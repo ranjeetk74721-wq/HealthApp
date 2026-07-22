@@ -1,0 +1,185 @@
+{
+  "app_name": "ClinicQueue Indian Healthcare",
+  "personality": "1 iOS-Native Clean",
+  "personality_one_liner": "A modern, clean, and trustworthy healthcare experience with clear typography, intuitive navigation, and calming blue tones for all age groups.",
+  "color": {
+    "surface": "#FFFFFF",
+    "onSurface": "#0F172A",
+    "surfaceSecondary": "#F8FAFC",
+    "onSurfaceSecondary": "#334155",
+    "surfaceTertiary": "#E2E8F0",
+    "onSurfaceTertiary": "#475569",
+    "surfaceInverse": "#1E293B",
+    "onSurfaceInverse": "#F8FAFC",
+    "brand": "#0284C7",
+    "brandPrimary": "#0369A1",
+    "onBrandPrimary": "#FFFFFF",
+    "brandSecondary": "#E0F2FE",
+    "onBrandSecondary": "#0369A1",
+    "brandTertiary": "#BAE6FD",
+    "onBrandTertiary": "#075985",
+    "success": "#059669",
+    "onSuccess": "#FFFFFF",
+    "warning": "#D97706",
+    "onWarning": "#FFFFFF",
+    "error": "#DC2626",
+    "onError": "#FFFFFF",
+    "info": "#2563EB",
+    "onInfo": "#FFFFFF",
+    "border": "#E2E8F0",
+    "borderStrong": "#CBD5E1",
+    "divider": "#F1F5F9"
+  },
+  "typography": {
+    "displayFontFamily": "Plus Jakarta Sans",
+    "textFontFamily": "Plus Jakarta Sans",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Use generous vertical breathing room for clarity. Forms and cards should be well spaced, accommodating larger touch targets for accessibility.",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 6,
+    "md": 12,
+    "lg": 20,
+    "pill": 999
+  },
+  "shadow_tier": 1,
+  "navigation": "bottom_tabs",
+  "icon_set": "Phosphor",
+  "glassmorphism": {
+    "enabled": true,
+    "do's": [
+      "Use on the bottom tab bar when content scrolls behind",
+      "Use for the Patient 'Upcoming Appointment' hero card overlay",
+      "Sticky headers in the Doctor and Receptionist dashboards"
+    ],
+    "dont's": [
+      "Avoid on form inputs or dense lists like Patient History",
+      "Do not over-blur; ensure high contrast for older demographics"
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "expo-glass-effect",
+      "android": "expo-blur",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "screens": [
+    {
+      "name": "Auth",
+      "purpose": "Simple role selection for Patient, Doctor, or Receptionist to enter their respective flows.",
+      "states": {
+        "loading": "Spinner over brandPrimary container",
+        "empty": "N/A",
+        "error": "Standard alert toast"
+      },
+      "layout": "Minimalist center-aligned stack of 3 large Pill buttons for each role. A healthcare cross or clinic logo at the top."
+    },
+    {
+      "name": "PatientHome",
+      "purpose": "Help patient find a doctor and view upcoming active bookings.",
+      "states": {
+        "loading": "Skeleton cards",
+        "empty": "N/A",
+        "error": "Error loading clinic data"
+      },
+      "layout": "Top: Greeting and search bar (specialty, doctor name, city). Below: Glassmorphic 'Upcoming Appointment' hero card featuring the clinic_waiting_room image as background with dark gradient scrim. Below: Grid of specialties (Cardiology, Dental, etc.) using tinted icon containers."
+    },
+    {
+      "name": "DoctorProfile",
+      "purpose": "Provide trust signals and essential details (fees, timings, wait time) before booking.",
+      "states": {
+        "loading": "Skeleton UI for profile",
+        "empty": "N/A",
+        "error": "Failed to fetch doctor details"
+      },
+      "layout": "Hero: large image of the doctor (doctor_portrait), name, rating. Middle: concise info cards for 'Fees', 'Consultation Timings', 'Avg Wait Time'. Bottom: Sticky 'Book Appointment' CTA at the bottom above safe area."
+    },
+    {
+      "name": "PatientBooking",
+      "purpose": "Date, time selection and mock payment.",
+      "states": {
+        "loading": "Spinner on dates",
+        "empty": "No slots available today",
+        "error": "Payment failed"
+      },
+      "layout": "Horizontal scrolling calendar pills for dates. Grid of time slots inside chips (surfaceTertiary for inactive, brandPrimary for selected). Mock payment sheet slides up on confirmation."
+    },
+    {
+      "name": "PatientLiveQueue",
+      "purpose": "Real-time queue tracking to reduce anxiety in the waiting room.",
+      "states": {
+        "loading": "Syncing queue position",
+        "empty": "You have no active queues",
+        "error": "Lost connection to clinic live queue"
+      },
+      "layout": "Dashboard feel. Top: Massive 'You are #8' typography. Middle: ETA (e.g., '~45 mins'), 'Currently serving #5', and progress bar. Bottom: Primary action 'Refresh' or 'Leave Queue'."
+    },
+    {
+      "name": "ReceptionistDashboard",
+      "purpose": "Operational queue management for front desk to process arrivals quickly.",
+      "states": {
+        "loading": "Loading queue data",
+        "empty": "No patients in queue yet",
+        "error": "Failed to update status"
+      },
+      "layout": "List view of today's patients ordered by token number. Each row has patient name, token, and a swipe-to-action or dropdown to 'Mark Arrived', 'Start', 'Complete', or 'Skip'. Floating Action Button for 'Emergency Insert'."
+    },
+    {
+      "name": "DoctorDashboard",
+      "purpose": "Task-first clinical dashboard to see who is next and manage shift status.",
+      "states": {
+        "loading": "Loading today's patients",
+        "empty": "No patients scheduled today",
+        "error": "Failed to sync schedule"
+      },
+      "layout": "Top: 3-way segmented control for status (Active, Pause/Break, Emergency). KPI Row (Total, Pending, Completed). List of the next 3-5 patients prominently displayed with a 'Call Next' primary button inside the top patient's card."
+    }
+  ],
+  "images": {
+    "doctor_portrait": {
+      "url": "https://images.pexels.com/photos/5888168/pexels-photo-5888168.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "alt": "Indian male doctor in blue scrubs"
+    },
+    "clinic_waiting_room": {
+      "url": "https://images.pexels.com/photos/8459996/pexels-photo-8459996.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "dark": "https://images.pexels.com/photos/31377751/pexels-photo-31377751.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "alt": "Modern hospital clinic waiting room"
+    }
+  },
+  "instructions_to_main_agent": [
+    "Adhere strictly to the Plus Jakarta Sans font with max 500 weight. Hierarchy must be established entirely through font sizes and spacing.",
+    "For 'PatientLiveQueue', ensure the current number 'You are #8' uses 3xl or larger font size so it is readable from a distance.",
+    "Implement the 'PatientHome' hero card with a gradient scrim layered over the `clinic_waiting_room` image to ensure text overlay contrast.",
+    "Ensure 'DoctorProfile' features the `doctor_portrait` image prominently at the top with a soft fade at the bottom edge.",
+    "Keep navigation simple: use bottom tabs for patient (Home, Queue, History) but single-screen stacks for Doctor and Receptionist dashboard to minimize clicks.",
+    "Any bottom CTA like 'Book Appointment' must be fixed/sticky above the safe area while the content scrolls underneath."
+  ],
+  "haptics": {
+    "booking_slot_select": "light",
+    "cta_button_press": "medium",
+    "queue_status_refresh": "light",
+    "receptionist_mark_arrived": "success",
+    "doctor_call_next": "medium"
+  }
+}
