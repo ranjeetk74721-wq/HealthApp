@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { View, Text, TextInput, Pressable, StyleSheet, KeyboardAvoidingView, Platform, ScrollView, ActivityIndicator } from "react-native";
+import { View, Text, TextInput, Pressable, StyleSheet, KeyboardAvoidingView, Platform, ScrollView, ActivityIndicator, Image } from "react-native";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { useAuth } from "@/src/context/AuthContext";
@@ -80,11 +80,9 @@ export default function Login() {
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1 }}>
         <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
           <View style={styles.logoWrap}>
-            <View style={styles.logoCircle}>
-              <Ionicons name="medkit" size={44} color={colors.onBrandPrimary} />
-            </View>
-            <Text style={styles.brandName}>ClinicQueue</Text>
-            <Text style={styles.tagline}>Skip the wait. Book smart.</Text>
+            <Image source={require("../assets/images/icon.png")} style={styles.logoImg} resizeMode="contain" />
+            <Text style={styles.brandName}>Meribaari</Text>
+            <Text style={styles.tagline}>Meri baari — skip the wait.</Text>
           </View>
 
           <View style={styles.tabsRow}>
@@ -197,6 +195,7 @@ const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.surfaceSecondary },
   container: { padding: spacing.lg, gap: spacing.md, paddingBottom: spacing.xxl },
   logoWrap: { alignItems: "center", marginTop: spacing.lg, marginBottom: spacing.md },
+  logoImg: { width: 96, height: 96, borderRadius: 20, marginBottom: spacing.md },
   logoCircle: { width: 84, height: 84, borderRadius: radius.pill, backgroundColor: colors.brandPrimary, alignItems: "center", justifyContent: "center", marginBottom: spacing.md },
   brandName: { fontSize: font.xxl, fontWeight: "700", color: colors.onSurface },
   tagline: { fontSize: font.base, color: colors.muted, marginTop: spacing.xs },

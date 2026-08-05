@@ -29,7 +29,7 @@ if (Platform.OS !== "web") {
 
 if (Platform.OS === "android") {
   Notifications.setNotificationChannelAsync("default", {
-    name: "ClinicQueue Alerts",
+    name: "Meribaari Alerts",
     importance: Notifications.AndroidImportance.MAX,
     sound: "default",
   });
