@@ -179,6 +179,7 @@ export default function Login() {
             <Text style={styles.demoTitle}>Demo accounts</Text>
             {tab === "staff" ? (
               <>
+                <Text style={styles.demoText}>Owner: owner@meribaari.com / owner123</Text>
                 <Text style={styles.demoText}>Doctor: drrajeshkumar@clinic.com / doctor123</Text>
                 <Text style={styles.demoText}>Reception: reception@clinic.com / reception123</Text>
               </>
