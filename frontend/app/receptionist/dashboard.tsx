@@ -238,7 +238,7 @@ export default function ReceptionistDashboard() {
       <Modal transparent visible={addOpen} animationType="slide" onRequestClose={() => setAddOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setAddOpen(false)}>
           <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ justifyContent: "flex-end", flex: 1 }}>
-            <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
+            <Pressable style={[styles.sheet, { maxHeight: "92%", minHeight: "70%" }]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
                 <Text style={styles.sheetTitle}>Add Walk-in Patient</Text>

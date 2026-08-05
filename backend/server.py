@@ -354,6 +354,9 @@ async def notify_queue_movement(doctor_id: str):
 
 @api_router.post("/register-push", status_code=201)
 async def register_push(body: RegisterPushBody):
+    # In dev/preview with placeholder key, soft-fail so mobile clients don't error
+    if PUSH_KEY == "placeholder":
+        return {"status": "queued_local"}
     try:
         resp = await _push_client.post("/api/v1/push/users/register", json=body.model_dump())
         if resp.status_code == 401:
@@ -364,7 +367,6 @@ async def register_push(body: RegisterPushBody):
     except HTTPException:
         raise
     except Exception as e:
-        # In dev/preview EMERGENT_PUSH_KEY is placeholder — surface as soft failure
         logger.warning(f"register-push non-fatal: {e}")
         return {"status": "queued_local"}
     return {"status": "registered"}
