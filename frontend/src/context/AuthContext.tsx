@@ -1,14 +1,19 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, ReactNode } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { Platform } from "react-native";
 
 export type Role = "patient" | "doctor" | "receptionist";
 
 export interface AuthUser {
   id: string;
-  email: string;
+  email?: string | null;
   full_name: string;
   role: Role;
   phone?: string;
+  mobile?: string | null;
+  age?: number | null;
+  gender?: string | null;
+  address?: string | null;
 }
 
 interface AuthState {
@@ -27,6 +32,30 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 const TOKEN_KEY = "cq_token";
 const USER_KEY = "cq_user";
 
+async function registerForPush(user_id: string) {
+  if (Platform.OS === "web") return;
+  try {
+    const Notifications = await import("expo-notifications");
+    const { status, canAskAgain } = await Notifications.getPermissionsAsync();
+    let finalStatus = status;
+    if (status !== "granted" && canAskAgain) {
+      const req = await Notifications.requestPermissionsAsync();
+      finalStatus = req.status;
+    }
+    if (finalStatus !== "granted") return;
+    const tokenResp = await Notifications.getDevicePushTokenAsync();
+    const base = process.env.EXPO_PUBLIC_BACKEND_URL;
+    if (!base || !tokenResp?.data) return;
+    await fetch(`${base}/api/register-push`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id, platform: Platform.OS, device_token: String(tokenResp.data) }),
+    });
+  } catch (e) {
+    // Non-fatal - push may not be available in Expo Go
+  }
+}
+
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [state, setState] = useState<AuthState>({ token: null, user: null, loading: true });
 
@@ -35,7 +64,10 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       try {
         const t = await AsyncStorage.getItem(TOKEN_KEY);
         const u = await AsyncStorage.getItem(USER_KEY);
-        setState({ token: t, user: u ? JSON.parse(u) : null, loading: false });
+        const parsedUser = u ? JSON.parse(u) : null;
+        setState({ token: t, user: parsedUser, loading: false });
+        // Re-register push on app open
+        if (parsedUser?.id) registerForPush(parsedUser.id);
       } catch {
         setState({ token: null, user: null, loading: false });
       }
@@ -46,6 +78,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     await AsyncStorage.setItem(TOKEN_KEY, token);
     await AsyncStorage.setItem(USER_KEY, JSON.stringify(user));
     setState({ token, user, loading: false });
+    // Register for push (only meaningful for patients typically, but harmless for all)
+    if (user.id) registerForPush(user.id);
   }, []);
 
   const signOut = useCallback(async () => {

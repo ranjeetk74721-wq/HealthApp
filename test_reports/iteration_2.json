@@ -1,0 +1,47 @@
+{
+  "summary": "ClinicQueue iteration 2 (new features: Mobile OTP auth, Add Patient, WebSocket real-time, Push registration) tested end-to-end. Backend: 47/48 pytest cases passing (17 new tests added covering OTP send/verify, mobile normalization, receptionist add-patient with & without appointment, walk-in→self-login continuity via same mobile, WebSocket connect + broadcast on emergency insert, ping/pong). Frontend: verified Patient tab → mobile OTP → OTP screen with autofill button → profile step (name/age/gender/address) → patient home; Staff tab → reception login → dashboard with 'Add Patient' bottom sheet + green WS live-dot; Doctor login → dashboard with KPIs, mode pills, per-row actions, symptoms rendered, and green WS live-dot. Only failure: POST /api/register-push returns 500 with placeholder EMERGENT_PUSH_KEY instead of gracefully soft-failing as the requirement states.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/register-push", "issue": "With placeholder EMERGENT_PUSH_KEY, upstream returns 401 which server converts to HTTPException(500, 'EMERGENT_PUSH_KEY missing or invalid') BEFORE the generic except-Exception soft-fail branch can catch it. Requirement says endpoint should 'gracefully handle placeholder key' (i.e. return 201 with status='queued_local'). Fix: move the 401 → HTTP 500 mapping under a config flag, or catch it and return {'status':'queued_local'}. Reference: /app/backend/server.py:359-370.", "priority": "MEDIUM"},
+      {"endpoint": "GET /api/appointments/{id}/queue", "issue": "(carried from iter-1) Any authenticated user can query queue for any appointment id. Low risk with UUIDs but should restrict to owner/staff.", "priority": "LOW"},
+      {"endpoint": "GET /api/doctors", "issue": "(carried from iter-1) N+1 estimate_wait_for_doctor loop, fine for 6 doctors.", "priority": "LOW"}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Multiple", "issues": ["Console warning: 'shadow*' style props are deprecated (use boxShadow) — React Native Web deprecation.", "Console warning: props.pointerEvents is deprecated (use style.pointerEvents).", "Console warning: [expo-notifications] Listening to push token changes is not yet fully supported on web (expected on web preview, native only)."]},
+      {"screen": "Receptionist Add Patient bottom sheet", "issues": ["Modal is scrollable via ScrollView, but on 390x844 viewport the gender chips + Add button sit below the fold. Users must scroll inside the sheet — consider sizing the sheet to ~85% of screen height (currently ~65%) or auto-scrolling to the submit button on focus."]}
+    ],
+    "react_native_issues": []
+  },
+  "test_report_links": ["/app/backend/tests/test_clinicqueue.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "Fix POST /api/register-push to actually soft-fail (return {'status':'queued_local'}) when EMERGENT_PUSH_KEY is 'placeholder' or upstream returns 401. Current behaviour returns HTTP 500 which will crash mobile app registration on startup in dev/preview.",
+    "(Optional design) Increase Add Patient bottom-sheet height or add auto-scroll-to-submit so gender/submit stay in viewport on 375-390px screens.",
+    "(Optional) Replace deprecated shadow* style props with boxShadow to silence RN-Web console warnings."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now 1033 lines. Consider splitting into modules (auth, appointments, reception, doctor, ws, push) — approaching maintainability threshold.",
+    "logger is defined AFTER app.include_router and after several routes that use it, but since assignments run at module import time before any route handlers execute, this works — still, moving logger + logging.basicConfig to the top of the file would be cleaner.",
+    "normalize_mobile correctly strips +91 / 91 / 0 prefixes and produces +91XXXXXXXXXX (verified via tests).",
+    "OTP flow correctly consumes the stored OTP on success and increments attempts on failure. Universal '123456' is also accepted (as documented).",
+    "Receptionist Add-Patient endpoint correctly upserts a patient user keyed on mobile, so a walk-in patient can later self-login via OTP with the same number (E2E verified in test_added_patient_can_self_login_via_otp).",
+    "WebSocket broadcast fan-out to both doctor:<id> and appt:<id> channels is correct; ping/pong keep-alive works.",
+    "notify_queue_movement fires push in a fire-and-forget task and catches exceptions — safe with placeholder key.",
+    "AddPatientBody schema doesn't validate that at least full_name+mobile are present via pydantic — handled manually in the endpoint (OK)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_clinicqueue.py (added 17 tests: MobileOTP, ReceptionAddPatient, PushRegistration, WebSocket classes)",
+    "/app/test_reports/iteration_2.json",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "success_rate": {"backend": "97.9% (47/48 pytest)", "frontend": "100% of tested flows (patient OTP E2E signup+login, staff login, reception dashboard + Add Patient modal open, doctor dashboard with WS live-dot + KPIs + status pills)"},
+  "seed_data_creation": "Tests create TEST_-prefixed patients via OTP (TEST OTP User, TEST OTP Stored), receptionist walk-ins (TEST Walk-in NoAppt, TEST Walk-in Sunita) with random 10-digit mobiles, TEST_WS_Emergency appointment via emergency insert to trigger WS broadcast, and one UI-created patient 'TEST UI OTP'. All prefixed for easy cleanup.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend URL: EXPO_PUBLIC_BACKEND_URL (https://queue-live-demo.preview.emergentagent.com). Universal OTP is '123456'; send-otp also returns dev_otp in response. Mobile normalized to +91XXXXXXXXXX by normalize_mobile(). Receptionist-added walk-in patients are upserted in users collection keyed by mobile, so same mobile → same patient_id on subsequent OTP login (proven in test_added_patient_can_self_login_via_otp). WebSocket URLs: wss://<host>/api/ws/queue/doctor/{id} and /api/ws/queue/appt/{id}. Each channel receives {type:'connected',channel} on open and broadcasts on booked/arrived/started/completed/skipped/reordered/emergency_inserted/patient_added/cancelled events. websocket-client is now installed. Only outstanding backend bug: /api/register-push returns 500 with placeholder key.",
+  "rca_of_issue": "POST /api/register-push RCA: In /app/backend/server.py:357-370, the try block explicitly re-raises HTTPException(500, 'EMERGENT_PUSH_KEY missing or invalid') when upstream returns 401. The 'except HTTPException: raise' preserves that 500 all the way to the client, so the intended 'except Exception: return queued_local' soft-fail path is bypassed. To fix: change the 401 branch to `return {'status': 'queued_local'}` (matching preview/placeholder-key expectation), or leave the 401 mapping only when a real key is configured (guard with `if PUSH_KEY != 'placeholder'`)."
+}

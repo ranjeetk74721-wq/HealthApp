@@ -1,0 +1,125 @@
+<analysis>**original_problem_statement**: 
+Build a modern healthcare appointment booking app for India (ClinicQueue) that reduces patient waiting time at clinics through real-time queue management. The app requires three user roles: Patient, Doctor, and Receptionist. Core functionality revolves around Patients booking appointments and seeing a live real-time queue position (e.g., You are number 8) which updates automatically when a receptionist marks a consultation as completed. 
+PRODUCT REQUIREMENTS: 
+- Flutter (Translated to React Native Expo based on platform defaults)
+- Firebase Auth (Substituted with JWT for MVP as per integration playbook), Razorpay/UPI integration, Google Maps, Push Notifications.
+
+**User's preferred language**: The user is communicating in **Romanized Hindi / Hindi** (e.g., Aap itna save karke safely rakhiye hum is process ko baad Mai credit purchase karke aage processed karenge). 
+**INSTRUCT NEXT AGENT:** You MUST respond to the user in Romanized Hindi or conversational Hindi.
+
+**what currently exists?**: 
+A fully functional and tested MVP for ClinicQueue built using React Native Expo (Frontend) and FastAPI/MongoDB (Backend). The application supports JWT role-based authentication (Patient, Doctor, Receptionist). The UI features patient navigation (search, book, queue, history), and dedicated dashboards for doctors and receptionists. The real-time queue is currently implemented via 5-second API polling. End-to-end flows have been verified by the testing agent (100% backend test pass rate).
+
+**Last working item**: 
+- Last item agent was working: Providing guidance on credit consumption and safely pausing the project. The user requested to stop the development so they can purchase more credits before proceeding to advanced features.
+- Status: NONE (Project paused in a stable state by user request)
+- Agent Testing Done: Y (Full testing agent run completed on MVP)
+- Which testing method agent to use?: NA (testing is already done)
+- User Testing Done: Y (User viewed the preview and approved pausing the work)
+
+**All Pending/In progress Issue list**: 
+No pending issues. The MVP is stable, fully functional, and bug-free based on the latest testing agent report.
+
+**In progress Task List**: 
+None. 
+
+**Upcoming and Future Tasks**
+*Upcoming Tasks:*
+- Task 1: Razorpay/UPI payment integration (P1) - *Mentioned in original prompt, pending implementation.*
+- Task 2: Google Maps integration for clinic search (P1) - *Mentioned in original prompt, pending implementation.*
+- Task 3: Upgrade real-time queue from 5-second polling to WebSockets for instant updates (P2)
+*Future Tasks:*
+- Task 4: Firebase Cloud Messaging / Push notifications for 1hr, 30m, and 10m turn reminders (P2) - *Requires native build setup and user to provide Firebase credentials.*
+
+**Completed work in this session**
+- Complete Backend architecture () with MongoDB endpoints (DONE)
+- Role-based JWT Authentication context and login/signup screens (DONE)
+- Patient App flows: Home, Doctor Selection, Booking, Live Queue, History (DONE)
+- Receptionist Dashboard: Manage daily appointments, mark patients as arrived/completed (DONE)
+- Doctor Dashboard: View schedule and pending patients (DONE)
+- Automated testing suite: 30 pytest cases passed for backend, and E2E frontend verification (DONE)
+- Project requirement documentation and credentials generation (DONE)
+
+**Earlier issues found/mentioned but not fixed**
+None.
+
+**Known issue recurrence from previous fork**
+- Issue recurrence in previous fork: None (This is the first iteration/initial setup).
+- Recurrence count: 0
+- Status: NA
+
+**Code Architecture**
+
+
+**Key Technical Concepts**
+Full-stack React Native Expo mobile application, Expo Router (file-based routing), FastAPI backend, MongoDB database, JWT Token Authentication, API Polling (for real-time queue syncing).
+
+**key DB schema**
+- : {id, email, password_hash, role (patient/doctor/receptionist), full_name}
+- : {id, user_id, specialty, fees, timings, est_wait_minutes, status}
+- : {id, patient_id, doctor_id, status (pending/arrived/completed), queue_position}
+
+**changes in tech stack**
+- Substituted Firebase Auth with standard JWT implementation for the MVP based on standard playbook practices, which perfectly handles the role-based auth requirement.
+- Substituted Flutter with React Native Expo (Emergent platform native standard).
+
+**All files of reference**
+- : Core FastAPI backend handling auth, users, and appointment/queue logic.
+- : Manages JWT state and secure local storage.
+- : Crucial UI file where the Live Queue feature is implemented using a 5-second polling interval.
+- : Contains the seeded mock user credentials for Patient, Doctor, and Receptionist roles.
+
+**Areas that need refactoring**
+- : Currently uses a 5-second  for fetching live queue updates. In the future, this should be refactored to use WebSockets for true real-time performance.
+
+**key api endpoints**
+-  & 
+- 
+- 
+- 
+- 
+
+**Critical Info for New Agent**
+- **DO NOT MAKE UNSOLICITED CHANGES.** The user explicitly stated: *Aap itna save karke safely rakhiye hum is process ko baad Mai credit purchase karke aage processed karenge* (Save this safely, I will process it later after purchasing credits).
+- The application is currently in a 100% stable, tested, and bug-free MVP state.
+- Await the user's explicit instruction on what feature they want to build next (e.g., Razorpay, Maps, Push Notifications). 
+- When implementing external integrations in the future, remember to invoke .
+
+**documents and test reports created in this job**
+- 
+- 
+- 
+- 
+- 
+
+**Last 10 User Messages and any pending HUMAN messages**
+1. User asked for estimated credits required to complete the work.
+2. Agent explained credit logic via support agent.
+3. User asked if 100 credits would be enough for the whole work.
+4. Agent explained that 100 is enough for the MVP but not for advanced integrations (Razorpay, Maps, etc.) and deployment.
+5. User said Haa kijiye (Proceed with MVP completion).
+6. Agent ran testing agent which passed 100%.
+7. User stated I want to continue later any problem.
+8. Agent assured them it's fine and saved work.
+9. User stated Mai preview dekh chuka hoon (I have seen the preview).
+10. User explicitly instructed: Aap itna save karke safely rakhiye hum is process ko baad Mai credit purchase karke aage processed karenge (Keep it safely saved, we will process it further later after purchasing credits). -> *Completed Status.*
+
+**Project Health Check:**
+- Broken: None
+- Mocked: None (Connected to live local MongoDB)
+- Stable: Fully Stable MVP.
+
+**3rd Party Integrations**
+- None currently implemented. (JWT Auth is managed internally). Future integrations like Razorpay or Firebase will require User API Keys.
+
+**Testing status**
+- Testing agent used after significant changes: YES
+- Troubleshoot agent used after agent stuck in loop: NO
+- Test files created: 
+- Known regressions: None
+
+**Credentials to test flow:**
+Available in . Contains active seeded accounts for , , and .
+
+**What agent forgot to execute**
+The agent did exactly what was requested for the MVP setup. Integrations like Razorpay, Google Maps, and Push Notifications were intentionally deferred to future tasks based on the user's credit availability and explicit request to pause development.</analysis>

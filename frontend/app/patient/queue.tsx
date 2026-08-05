@@ -6,11 +6,16 @@ import { useFocusEffect } from "expo-router";
 import { api } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
 
+const WS_BASE = (process.env.EXPO_PUBLIC_BACKEND_URL || "").replace(/^http/, "ws");
+
 export default function PatientQueue() {
   const [data, setData] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const timerRef = useRef<any>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const [wsConnected, setWsConnected] = useState(false);
+  const currentApptId = useRef<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -18,10 +23,16 @@ export default function PatientQueue() {
       const active = appts.find((a: any) => ["booked", "arrived", "in_consultation"].includes(a.status));
       if (!active) {
         setData({ empty: true });
+        currentApptId.current = null;
         return;
       }
       const q = await api.get(`/appointments/${active.id}/queue`);
       setData(q);
+      // Establish WS if new active appt
+      if (currentApptId.current !== active.id) {
+        currentApptId.current = active.id;
+        connectWs(active.id);
+      }
     } catch (e) {
       console.log(e);
     } finally {
@@ -30,12 +41,33 @@ export default function PatientQueue() {
     }
   }, []);
 
+  const connectWs = (apptId: string) => {
+    if (!WS_BASE) return;
+    if (wsRef.current) {
+      try { wsRef.current.close(); } catch {}
+      wsRef.current = null;
+    }
+    try {
+      const ws = new WebSocket(`${WS_BASE}/api/ws/queue/appt/${apptId}`);
+      wsRef.current = ws;
+      ws.onopen = () => setWsConnected(true);
+      ws.onmessage = () => { load(); };
+      ws.onerror = () => setWsConnected(false);
+      ws.onclose = () => setWsConnected(false);
+    } catch {
+      setWsConnected(false);
+    }
+  };
+
   useFocusEffect(
     useCallback(() => {
       load();
-      timerRef.current = setInterval(load, 5000);
+      // Fallback polling every 15s (WS should handle most updates)
+      timerRef.current = setInterval(load, 15000);
       return () => {
         if (timerRef.current) clearInterval(timerRef.current);
+        if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
+        currentApptId.current = null;
       };
     }, [load]),
   );
@@ -95,10 +127,10 @@ export default function PatientQueue() {
         </View>
 
         <View style={styles.notifyCard}>
-          <Ionicons name="notifications" size={20} color={colors.brandPrimary} />
+          <Ionicons name={wsConnected ? "flash" : "notifications"} size={20} color={wsConnected ? colors.success : colors.brandPrimary} />
           <View style={{ flex: 1 }}>
-            <Text style={styles.notifyTitle}>Auto-refreshing every 5s</Text>
-            <Text style={styles.notifySub}>You'll be alerted 1hr, 30min, 10min before your turn</Text>
+            <Text style={styles.notifyTitle}>{wsConnected ? "Live updates active" : "Auto-refreshing"}</Text>
+            <Text style={styles.notifySub}>{wsConnected ? "Real-time queue updates via WebSocket" : "Updates every 15s"}</Text>
           </View>
         </View>
 

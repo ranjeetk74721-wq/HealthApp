@@ -5,7 +5,7 @@ import uuid
 import pytest
 import requests
 
-BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://patient-queue-31.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://queue-live-demo.preview.emergentagent.com").rstrip("/")
 API = f"{BASE_URL}/api"
 
 RECEPTION_EMAIL = "reception@clinic.com"
@@ -286,3 +286,232 @@ class TestQueueUpdatesOtherPatients:
         q_after = s.get(f"{API}/appointments/{a2['id']}/queue", headers=h(p2["access_token"])).json()
         pos_after = q_after["my_position"]
         assert pos_after < pos_before, f"Position should shift down. before={pos_before} after={pos_after}"
+
+
+# ---------------- MOBILE OTP AUTH (Patient) ----------------
+class TestMobileOTP:
+    _shared = {}
+
+    def test_send_otp_normalizes_and_returns_dev_otp(self, s):
+        mobile_raw = f"98765{str(uuid.uuid4().int)[:5]}"[:10]  # random 10-digit
+        r = s.post(f"{API}/auth/send-otp", json={"mobile": mobile_raw})
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["ok"] is True
+        assert data["mobile"].startswith("+91"), f"expected +91 prefix, got {data['mobile']}"
+        assert data["mobile"].endswith(mobile_raw)
+        assert "dev_otp" in data and len(data["dev_otp"]) == 6
+        assert data["is_registered"] is False
+        self.__class__._shared["mobile_new"] = mobile_raw
+        self.__class__._shared["dev_otp_new"] = data["dev_otp"]
+
+    def test_send_otp_bad_mobile(self, s):
+        r = s.post(f"{API}/auth/send-otp", json={"mobile": "123"})
+        assert r.status_code == 400
+
+    def test_send_otp_accepts_plus91_format(self, s):
+        # normalization should accept +91 prefix
+        num = f"98765{str(uuid.uuid4().int)[:5]}"[:10]
+        r = s.post(f"{API}/auth/send-otp", json={"mobile": f"+91{num}"})
+        assert r.status_code == 200
+        assert r.json()["mobile"] == f"+91{num}"
+
+    def test_verify_otp_new_patient_requires_name(self, s):
+        mobile = self._shared["mobile_new"]
+        r = s.post(f"{API}/auth/verify-otp", json={"mobile": mobile, "otp": "123456"})
+        assert r.status_code == 400
+        assert "name" in r.json()["detail"].lower()
+
+    def test_verify_otp_universal_creates_patient(self, s):
+        mobile = self._shared["mobile_new"]
+        r = s.post(f"{API}/auth/verify-otp", json={
+            "mobile": mobile, "otp": "123456",
+            "full_name": "TEST OTP User", "age": 28, "gender": "Male", "address": "TEST addr",
+        })
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["user"]["role"] == "patient"
+        assert data["user"]["mobile"] == f"+91{mobile}"
+        assert data["user"]["full_name"] == "TEST OTP User"
+        assert data["user"]["age"] == 28
+        assert data["user"]["gender"] == "Male"
+        assert isinstance(data["access_token"], str)
+        self.__class__._shared["token_new"] = data["access_token"]
+
+    def test_verify_otp_second_login_existing_no_name_needed(self, s):
+        mobile = self._shared["mobile_new"]
+        # existing user should now come back
+        r = s.post(f"{API}/auth/send-otp", json={"mobile": mobile})
+        assert r.json()["is_registered"] is True
+        r2 = s.post(f"{API}/auth/verify-otp", json={"mobile": mobile, "otp": "123456"})
+        assert r2.status_code == 200
+        assert r2.json()["user"]["full_name"] == "TEST OTP User"
+
+    def test_verify_otp_wrong_otp(self, s):
+        mobile = self._shared["mobile_new"]
+        s.post(f"{API}/auth/send-otp", json={"mobile": mobile})
+        r = s.post(f"{API}/auth/verify-otp", json={"mobile": mobile, "otp": "000000"})
+        assert r.status_code == 401
+
+    def test_verify_otp_stored_dev_otp_works(self, s):
+        # Fresh mobile so stored otp is fresh
+        num = f"98765{str(uuid.uuid4().int)[:5]}"[:10]
+        r = s.post(f"{API}/auth/send-otp", json={"mobile": num})
+        stored = r.json()["dev_otp"]
+        r2 = s.post(f"{API}/auth/verify-otp", json={
+            "mobile": num, "otp": stored, "full_name": "TEST OTP Stored"
+        })
+        assert r2.status_code == 200
+
+
+# ---------------- RECEPTION Add Patient ----------------
+class TestReceptionAddPatient:
+    _shared = {}
+
+    def test_add_patient_no_appointment(self, s, reception_token):
+        num = f"98765{str(uuid.uuid4().int)[:5]}"[:10]
+        r = s.post(f"{API}/reception/add-patient", headers=h(reception_token), json={
+            "full_name": "TEST Walk-in NoAppt",
+            "mobile": num,
+            "age": 45,
+            "gender": "Female",
+            "address": "TEST street",
+        })
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["ok"] is True
+        assert data["patient"]["mobile"] == f"+91{num}"
+        assert data["patient"]["full_name"] == "TEST Walk-in NoAppt"
+        assert data["appointment"] is None
+
+    def test_add_patient_with_appointment(self, s, reception_token):
+        doctors = s.get(f"{API}/doctors").json()
+        did = doctors[4]["id"]
+        num = f"98765{str(uuid.uuid4().int)[:5]}"[:10]
+        r = s.post(f"{API}/reception/add-patient", headers=h(reception_token), json={
+            "full_name": "TEST Walk-in Sunita",
+            "mobile": num,
+            "age": 30,
+            "gender": "Female",
+            "symptoms": "Fever and headache",
+            "address": "TEST addr",
+            "doctor_id": did,
+            "slot": "11:30 AM",
+        })
+        assert r.status_code == 200, r.text
+        data = r.json()
+        appt = data["appointment"]
+        assert appt is not None
+        assert appt["status"] == "arrived"
+        assert appt["token_number"] >= 1
+        assert appt["doctor_id"] == did
+        assert appt["symptoms"] == "Fever and headache"
+        assert appt["patient_name"] == "TEST Walk-in Sunita"
+        self.__class__._shared["mobile"] = num
+        self.__class__._shared["patient_id"] = data["patient"]["id"]
+        self.__class__._shared["appt_id"] = appt["id"]
+
+    def test_added_patient_appears_in_reception_queue(self, s, reception_token):
+        appt_id = self._shared["appt_id"]
+        r = s.get(f"{API}/reception/queue", headers=h(reception_token))
+        assert r.status_code == 200
+        ids = [a["id"] for a in r.json()]
+        assert appt_id in ids
+
+    def test_added_patient_can_self_login_via_otp(self, s):
+        """Same mobile the receptionist used should log in the same patient."""
+        num = self._shared["mobile"]
+        r = s.post(f"{API}/auth/send-otp", json={"mobile": num})
+        assert r.status_code == 200
+        assert r.json()["is_registered"] is True, "receptionist-added patient should be marked registered"
+        r2 = s.post(f"{API}/auth/verify-otp", json={"mobile": num, "otp": "123456"})
+        assert r2.status_code == 200
+        user = r2.json()["user"]
+        assert user["id"] == self._shared["patient_id"], "should return same patient user"
+        assert user["full_name"] == "TEST Walk-in Sunita"
+
+    def test_add_patient_missing_name(self, s, reception_token):
+        r = s.post(f"{API}/reception/add-patient", headers=h(reception_token), json={
+            "full_name": "  ", "mobile": "9876543210"
+        })
+        assert r.status_code == 400
+
+    def test_add_patient_invalid_mobile(self, s, reception_token):
+        r = s.post(f"{API}/reception/add-patient", headers=h(reception_token), json={
+            "full_name": "TEST Bad", "mobile": "12"
+        })
+        assert r.status_code == 400
+
+    def test_add_patient_forbidden_for_non_reception(self, s, patient_ctx):
+        r = s.post(f"{API}/reception/add-patient", headers=h(patient_ctx["token"]), json={
+            "full_name": "TEST", "mobile": "9876543210"
+        })
+        assert r.status_code == 403
+
+
+# ---------------- PUSH REGISTRATION ----------------
+class TestPushRegistration:
+    def test_register_push_placeholder_key_soft_fail(self, s):
+        r = s.post(f"{API}/register-push", json={
+            "user_id": "test-user-id",
+            "platform": "ios",
+            "device_token": "TEST_dummy_token"
+        })
+        # With placeholder key, we expect graceful degradation (either 201 registered or 201 queued_local)
+        assert r.status_code == 201, f"got {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("status") in ("registered", "queued_local")
+
+
+# ---------------- WEBSOCKET ----------------
+class TestWebSocket:
+    def _ws_url(self, path: str) -> str:
+        return BASE_URL.replace("https://", "wss://").replace("http://", "ws://") + path
+
+    def test_ws_doctor_connect_and_receive_broadcast(self, s, reception_token):
+        try:
+            from websocket import create_connection  # websocket-client
+        except ImportError:
+            pytest.skip("websocket-client not installed")
+
+        doctors = s.get(f"{API}/doctors").json()
+        did = doctors[0]["id"]
+        url = self._ws_url(f"/api/ws/queue/doctor/{did}")
+        ws = create_connection(url, timeout=10)
+        try:
+            # First message should be connected
+            import json as _json
+            first = _json.loads(ws.recv())
+            assert first["type"] == "connected"
+            assert first["channel"] == f"doctor:{did}"
+
+            # Trigger a broadcast by inserting an emergency
+            r = s.post(f"{API}/reception/emergency_insert", headers=h(reception_token),
+                       json={"doctor_id": did, "patient_name": "TEST_WS_Emergency"})
+            assert r.status_code == 200
+
+            ws.settimeout(5)
+            second = _json.loads(ws.recv())
+            assert second["type"] == "emergency_inserted"
+            assert second["doctor_id"] == did
+        finally:
+            ws.close()
+
+    def test_ws_appt_channel_connects(self, s):
+        try:
+            from websocket import create_connection
+        except ImportError:
+            pytest.skip("websocket-client not installed")
+        import json as _json
+        url = self._ws_url("/api/ws/queue/appt/some-appt-id")
+        ws = create_connection(url, timeout=10)
+        try:
+            first = _json.loads(ws.recv())
+            assert first["type"] == "connected"
+            assert first["channel"] == "appt:some-appt-id"
+            # ping/pong
+            ws.send("ping")
+            pong = _json.loads(ws.recv())
+            assert pong["type"] == "pong"
+        finally:
+            ws.close()

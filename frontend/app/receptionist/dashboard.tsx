@@ -1,5 +1,5 @@
-import { useCallback, useState } from "react";
-import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, RefreshControl, Modal, TextInput } from "react-native";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, RefreshControl, Modal, TextInput, KeyboardAvoidingView, Platform } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
@@ -14,6 +14,10 @@ const actions = [
   { label: "Skip", path: "/reception/skip", color: colors.warning, icon: "arrow-forward" as const },
 ];
 
+const GENDERS = ["Male", "Female", "Other"];
+
+const WS_BASE = (process.env.EXPO_PUBLIC_BACKEND_URL || "").replace(/^http/, "ws");
+
 export default function ReceptionistDashboard() {
   const router = useRouter();
   const { user, signOut } = useAuth();
@@ -25,7 +29,24 @@ export default function ReceptionistDashboard() {
   const [emergencyOpen, setEmergencyOpen] = useState(false);
   const [emergencyName, setEmergencyName] = useState("");
 
-  const load = useCallback(async () => {
+  // Add Patient sheet
+  const [addOpen, setAddOpen] = useState(false);
+  const [pName, setPName] = useState("");
+  const [pMobile, setPMobile] = useState("");
+  const [pAge, setPAge] = useState("");
+  const [pGender, setPGender] = useState<string | null>(null);
+  const [pSymptoms, setPSymptoms] = useState("");
+  const [pAddress, setPAddress] = useState("");
+  const [pSlot, setPSlot] = useState("");
+  const [addLoading, setAddLoading] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+  const [addToast, setAddToast] = useState<string | null>(null);
+
+  // WebSocket
+  const wsRef = useRef<WebSocket | null>(null);
+  const [wsConnected, setWsConnected] = useState(false);
+
+  const load = useCallback(async (silent = false) => {
     try {
       const docs = await api.get("/reception/doctors");
       setDoctors(docs);
@@ -36,21 +57,92 @@ export default function ReceptionistDashboard() {
         setQueue(q);
       }
     } catch (e) { console.log(e); }
-    finally { setLoading(false); setRefreshing(false); }
+    finally { if (!silent) setLoading(false); setRefreshing(false); }
   }, [selectedDoc]);
 
-  useFocusEffect(useCallback(() => { load(); const t = setInterval(load, 5000); return () => clearInterval(t); }, [load]));
+  // Setup WebSocket per selected doctor
+  useEffect(() => {
+    if (!selectedDoc || !WS_BASE) return;
+    // Close any prior connection
+    if (wsRef.current) {
+      try { wsRef.current.close(); } catch {}
+      wsRef.current = null;
+    }
+    const url = `${WS_BASE}/api/ws/queue/doctor/${selectedDoc}`;
+    let closed = false;
+    try {
+      const ws = new WebSocket(url);
+      wsRef.current = ws;
+      ws.onopen = () => { if (!closed) setWsConnected(true); };
+      ws.onmessage = () => { load(true); };
+      ws.onerror = () => { setWsConnected(false); };
+      ws.onclose = () => { setWsConnected(false); };
+    } catch (e) {
+      setWsConnected(false);
+    }
+    return () => {
+      closed = true;
+      if (wsRef.current) {
+        try { wsRef.current.close(); } catch {}
+        wsRef.current = null;
+      }
+    };
+  }, [selectedDoc]);
+
+  useFocusEffect(
+    useCallback(() => {
+      load();
+      // Fallback polling every 10s (in case WS drops)
+      const t = setInterval(() => load(true), 10000);
+      return () => clearInterval(t);
+    }, [load]),
+  );
 
   const doAction = async (path: string, appt_id: string) => {
-    try { await api.post(path, { appointment_id: appt_id }); load(); } catch (e) { console.log(e); }
+    try { await api.post(path, { appointment_id: appt_id }); load(true); } catch (e) { console.log(e); }
   };
 
   const insertEmergency = async () => {
     if (!selectedDoc) return;
     try {
       await api.post("/reception/emergency_insert", { doctor_id: selectedDoc, patient_name: emergencyName || "Emergency Patient" });
-      setEmergencyOpen(false); setEmergencyName(""); load();
+      setEmergencyOpen(false); setEmergencyName(""); load(true);
     } catch (e) { console.log(e); }
+  };
+
+  const resetAddForm = () => {
+    setPName(""); setPMobile(""); setPAge(""); setPGender(null);
+    setPSymptoms(""); setPAddress(""); setPSlot("");
+    setAddError(null);
+  };
+
+  const onAddPatient = async () => {
+    setAddError(null);
+    if (!pName.trim()) return setAddError("Name is required");
+    if (pMobile.replace(/[^0-9]/g, "").length < 10) return setAddError("Enter valid 10-digit mobile");
+    if (!selectedDoc) return setAddError("Select a doctor first");
+    setAddLoading(true);
+    try {
+      const res = await api.post("/reception/add-patient", {
+        full_name: pName.trim(),
+        mobile: pMobile.replace(/[^0-9]/g, ""),
+        age: pAge ? parseInt(pAge, 10) : undefined,
+        gender: pGender,
+        symptoms: pSymptoms || undefined,
+        address: pAddress || undefined,
+        doctor_id: selectedDoc,
+        slot: pSlot || "Walk-in",
+      });
+      setAddToast(`Added: ${res.patient.full_name} · Token #${res.appointment?.token_number}`);
+      resetAddForm();
+      setAddOpen(false);
+      load(true);
+      setTimeout(() => setAddToast(null), 3000);
+    } catch (e: any) {
+      setAddError(e.message || "Could not add patient");
+    } finally {
+      setAddLoading(false);
+    }
   };
 
   if (loading) return <SafeAreaView style={styles.safe}><ActivityIndicator style={{ marginTop: 60 }} color={colors.brand} /></SafeAreaView>;
@@ -68,7 +160,10 @@ export default function ReceptionistDashboard() {
       <View style={styles.header}>
         <View style={{ flex: 1 }}>
           <Text style={styles.hello}>Reception</Text>
-          <Text style={styles.name}>{user?.full_name}</Text>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+            <Text style={styles.name}>{user?.full_name}</Text>
+            <View style={[styles.liveDot, wsConnected && { backgroundColor: colors.success }]} />
+          </View>
         </View>
         <Pressable onPress={async () => { await signOut(); router.replace("/login"); }} testID="reception-logout" style={styles.iconBtn}>
           <Ionicons name="log-out-outline" size={22} color={colors.onSurfaceSecondary} />
@@ -97,7 +192,7 @@ export default function ReceptionistDashboard() {
 
       <ScrollView contentContainerStyle={styles.scroll} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} />}>
         {activeQueue.length === 0 ? (
-          <View style={styles.empty}><Ionicons name="people-outline" size={44} color={colors.muted} /><Text style={styles.emptyText}>No patients yet</Text></View>
+          <View style={styles.empty}><Ionicons name="people-outline" size={44} color={colors.muted} /><Text style={styles.emptyText}>No patients yet. Tap &quot;+ Add Patient&quot; to register a walk-in.</Text></View>
         ) : (
           activeQueue.map((a) => (
             <View key={a.id} style={styles.apptCard}>
@@ -107,6 +202,7 @@ export default function ReceptionistDashboard() {
               <View style={{ flex: 1 }}>
                 <Text style={styles.apptName}>{a.patient_name}</Text>
                 <Text style={styles.apptMeta}>{a.slot} · <Text style={{ color: colors.brandPrimary }}>{a.status.replace("_", " ")}</Text></Text>
+                {a.symptoms ? <Text style={styles.symptoms} numberOfLines={1}>💊 {a.symptoms}</Text> : null}
               </View>
               <View style={styles.actionsRow}>
                 {actions.map((act) => (
@@ -120,25 +216,89 @@ export default function ReceptionistDashboard() {
         )}
       </ScrollView>
 
-      <Pressable testID="emergency-insert-btn" onPress={() => setEmergencyOpen(true)} style={styles.fab}>
-        <Ionicons name="alert" size={22} color="#fff" />
-        <Text style={styles.fabText}>Emergency</Text>
-      </Pressable>
+      {addToast ? (
+        <View style={styles.toast} testID="add-patient-toast">
+          <Ionicons name="checkmark-circle" size={18} color="#fff" />
+          <Text style={styles.toastText}>{addToast}</Text>
+        </View>
+      ) : null}
 
+      <View style={styles.fabRow}>
+        <Pressable testID="add-patient-btn" onPress={() => setAddOpen(true)} style={[styles.fab, { backgroundColor: colors.brandPrimary }]}>
+          <Ionicons name="person-add" size={20} color="#fff" />
+          <Text style={styles.fabText}>Add Patient</Text>
+        </Pressable>
+        <Pressable testID="emergency-insert-btn" onPress={() => setEmergencyOpen(true)} style={[styles.fab, { backgroundColor: colors.error }]}>
+          <Ionicons name="alert" size={20} color="#fff" />
+          <Text style={styles.fabText}>Emergency</Text>
+        </Pressable>
+      </View>
+
+      {/* Add Patient Modal */}
+      <Modal transparent visible={addOpen} animationType="slide" onRequestClose={() => setAddOpen(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setAddOpen(false)}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ justifyContent: "flex-end", flex: 1 }}>
+            <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <ScrollView keyboardShouldPersistTaps="handled">
+                <Text style={styles.sheetTitle}>Add Walk-in Patient</Text>
+                <Text style={styles.sheetSub}>Patient will be added to the queue for the selected doctor.</Text>
+
+                <Text style={styles.label}>Full Name*</Text>
+                <TextInput testID="ap-name" placeholder="Patient name" placeholderTextColor={colors.muted} value={pName} onChangeText={setPName} style={styles.input} />
+
+                <Text style={styles.label}>Mobile Number*</Text>
+                <View style={styles.mobileWrap}>
+                  <View style={styles.ccBadge}><Text style={styles.ccText}>+91</Text></View>
+                  <TextInput testID="ap-mobile" placeholder="98765 43210" placeholderTextColor={colors.muted} value={pMobile} onChangeText={(t) => setPMobile(t.replace(/[^0-9]/g, "").slice(0, 10))} keyboardType="phone-pad" style={styles.mobileInput} />
+                </View>
+
+                <View style={{ flexDirection: "row", gap: spacing.sm }}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.label}>Age</Text>
+                    <TextInput testID="ap-age" placeholder="32" placeholderTextColor={colors.muted} value={pAge} onChangeText={(t) => setPAge(t.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" style={styles.input} />
+                  </View>
+                  <View style={{ flex: 2 }}>
+                    <Text style={styles.label}>Gender</Text>
+                    <View style={styles.genderRow}>
+                      {GENDERS.map((g) => (
+                        <Pressable key={g} testID={`ap-gender-${g}`} onPress={() => setPGender(g)} style={[styles.genderChip, pGender === g && styles.genderChipActive]}>
+                          <Text style={[styles.genderText, pGender === g && { color: colors.onBrandPrimary }]}>{g}</Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                  </View>
+                </View>
+
+                <Text style={styles.label}>Symptoms / Reason</Text>
+                <TextInput testID="ap-symptoms" placeholder="Fever, cough, headache..." placeholderTextColor={colors.muted} value={pSymptoms} onChangeText={setPSymptoms} multiline style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]} />
+
+                <Text style={styles.label}>Address</Text>
+                <TextInput testID="ap-address" placeholder="Area, city" placeholderTextColor={colors.muted} value={pAddress} onChangeText={setPAddress} style={styles.input} />
+
+                <Text style={styles.label}>Slot (optional)</Text>
+                <TextInput testID="ap-slot" placeholder="e.g. 11:00 AM (leave blank for Walk-in)" placeholderTextColor={colors.muted} value={pSlot} onChangeText={setPSlot} style={styles.input} />
+
+                {addError ? <Text style={styles.error}>{addError}</Text> : null}
+
+                <Pressable testID="ap-submit" onPress={onAddPatient} disabled={addLoading} style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }]}>
+                  {addLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Add to Queue</Text>}
+                </Pressable>
+                <View style={{ height: spacing.xl }} />
+              </ScrollView>
+            </Pressable>
+          </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
+
+      {/* Emergency Modal */}
       <Modal transparent visible={emergencyOpen} animationType="slide" onRequestClose={() => setEmergencyOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setEmergencyOpen(false)}>
           <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
             <View style={styles.sheetHandle} />
             <Text style={styles.sheetTitle}>Emergency Insert</Text>
             <Text style={styles.sheetSub}>This patient will be pushed to the top of the queue.</Text>
-            <TextInput
-              testID="emergency-name-input"
-              placeholder="Patient name"
-              placeholderTextColor={colors.muted}
-              value={emergencyName}
-              onChangeText={setEmergencyName}
-              style={styles.emergencyInput}
-            />
+            <TextInput testID="emergency-name-input" placeholder="Patient name" placeholderTextColor={colors.muted} value={emergencyName} onChangeText={setEmergencyName} style={styles.emergencyInput} />
             <Pressable testID="emergency-confirm" onPress={insertEmergency} style={styles.emergencyBtn}>
               <Text style={styles.emergencyBtnText}>Insert as Priority</Text>
             </Pressable>
@@ -154,6 +314,7 @@ const styles = StyleSheet.create({
   header: { flexDirection: "row", padding: spacing.lg, alignItems: "center" },
   hello: { fontSize: font.base, color: colors.muted },
   name: { fontSize: font.xl, fontWeight: "700", color: colors.onSurface },
+  liveDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.muted, marginLeft: 4 },
   iconBtn: { width: 40, height: 40, borderRadius: radius.pill, backgroundColor: colors.surface, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.border },
   docPickerWrap: { paddingBottom: spacing.sm, borderBottomWidth: 1, borderBottomColor: colors.divider, backgroundColor: colors.surfaceSecondary },
   docPickerRow: { gap: spacing.sm, paddingHorizontal: spacing.lg },
@@ -164,24 +325,41 @@ const styles = StyleSheet.create({
   kpiCard: { flex: 1, minWidth: "22%", backgroundColor: colors.surface, padding: spacing.sm, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, alignItems: "center" },
   kpiLabel: { fontSize: 11, color: colors.muted },
   kpiValue: { fontSize: font.xl, fontWeight: "800", color: colors.onSurface },
-  scroll: { padding: spacing.lg, gap: spacing.sm, paddingBottom: 120 },
+  scroll: { padding: spacing.lg, gap: spacing.sm, paddingBottom: 140 },
   apptCard: { flexDirection: "row", alignItems: "center", gap: spacing.sm, backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border },
   tokenBubble: { width: 44, height: 44, borderRadius: radius.pill, backgroundColor: colors.brandSecondary, alignItems: "center", justifyContent: "center" },
   tokenText: { fontSize: font.sm, fontWeight: "700", color: colors.brandPrimary },
   apptName: { fontSize: font.base, fontWeight: "600", color: colors.onSurface },
   apptMeta: { fontSize: font.sm, color: colors.muted, textTransform: "capitalize" },
+  symptoms: { fontSize: 11, color: colors.onSurfaceSecondary, marginTop: 2 },
   actionsRow: { flexDirection: "row", gap: 6 },
   actBtn: { width: 32, height: 32, borderRadius: radius.pill, alignItems: "center", justifyContent: "center" },
-  fab: { position: "absolute", bottom: 24, right: 20, backgroundColor: colors.error, paddingHorizontal: spacing.lg, paddingVertical: spacing.md, borderRadius: radius.pill, flexDirection: "row", alignItems: "center", gap: 6, elevation: 4, shadowColor: "#000", shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.2, shadowRadius: 8 },
+  fabRow: { position: "absolute", bottom: 24, left: 20, right: 20, flexDirection: "row", justifyContent: "space-between", gap: spacing.sm },
+  fab: { flex: 1, paddingHorizontal: spacing.lg, paddingVertical: spacing.md, borderRadius: radius.pill, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, elevation: 4, shadowColor: "#000", shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.2, shadowRadius: 8 },
   fabText: { color: "#fff", fontWeight: "700", fontSize: font.base },
   empty: { alignItems: "center", padding: spacing.xxl, gap: spacing.md },
-  emptyText: { color: colors.muted, fontSize: font.base },
+  emptyText: { color: colors.muted, fontSize: font.base, textAlign: "center" },
   modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
   sheet: { backgroundColor: colors.surface, padding: spacing.lg, borderTopLeftRadius: 24, borderTopRightRadius: 24, gap: spacing.sm, paddingBottom: spacing.xxl },
   sheetHandle: { width: 40, height: 4, backgroundColor: colors.borderStrong, borderRadius: 2, alignSelf: "center", marginBottom: spacing.md },
   sheetTitle: { fontSize: font.xl, fontWeight: "700", color: colors.onSurface },
   sheetSub: { fontSize: font.base, color: colors.muted, marginBottom: spacing.md },
+  label: { fontSize: font.sm, color: colors.onSurfaceSecondary, marginTop: spacing.sm, marginBottom: spacing.xs, fontWeight: "500" },
+  input: { borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, paddingHorizontal: spacing.md, paddingVertical: 12, fontSize: font.base, color: colors.onSurface, backgroundColor: colors.surface },
+  mobileWrap: { flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, backgroundColor: colors.surface, overflow: "hidden" },
+  ccBadge: { paddingHorizontal: spacing.md, paddingVertical: 12, backgroundColor: colors.surfaceSecondary, borderRightWidth: 1, borderRightColor: colors.border },
+  ccText: { fontSize: font.base, color: colors.onSurface, fontWeight: "600" },
+  mobileInput: { flex: 1, paddingHorizontal: spacing.md, paddingVertical: 12, fontSize: font.base, color: colors.onSurface },
+  genderRow: { flexDirection: "row", gap: 6, marginTop: spacing.xs },
+  genderChip: { flex: 1, alignItems: "center", paddingVertical: 10, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface },
+  genderChipActive: { backgroundColor: colors.brandPrimary, borderColor: colors.brandPrimary },
+  genderText: { fontSize: font.sm, color: colors.onSurface, fontWeight: "500" },
+  error: { color: colors.error, marginTop: spacing.sm, fontSize: font.sm },
+  primaryBtn: { backgroundColor: colors.brandPrimary, borderRadius: radius.md, padding: spacing.lg, alignItems: "center", marginTop: spacing.lg, minHeight: 52, justifyContent: "center" },
+  primaryBtnText: { color: colors.onBrandPrimary, fontSize: font.lg, fontWeight: "600" },
   emergencyInput: { borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, padding: spacing.md, fontSize: font.base, color: colors.onSurface },
   emergencyBtn: { backgroundColor: colors.error, borderRadius: radius.md, padding: spacing.lg, alignItems: "center", marginTop: spacing.md },
   emergencyBtnText: { color: "#fff", fontSize: font.lg, fontWeight: "700" },
+  toast: { position: "absolute", bottom: 100, left: 20, right: 20, backgroundColor: colors.success, padding: spacing.md, borderRadius: radius.md, flexDirection: "row", alignItems: "center", gap: spacing.sm, elevation: 5 },
+  toastText: { color: "#fff", fontWeight: "600", flex: 1 },
 });
