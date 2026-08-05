@@ -10,15 +10,20 @@
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.emergent.patientqueue.gtzdaf"
+      "bundleIdentifier": "com.emergent.patientqueue.gtzdaf",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "Upload doctor photos, ID proof, and degree certificates",
+        "NSCameraUsageDescription": "Capture doctor documents for verification"
+      }
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
-        "backgroundColor": "#000000"
+        "backgroundColor": "#0369A1"
       },
       "edgeToEdgeEnabled": true,
-      "package": "com.emergent.patientqueue.gtzdaf"
+      "package": "com.emergent.patientqueue.gtzdaf",
+      "permissions": ["READ_MEDIA_IMAGES", "POST_NOTIFICATIONS"]
     },
     "web": {
       "bundler": "metro",

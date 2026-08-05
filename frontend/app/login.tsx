@@ -67,7 +67,11 @@ export default function Login() {
       }
       await signIn(res.access_token, res.user);
       const role = res.user.role;
-      router.replace(role === "doctor" ? "/doctor/dashboard" : "/receptionist/dashboard");
+      router.replace(
+        role === "doctor" ? "/doctor/dashboard"
+        : role === "owner" ? "/owner/dashboard"
+        : "/receptionist/dashboard"
+      );
     } catch (e: any) {
       setError(e.message || "Login failed");
     } finally {

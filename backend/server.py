@@ -43,7 +43,7 @@ app = FastAPI()
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer(auto_error=False)
 
-Role = Literal["patient", "doctor", "receptionist"]
+Role = Literal["patient", "doctor", "receptionist", "owner"]
 
 
 # ============ MODELS ============
@@ -152,6 +152,54 @@ class AddPatientBody(BaseModel):
     doctor_id: Optional[str] = None  # if provided, auto-book appointment
     slot: Optional[str] = None
     payment_method: Optional[str] = "pay_at_clinic"
+
+
+# ---- Owner: Doctor management models ----
+class OwnerAddDoctorBody(BaseModel):
+    full_name: str
+    email: EmailStr
+    password: str
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    specialty: str
+    degree: Optional[str] = None  # e.g. "MBBS, MD"
+    experience_years: Optional[int] = None
+    clinic_name: str
+    city: str
+    fees: int
+    timings: str
+    bio: Optional[str] = None
+    photo: Optional[str] = None          # base64 data URL or URL
+    id_proof_photo: Optional[str] = None  # base64
+    degree_photo: Optional[str] = None    # base64
+
+
+class OwnerUpdateDoctorBody(BaseModel):
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    specialty: Optional[str] = None
+    degree: Optional[str] = None
+    experience_years: Optional[int] = None
+    clinic_name: Optional[str] = None
+    city: Optional[str] = None
+    fees: Optional[int] = None
+    timings: Optional[str] = None
+    bio: Optional[str] = None
+    photo: Optional[str] = None
+    id_proof_photo: Optional[str] = None
+    degree_photo: Optional[str] = None
+    status: Optional[str] = None
+
+
+class DoctorSelfUpdateBody(BaseModel):
+    """Doctor updates own profile — limited fields."""
+    fees: Optional[int] = None
+    timings: Optional[str] = None
+    bio: Optional[str] = None
+    address: Optional[str] = None
+    phone: Optional[str] = None
+    photo: Optional[str] = None
 
 
 # ============ HELPERS ============
@@ -958,6 +1006,126 @@ async def ws_appt_queue(ws: WebSocket, appointment_id: str):
         await manager.disconnect(channel, ws)
 
 
+# ============ DOCTOR SELF-UPDATE ============
+@api_router.post("/doctor/update_profile")
+async def doctor_update_profile(body: DoctorSelfUpdateBody, user: dict = Depends(require_role("doctor"))):
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        return {"ok": True, "message": "No changes"}
+    await db.doctors.update_one({"user_id": user["id"]}, {"$set": updates})
+    return {"ok": True, "updated": list(updates.keys())}
+
+
+# ============ OWNER ENDPOINTS ============
+@api_router.get("/owner/stats")
+async def owner_stats(user: dict = Depends(require_role("owner"))):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    total_doctors = await db.doctors.count_documents({})
+    total_patients = await db.users.count_documents({"role": "patient"})
+    todays_appts = await db.appointments.count_documents({"date": today})
+    completed_today = await db.appointments.find({"date": today, "status": "completed"}, {"_id": 0}).to_list(1000)
+    # Compute revenue: sum of doctor fees for each completed appt
+    doctor_fees_cache: dict = {}
+    revenue = 0
+    for a in completed_today:
+        did = a["doctor_id"]
+        if did not in doctor_fees_cache:
+            d = await db.doctors.find_one({"id": did}, {"_id": 0, "fees": 1})
+            doctor_fees_cache[did] = (d or {}).get("fees", 0)
+        revenue += doctor_fees_cache[did]
+    total_receptionists = await db.users.count_documents({"role": "receptionist"})
+    return {
+        "total_doctors": total_doctors,
+        "total_patients": total_patients,
+        "total_receptionists": total_receptionists,
+        "todays_appointments": todays_appts,
+        "completed_today": len(completed_today),
+        "revenue_today": revenue,
+    }
+
+
+@api_router.get("/owner/doctors")
+async def owner_list_doctors(user: dict = Depends(require_role("owner"))):
+    docs = await db.doctors.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    # Attach today's appointment count per doctor
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for d in docs:
+        d["todays_appts"] = await db.appointments.count_documents({"doctor_id": d["id"], "date": today})
+    return docs
+
+
+@api_router.post("/owner/add-doctor")
+async def owner_add_doctor(body: OwnerAddDoctorBody, user: dict = Depends(require_role("owner"))):
+    # Ensure email not taken
+    existing = await db.users.find_one({"email": body.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    user_id = str(uuid.uuid4())
+    await db.users.insert_one({
+        "id": user_id,
+        "email": body.email.lower(),
+        "password_hash": hash_password(body.password),
+        "full_name": body.full_name,
+        "role": "doctor",
+        "phone": body.phone,
+        "address": body.address,
+        "created_by_owner": user["id"],
+        "created_at": now_iso(),
+    })
+    doctor_id = str(uuid.uuid4())
+    doc = {
+        "id": doctor_id,
+        "user_id": user_id,
+        "full_name": body.full_name,
+        "specialty": body.specialty,
+        "city": body.city,
+        "clinic_name": body.clinic_name,
+        "fees": body.fees,
+        "timings": body.timings,
+        "rating": 4.5,
+        "photo": body.photo,
+        "bio": body.bio or "",
+        "status": "active",
+        "address": body.address,
+        "phone": body.phone,
+        "email": body.email.lower(),
+        "degree": body.degree,
+        "experience_years": body.experience_years,
+        "id_proof_photo": body.id_proof_photo,
+        "degree_photo": body.degree_photo,
+        "created_at": now_iso(),
+    }
+    await db.doctors.insert_one(doc)
+    doc.pop("_id", None)
+    return {"ok": True, "doctor": doc}
+
+
+@api_router.put("/owner/doctors/{doctor_id}")
+async def owner_update_doctor(doctor_id: str, body: OwnerUpdateDoctorBody, user: dict = Depends(require_role("owner"))):
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        return {"ok": True}
+    await db.doctors.update_one({"id": doctor_id}, {"$set": updates})
+    # Also sync full_name to user record
+    if "full_name" in updates:
+        d = await db.doctors.find_one({"id": doctor_id})
+        if d:
+            await db.users.update_one({"id": d["user_id"]}, {"$set": {"full_name": updates["full_name"]}})
+    return {"ok": True, "updated": list(updates.keys())}
+
+
+@api_router.delete("/owner/doctors/{doctor_id}")
+async def owner_delete_doctor(doctor_id: str, user: dict = Depends(require_role("owner"))):
+    d = await db.doctors.find_one({"id": doctor_id})
+    if not d:
+        raise HTTPException(status_code=404, detail="Not found")
+    await db.doctors.delete_one({"id": doctor_id})
+    # Also delete the user account
+    await db.users.delete_one({"id": d["user_id"]})
+    return {"ok": True}
+
+
 # ============ SEED ============
 @app.on_event("startup")
 async def seed_data():
@@ -1008,6 +1176,18 @@ async def seed_data():
             "full_name": "Front Desk",
             "role": "receptionist",
             "phone": "+91-9000000000",
+            "created_at": now_iso(),
+        })
+
+    # Seed the app owner (admin)
+    if not await db.users.find_one({"email": "owner@meribaari.com"}):
+        await db.users.insert_one({
+            "id": str(uuid.uuid4()),
+            "email": "owner@meribaari.com",
+            "password_hash": hash_password("owner123"),
+            "full_name": "App Owner",
+            "role": "owner",
+            "phone": "+91-9000000001",
             "created_at": now_iso(),
         })
     logger.info("Seed complete.")

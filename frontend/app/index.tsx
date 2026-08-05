@@ -18,6 +18,8 @@ export default function Index() {
       router.replace("/doctor/dashboard");
     } else if (user.role === "receptionist") {
       router.replace("/receptionist/dashboard");
+    } else if (user.role === "owner") {
+      router.replace("/owner/dashboard");
     }
   }, [loading, user]);
 

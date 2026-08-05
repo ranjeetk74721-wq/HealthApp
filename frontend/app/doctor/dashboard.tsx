@@ -39,6 +39,11 @@ export default function DoctorDashboard() {
   const [refreshing, setRefreshing] = useState(false);
   const [prescOpen, setPrescOpen] = useState<any | null>(null);
   const [prescText, setPrescText] = useState("");
+  const [editOpen, setEditOpen] = useState(false);
+  const [editFees, setEditFees] = useState("");
+  const [editTimings, setEditTimings] = useState("");
+  const [editBio, setEditBio] = useState("");
+  const [editSaving, setEditSaving] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
 
@@ -94,6 +99,29 @@ export default function DoctorDashboard() {
     } catch (e) { console.log(e); }
   };
 
+  const openEditProfile = () => {
+    setEditFees(String(data?.doctor?.fees ?? ""));
+    setEditTimings(data?.doctor?.timings ?? "");
+    setEditBio(data?.doctor?.bio ?? "");
+    setEditOpen(true);
+  };
+
+  const saveProfile = async () => {
+    setEditSaving(true);
+    try {
+      const updates: any = {};
+      if (editFees && parseInt(editFees, 10) !== data?.doctor?.fees) updates.fees = parseInt(editFees, 10);
+      if (editTimings && editTimings !== data?.doctor?.timings) updates.timings = editTimings;
+      if (editBio !== (data?.doctor?.bio || "")) updates.bio = editBio;
+      if (Object.keys(updates).length > 0) {
+        await api.post("/doctor/update_profile", updates);
+      }
+      setEditOpen(false);
+      load(true);
+    } catch (e) { console.log(e); }
+    finally { setEditSaving(false); }
+  };
+
   if (loading || !data) return <SafeAreaView style={styles.safe}><ActivityIndicator style={{ marginTop: 60 }} color={colors.brand} /></SafeAreaView>;
 
   const currentMode = data.status;
@@ -111,6 +139,9 @@ export default function DoctorDashboard() {
             <View style={[styles.liveDot, wsConnected && { backgroundColor: colors.success }]} />
           </View>
         </View>
+        <Pressable onPress={openEditProfile} testID="doctor-edit-profile" style={styles.iconBtn}>
+          <Ionicons name="create-outline" size={20} color={colors.brandPrimary} />
+        </Pressable>
         <Pressable onPress={async () => { await signOut(); router.replace("/login"); }} testID="doctor-logout" style={styles.iconBtn}>
           <Ionicons name="log-out-outline" size={22} color={colors.onSurfaceSecondary} />
         </Pressable>
@@ -220,13 +251,32 @@ export default function DoctorDashboard() {
           </Pressable>
         </Pressable>
       </Modal>
+
+      <Modal transparent visible={editOpen} animationType="slide" onRequestClose={() => setEditOpen(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setEditOpen(false)}>
+          <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+            <View style={styles.sheetHandle} />
+            <Text style={styles.sheetTitle}>Update My Profile</Text>
+            <Text style={styles.sheetSub}>Update your consultation fees & timings</Text>
+            <Text style={styles.editLabel}>Consultation Fees (₹)</Text>
+            <TextInput testID="edit-fees" value={editFees} onChangeText={(v) => setEditFees(v.replace(/[^0-9]/g, ""))} keyboardType="number-pad" placeholder="500" placeholderTextColor={colors.muted} style={styles.editInput} />
+            <Text style={styles.editLabel}>Timings</Text>
+            <TextInput testID="edit-timings" value={editTimings} onChangeText={setEditTimings} placeholder="10:00 AM - 4:00 PM" placeholderTextColor={colors.muted} style={styles.editInput} />
+            <Text style={styles.editLabel}>Bio (optional)</Text>
+            <TextInput testID="edit-bio" value={editBio} onChangeText={setEditBio} multiline placeholder="Short bio" placeholderTextColor={colors.muted} style={[styles.editInput, { minHeight: 80, textAlignVertical: "top" }]} />
+            <Pressable testID="edit-save" onPress={saveProfile} disabled={editSaving} style={styles.saveBtn}>
+              {editSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveBtnText}>Save Changes</Text>}
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.surfaceSecondary },
-  header: { flexDirection: "row", padding: spacing.lg, alignItems: "center" },
+  header: { flexDirection: "row", padding: spacing.lg, alignItems: "center", gap: spacing.sm },
   hello: { fontSize: font.base, color: colors.muted },
   name: { fontSize: font.xl, fontWeight: "700", color: colors.onSurface },
   liveDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.muted, marginLeft: 4 },
@@ -266,6 +316,8 @@ const styles = StyleSheet.create({
   sheetTitle: { fontSize: font.xl, fontWeight: "700", color: colors.onSurface },
   sheetSub: { fontSize: font.base, color: colors.muted, marginBottom: spacing.md },
   prescInput: { borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, padding: spacing.md, fontSize: font.base, color: colors.onSurface, minHeight: 140, textAlignVertical: "top" },
+  editLabel: { fontSize: font.sm, color: colors.onSurfaceSecondary, marginTop: spacing.sm, marginBottom: 4, fontWeight: "600" },
+  editInput: { borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, padding: spacing.md, fontSize: font.base, color: colors.onSurface, backgroundColor: colors.surface },
   saveBtn: { backgroundColor: colors.brandPrimary, borderRadius: radius.md, padding: spacing.lg, alignItems: "center", marginTop: spacing.md },
   saveBtnText: { color: colors.onBrandPrimary, fontSize: font.lg, fontWeight: "700" },
 });

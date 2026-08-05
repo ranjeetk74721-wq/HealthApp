@@ -2,7 +2,7 @@ import React, { createContext, useContext, useEffect, useState, useCallback, Rea
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Platform } from "react-native";
 
-export type Role = "patient" | "doctor" | "receptionist";
+export type Role = "patient" | "doctor" | "receptionist" | "owner";
 
 export interface AuthUser {
   id: string;

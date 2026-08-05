@@ -80,8 +80,33 @@ export default function DoctorProfile() {
             <View style={{ flex: 1 }}>
               <Text style={styles.detailTitle}>{doctor.clinic_name}</Text>
               <Text style={styles.detailSub}>{doctor.city}, India</Text>
+              {doctor.address ? <Text style={styles.detailSub}>{doctor.address}</Text> : null}
             </View>
           </View>
+
+          {(doctor.degree || doctor.experience_years) ? (
+            <>
+              <Text style={styles.sectionTitle}>Credentials</Text>
+              {doctor.degree ? (
+                <View style={styles.detailCard}>
+                  <Ionicons name="school" size={20} color={colors.brand} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.detailTitle}>{doctor.degree}</Text>
+                    <Text style={styles.detailSub}>Degree qualification</Text>
+                  </View>
+                </View>
+              ) : null}
+              {doctor.experience_years ? (
+                <View style={styles.detailCard}>
+                  <Ionicons name="briefcase" size={20} color={colors.brand} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.detailTitle}>{doctor.experience_years} years experience</Text>
+                    <Text style={styles.detailSub}>In {doctor.specialty}</Text>
+                  </View>
+                </View>
+              ) : null}
+            </>
+          ) : null}
 
           <Text style={styles.sectionTitle}>Timings</Text>
           <View style={styles.detailCard}>
