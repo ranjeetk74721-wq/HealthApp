@@ -43,6 +43,7 @@ export default function DoctorDashboard() {
   const [editFees, setEditFees] = useState("");
   const [editTimings, setEditTimings] = useState("");
   const [editBio, setEditBio] = useState("");
+  const [editAvgMin, setEditAvgMin] = useState("");
   const [editSaving, setEditSaving] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
@@ -103,6 +104,7 @@ export default function DoctorDashboard() {
     setEditFees(String(data?.doctor?.fees ?? ""));
     setEditTimings(data?.doctor?.timings ?? "");
     setEditBio(data?.doctor?.bio ?? "");
+    setEditAvgMin(String(data?.doctor?.avg_consult_minutes ?? 15));
     setEditOpen(true);
   };
 
@@ -113,6 +115,10 @@ export default function DoctorDashboard() {
       if (editFees && parseInt(editFees, 10) !== data?.doctor?.fees) updates.fees = parseInt(editFees, 10);
       if (editTimings && editTimings !== data?.doctor?.timings) updates.timings = editTimings;
       if (editBio !== (data?.doctor?.bio || "")) updates.bio = editBio;
+      const avgMinNum = parseInt(editAvgMin, 10);
+      if (!isNaN(avgMinNum) && avgMinNum > 0 && avgMinNum !== (data?.doctor?.avg_consult_minutes ?? 15)) {
+        updates.avg_consult_minutes = avgMinNum;
+      }
       if (Object.keys(updates).length > 0) {
         await api.post("/doctor/update_profile", updates);
       }
@@ -260,6 +266,9 @@ export default function DoctorDashboard() {
             <Text style={styles.sheetSub}>Update your consultation fees & timings</Text>
             <Text style={styles.editLabel}>Consultation Fees (₹)</Text>
             <TextInput testID="edit-fees" value={editFees} onChangeText={(v) => setEditFees(v.replace(/[^0-9]/g, ""))} keyboardType="number-pad" placeholder="500" placeholderTextColor={colors.muted} style={styles.editInput} />
+            <Text style={styles.editLabel}>⏱ Avg. Time per Patient (minutes)</Text>
+            <TextInput testID="edit-avgmin" value={editAvgMin} onChangeText={(v) => setEditAvgMin(v.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" placeholder="15" placeholderTextColor={colors.muted} style={styles.editInput} />
+            <Text style={styles.hintTxt}>Patients ki live wait time is number × queue position se calculate hoti hai</Text>
             <Text style={styles.editLabel}>Timings</Text>
             <TextInput testID="edit-timings" value={editTimings} onChangeText={setEditTimings} placeholder="10:00 AM - 4:00 PM" placeholderTextColor={colors.muted} style={styles.editInput} />
             <Text style={styles.editLabel}>Bio (optional)</Text>
@@ -318,6 +327,7 @@ const styles = StyleSheet.create({
   prescInput: { borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, padding: spacing.md, fontSize: font.base, color: colors.onSurface, minHeight: 140, textAlignVertical: "top" },
   editLabel: { fontSize: font.sm, color: colors.onSurfaceSecondary, marginTop: spacing.sm, marginBottom: 4, fontWeight: "600" },
   editInput: { borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, padding: spacing.md, fontSize: font.base, color: colors.onSurface, backgroundColor: colors.surface },
+  hintTxt: { fontSize: 11, color: colors.muted, marginTop: 4, fontStyle: "italic" },
   saveBtn: { backgroundColor: colors.brandPrimary, borderRadius: radius.md, padding: spacing.lg, alignItems: "center", marginTop: spacing.md },
   saveBtnText: { color: colors.onBrandPrimary, fontSize: font.lg, fontWeight: "700" },
 });

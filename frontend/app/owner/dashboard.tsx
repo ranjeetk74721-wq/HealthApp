@@ -30,6 +30,7 @@ interface DocRow {
   todays_appts?: number;
   id_proof_photo?: string | null;
   degree_photo?: string | null;
+  avg_consult_minutes?: number | null;
   bio?: string | null;
   timings?: string;
 }
@@ -51,7 +52,7 @@ export default function OwnerDashboard() {
   const [f, setF] = useState({
     full_name: "", email: "", password: "", phone: "", address: "",
     specialty: "", degree: "", experience_years: "", clinic_name: "",
-    city: "", fees: "", timings: "", bio: "",
+    city: "", fees: "", timings: "", bio: "", avg_consult_minutes: "15",
   });
   const [photo, setPhoto] = useState<string | null>(null);
   const [idProof, setIdProof] = useState<string | null>(null);
@@ -62,7 +63,7 @@ export default function OwnerDashboard() {
     setF({
       full_name: "", email: "", password: "", phone: "", address: "",
       specialty: "", degree: "", experience_years: "", clinic_name: "",
-      city: "", fees: "", timings: "", bio: "",
+      city: "", fees: "", timings: "", bio: "", avg_consult_minutes: "15",
     });
     setPhoto(null); setIdProof(null); setDegreePhoto(null); setError(null);
   };
@@ -121,6 +122,7 @@ export default function OwnerDashboard() {
         fees: parseInt(f.fees, 10),
         timings: f.timings,
         bio: f.bio || undefined,
+        avg_consult_minutes: f.avg_consult_minutes ? parseInt(f.avg_consult_minutes, 10) : 15,
         photo, id_proof_photo: idProof, degree_photo: degreePhoto,
       });
       setToast(`Doctor added: ${f.full_name}`);
@@ -283,6 +285,7 @@ export default function OwnerDashboard() {
                 <TextInput testID="ad-clinic" placeholder="Clinic Name*" placeholderTextColor={colors.muted} value={f.clinic_name} onChangeText={(v) => setField("clinic_name", v)} style={styles.input} />
                 <TextInput testID="ad-city" placeholder="City*" placeholderTextColor={colors.muted} value={f.city} onChangeText={(v) => setField("city", v)} style={styles.input} />
                 <TextInput testID="ad-timings" placeholder='Timings* (e.g. "10 AM - 4 PM")' placeholderTextColor={colors.muted} value={f.timings} onChangeText={(v) => setField("timings", v)} style={styles.input} />
+                <TextInput testID="ad-avgmin" placeholder="Avg. time per patient (min, default 15)" placeholderTextColor={colors.muted} value={f.avg_consult_minutes} onChangeText={(v) => setField("avg_consult_minutes", v.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" style={styles.input} />
                 <TextInput testID="ad-bio" placeholder="Short bio (optional)" placeholderTextColor={colors.muted} value={f.bio} onChangeText={(v) => setField("bio", v)} multiline style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]} />
 
                 <Text style={styles.groupLabel}>Documents</Text>
@@ -333,6 +336,7 @@ export default function OwnerDashboard() {
                 <DetailRow icon="business" label="Clinic" value={viewDoc.clinic_name} />
                 <DetailRow icon="cash" label="Fees" value={`₹${viewDoc.fees}`} />
                 <DetailRow icon="time" label="Timings" value={viewDoc.timings || "—"} />
+                <DetailRow icon="hourglass" label="Avg. per patient" value={viewDoc.avg_consult_minutes ? `${viewDoc.avg_consult_minutes} minutes` : "15 minutes"} />
                 <DetailRow icon="mail" label="Email" value={viewDoc.email || "—"} />
                 <DetailRow icon="call" label="Phone" value={viewDoc.phone || "—"} />
                 <DetailRow icon="location" label="Address" value={viewDoc.address || "—"} />

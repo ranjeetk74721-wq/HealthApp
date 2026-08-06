@@ -172,6 +172,7 @@ class OwnerAddDoctorBody(BaseModel):
     photo: Optional[str] = None          # base64 data URL or URL
     id_proof_photo: Optional[str] = None  # base64
     degree_photo: Optional[str] = None    # base64
+    avg_consult_minutes: Optional[int] = 15
 
 
 class OwnerUpdateDoctorBody(BaseModel):
@@ -190,6 +191,7 @@ class OwnerUpdateDoctorBody(BaseModel):
     id_proof_photo: Optional[str] = None
     degree_photo: Optional[str] = None
     status: Optional[str] = None
+    avg_consult_minutes: Optional[int] = None
 
 
 class DoctorSelfUpdateBody(BaseModel):
@@ -200,6 +202,7 @@ class DoctorSelfUpdateBody(BaseModel):
     address: Optional[str] = None
     phone: Optional[str] = None
     photo: Optional[str] = None
+    avg_consult_minutes: Optional[int] = None
 
 
 # ============ HELPERS ============
@@ -603,7 +606,10 @@ async def estimate_wait_for_doctor(doctor_id: str) -> int:
         "date": today,
         "status": {"$in": ["booked", "arrived", "in_consultation"]},
     })
-    return pending * 15  # 15 minutes per patient
+    # Use doctor's configured avg_consult_minutes (fallback 15)
+    doctor = await db.doctors.find_one({"id": doctor_id}, {"_id": 0, "avg_consult_minutes": 1})
+    per = int((doctor or {}).get("avg_consult_minutes") or 15)
+    return pending * per
 
 
 @api_router.get("/doctors/{doctor_id}")
@@ -690,7 +696,12 @@ async def queue_status(appt_id: str, user: dict = Depends(get_current_user)):
     else:
         my_position = -1  # done / cancelled
 
-    eta_minutes = max(0, (my_position - (1 if current else 0))) * 15 if my_position > 0 else 0
+    eta_minutes = 0
+    if my_position > 0:
+        # Fetch doctor's avg consult time
+        doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "avg_consult_minutes": 1})
+        per = int((doctor or {}).get("avg_consult_minutes") or 15)
+        eta_minutes = max(0, (my_position - (1 if current else 0))) * per
 
     return {
         "appointment": appt,
@@ -1013,6 +1024,11 @@ async def doctor_update_profile(body: DoctorSelfUpdateBody, user: dict = Depends
     if not updates:
         return {"ok": True, "message": "No changes"}
     await db.doctors.update_one({"user_id": user["id"]}, {"$set": updates})
+    # If wait-time-affecting fields changed, broadcast to patients so their ETA refreshes live
+    if "avg_consult_minutes" in updates or "timings" in updates or "fees" in updates:
+        d = await db.doctors.find_one({"user_id": user["id"]}, {"_id": 0, "id": 1})
+        if d:
+            await broadcast_doctor_update(d["id"], "doctor_profile_updated")
     return {"ok": True, "updated": list(updates.keys())}
 
 
@@ -1094,6 +1110,7 @@ async def owner_add_doctor(body: OwnerAddDoctorBody, user: dict = Depends(requir
         "experience_years": body.experience_years,
         "id_proof_photo": body.id_proof_photo,
         "degree_photo": body.degree_photo,
+        "avg_consult_minutes": body.avg_consult_minutes or 15,
         "created_at": now_iso(),
     }
     await db.doctors.insert_one(doc)
@@ -1112,6 +1129,9 @@ async def owner_update_doctor(doctor_id: str, body: OwnerUpdateDoctorBody, user:
         d = await db.doctors.find_one({"id": doctor_id})
         if d:
             await db.users.update_one({"id": d["user_id"]}, {"$set": {"full_name": updates["full_name"]}})
+    # Broadcast if wait-time-affecting field changed
+    if "avg_consult_minutes" in updates or "timings" in updates or "fees" in updates or "status" in updates:
+        await broadcast_doctor_update(doctor_id, "doctor_profile_updated")
     return {"ok": True, "updated": list(updates.keys())}
 
 
@@ -1165,6 +1185,7 @@ async def seed_data():
                 "photo": sd["photo"],
                 "bio": f"Experienced {sd['specialty']} specialist with 10+ years of practice.",
                 "status": "active",
+                "avg_consult_minutes": 15,
             })
 
     # Seed a demo receptionist
