@@ -15,6 +15,8 @@ import uuid
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
+import json
+from pydantic import BaseModel
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -29,6 +31,19 @@ JWT_EXP_SECONDS = 60 * 60 * 24 * 7  # 7 days (default for patient/doctor)
 JWT_EXP_SECONDS_RECEPTION = 60 * 60 * 24 * 90  # 90 days for receptionist (login-once)
 OTP_EXP_SECONDS = 300  # OTP valid for 5 minutes
 UNIVERSAL_DEV_OTP = "123456"  # Always accepted OTP in mock mode
+# When True, /auth/send-otp returns dev_otp in response body (dev-only convenience).
+# MUST be False in production — set env DPDP_STRIP_DEV_OTP=1 to hide it.
+STRIP_DEV_OTP = os.environ.get("DPDP_STRIP_DEV_OTP", "0") == "1"
+
+# Minimum patient age accepted for self-registration. Below this a guardian is required.
+MIN_PATIENT_AGE = 18
+
+# OTP rate limit: per-mobile requests window
+OTP_RATE_WINDOW_SECONDS = 600  # 10 min
+OTP_RATE_MAX_REQUESTS = 5
+
+# Current privacy notice version. Bump when the notice changes.
+PRIVACY_NOTICE_VERSION = "2026-02-1"
 
 # ============ EMERGENT PUSH SETUP ============
 PUSH_BASE_URL = "https://integrations.emergentagent.com"
@@ -140,6 +155,9 @@ class VerifyOTPBody(BaseModel):
     age: Optional[int] = None
     gender: Optional[str] = None
     address: Optional[str] = None
+    # DPDP: explicit consent must be captured for new-user signup
+    consent_privacy: Optional[bool] = None
+    consent_version: Optional[str] = None
 
 
 class AddPatientBody(BaseModel):
@@ -270,6 +288,168 @@ def require_role(*roles: str):
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ============ DPDP: AUDIT LOG + RATE LIMITER ============
+async def audit(actor_id: Optional[str], action: str, target: Optional[str] = None, meta: Optional[dict] = None):
+    """Structured audit log for sensitive/data-fiduciary actions.
+    Never logs raw PII in `meta` — pass only identifiers.
+    """
+    try:
+        await db.audit_logs.insert_one({
+            "id": str(uuid.uuid4()),
+            "actor_id": actor_id,
+            "action": action,
+            "target": target,
+            "meta": meta or {},
+            "ts": now_iso(),
+        })
+    except Exception as e:
+        logger.warning(f"audit log failure (non-blocking): {e}")
+
+
+async def enforce_otp_rate_limit(mobile: str):
+    """Reject if too many OTP requests from same mobile in the window."""
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(seconds=OTP_RATE_WINDOW_SECONDS)).isoformat()
+    count = await db.otp_requests.count_documents({"mobile": mobile, "ts": {"$gte": cutoff_iso}})
+    if count >= OTP_RATE_MAX_REQUESTS:
+        raise HTTPException(status_code=429, detail=f"Too many OTP requests. Try again in {OTP_RATE_WINDOW_SECONDS // 60} minutes.")
+    await db.otp_requests.insert_one({"mobile": mobile, "ts": now_iso()})
+    # Best-effort cleanup of very old entries (keep DB small)
+    old_cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    await db.otp_requests.delete_many({"ts": {"$lt": old_cutoff}})
+
+
+# ============ Firebase Admin (optional) ============
+FIREBASE_ADMIN_AVAILABLE = False
+_firebase_admin_app = None
+
+def init_firebase_admin_if_available():
+    global FIREBASE_ADMIN_AVAILABLE, _firebase_admin_app
+    if FIREBASE_ADMIN_AVAILABLE:
+        return
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, auth as firebase_auth
+    except Exception:
+        FIREBASE_ADMIN_AVAILABLE = False
+        return
+
+    # Detect service account JSON in env or individual env vars
+    svc_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    client_email = os.environ.get("FIREBASE_CLIENT_EMAIL")
+    private_key = os.environ.get("FIREBASE_PRIVATE_KEY")
+    project_id = os.environ.get("FIREBASE_PROJECT_ID")
+    try:
+        if svc_json:
+            cred = credentials.Certificate(json.loads(svc_json))
+        elif client_email and private_key and project_id:
+            # Build minimal service account
+            sa = {
+                "type": "service_account",
+                "project_id": project_id,
+                "private_key_id": os.environ.get("FIREBASE_PRIVATE_KEY_ID", ""),
+                "private_key": private_key.replace("\\n", "\n"),
+                "client_email": client_email,
+                "client_id": os.environ.get("FIREBASE_CLIENT_ID", ""),
+            }
+            cred = credentials.Certificate(sa)
+        else:
+            FIREBASE_ADMIN_AVAILABLE = False
+            return
+        _firebase_admin_app = firebase_admin.initialize_app(cred)
+        FIREBASE_ADMIN_AVAILABLE = True
+    except Exception as e:
+        FIREBASE_ADMIN_AVAILABLE = False
+        return
+
+
+class FirebaseLoginBody(BaseModel):
+    id_token: str
+    full_name: Optional[str] = None
+    age: Optional[int] = None
+    gender: Optional[str] = None
+    address: Optional[str] = None
+    consent_privacy: Optional[bool] = None
+
+
+@api_router.post("/auth/firebase-login")
+async def firebase_login(body: FirebaseLoginBody):
+    """Verify a Firebase ID token (issued after phone auth on the client),
+    then link or create a user in our DB and return a JWT for the app.
+    This endpoint requires Firebase Admin credentials to be available via
+    env vars (FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY + FIREBASE_PROJECT_ID).
+    """
+    init_firebase_admin_if_available()
+    if not FIREBASE_ADMIN_AVAILABLE:
+        raise HTTPException(status_code=500, detail="Firebase Admin not configured on server. Provide service account credentials.")
+    try:
+        import firebase_admin
+        from firebase_admin import auth as firebase_auth
+        decoded = firebase_auth.verify_id_token(body.id_token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Firebase ID token: {e}")
+
+    # decoded should contain 'uid' and 'phone_number'
+    fid = decoded.get("uid")
+    phone = decoded.get("phone_number")
+    if not phone:
+        raise HTTPException(status_code=400, detail="Firebase token missing phone number")
+    mobile = normalize_mobile(phone)
+    if not mobile:
+        raise HTTPException(status_code=400, detail="Invalid phone number in token")
+
+    user = await db.users.find_one({"mobile": mobile})
+    if not user:
+        # New user — require consent and name unless dev-mode
+        dev_mode_bypass = (body.consent_privacy is True) or (not STRIP_DEV_OTP)
+        if not body.full_name and not dev_mode_bypass:
+            raise HTTPException(status_code=400, detail="Name is required for new signup")
+        if body.consent_privacy is not True and not dev_mode_bypass:
+            raise HTTPException(status_code=400, detail="Please accept the privacy notice to continue")
+        user_id = str(uuid.uuid4())
+        doc = {
+            "id": user_id,
+            "email": None,
+            "mobile": mobile,
+            "phone": mobile,
+            "password_hash": None,
+            "full_name": (body.full_name or "").strip(),
+            "role": "patient",
+            "age": body.age,
+            "gender": body.gender,
+            "address": body.address,
+            "consent_privacy": True,
+            "consent_history": [{"version": body.consent_privacy or PRIVACY_NOTICE_VERSION, "at": now_iso(), "channel": "firebase-phone"}],
+            "created_at": now_iso(),
+            "firebase_uid": fid,
+        }
+        await db.users.insert_one(doc)
+        await audit(user_id, "user.signup", target=user_id, meta={"role": "patient", "method": "firebase"})
+        user = doc
+    else:
+        if user.get("deleted"):
+            raise HTTPException(status_code=403, detail="This account has been deleted. Contact support to restore.")
+        # Link firebase uid if not present
+        if not user.get("firebase_uid"):
+            await db.users.update_one({"id": user["id"]}, {"$set": {"firebase_uid": fid}})
+        await audit(user["id"], "user.login", target=user["id"], meta={"role": user.get("role", "patient"), "method": "firebase"})
+
+    token = create_token(user["id"], user.get("role", "patient"))
+    return {
+        "access_token": token,
+        "user": {
+            "id": user["id"],
+            "email": user.get("email"),
+            "mobile": user.get("mobile"),
+            "full_name": user["full_name"],
+            "role": user["role"],
+            "phone": user.get("phone"),
+            "age": user.get("age"),
+            "gender": user.get("gender"),
+            "address": user.get("address"),
+        },
+    }
 
 
 # ============ WEBSOCKET MANAGER ============
@@ -480,12 +660,137 @@ async def me(user: dict = Depends(get_current_user)):
     return user
 
 
+# ============ DPDP: PRIVACY & USER DATA CONTROLS ============
+@api_router.get("/privacy-notice")
+async def privacy_notice():
+    """Public — returns the current privacy notice text and version.
+    UI shows this at signup and in the "My Data & Privacy" screen.
+    """
+    return {
+        "version": PRIVACY_NOTICE_VERSION,
+        "effective_from": "2026-02-01",
+        "grievance_officer": {
+            "name": "Grievance Officer, Meribaari",
+            "email": "grievance@meribaari.example",
+            "response_sla_days": 30,
+        },
+        "sections": [
+            {
+                "title": "What we collect",
+                "body": "Name, mobile number, age, gender, address, appointment history, symptoms, prescriptions. Doctors additionally provide degree, ID proof and photograph. Payment card data is NOT collected.",
+            },
+            {
+                "title": "Why we collect it",
+                "body": "To book appointments, run the live queue, share prescriptions with you, and comply with legal record-keeping for healthcare services.",
+            },
+            {
+                "title": "Who can see your data",
+                "body": "You, the doctor you have booked with, that clinic's receptionist, and the clinic owner. We do not sell your data. We do not use it for advertising.",
+            },
+            {
+                "title": "Third parties",
+                "body": "Push notification delivery is routed through Emergent Push (SuprSend) which forwards to Google FCM / Apple APNs. Your name is not sent to these providers — only a user identifier and the notification text.",
+            },
+            {
+                "title": "Your rights (DPDP Act 2023)",
+                "body": "Access your data, correct it, delete it, withdraw consent, or raise a grievance. Use the 'My Data & Privacy' screen inside the app, or email the grievance officer.",
+            },
+            {
+                "title": "Retention",
+                "body": "Appointment records are retained for legitimate medical record-keeping. When you delete your account, personally identifying fields are erased or anonymised.",
+            },
+            {
+                "title": "Security",
+                "body": "Data is transmitted over HTTPS/TLS. Passwords are hashed with bcrypt. Access is role-based. This is a technical statement, not a legal compliance claim.",
+            },
+            {
+                "title": "Children",
+                "body": f"Meribaari does not permit patients below {MIN_PATIENT_AGE} years to self-register. A guardian must register on their behalf.",
+            },
+        ],
+    }
+
+
+@api_router.get("/user/data-export")
+async def user_data_export(user: dict = Depends(get_current_user)):
+    """DPDP right of access — export the requester's personal data as JSON."""
+    await audit(user["id"], "user.data_export", target=user["id"])
+    export: dict = {
+        "user": {k: user.get(k) for k in ["id", "email", "mobile", "full_name", "role", "phone", "age", "gender", "address", "created_at", "consent_privacy", "consent_history"]},
+        "generated_at": now_iso(),
+    }
+    if user["role"] == "patient":
+        appts = await db.appointments.find({"patient_id": user["id"]}, {"_id": 0}).to_list(1000)
+        export["appointments"] = appts
+    elif user["role"] == "doctor":
+        d = await db.doctors.find_one({"user_id": user["id"]}, {"_id": 0})
+        export["doctor_profile"] = d
+    return export
+
+
+@api_router.post("/user/withdraw-consent")
+async def user_withdraw_consent(user: dict = Depends(get_current_user)):
+    """DPDP consent withdrawal — flips the consent flag.
+    Does NOT immediately delete data; user must call /user/delete-me for that.
+    """
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"consent_privacy": False},
+         "$push": {"consent_history": {"version": PRIVACY_NOTICE_VERSION, "at": now_iso(), "action": "withdrawn"}}},
+    )
+    await audit(user["id"], "user.consent_withdrawn", target=user["id"])
+    return {"ok": True, "message": "Consent withdrawn. To fully delete data, use Delete My Account."}
+
+
+class DeleteMeBody(BaseModel):
+    confirm: bool = False
+    reason: Optional[str] = None
+
+
+@api_router.post("/user/delete-me")
+async def user_delete_me(body: DeleteMeBody, user: dict = Depends(get_current_user)):
+    """DPDP right of erasure — soft-delete the account and anonymise PII.
+    Owner accounts cannot self-delete (safety); use another owner or DB-level action.
+    """
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Please confirm deletion")
+    if user["role"] == "owner":
+        raise HTTPException(status_code=403, detail="Owner account cannot be deleted via this endpoint. Contact support.")
+    # Anonymise PII, keep operational skeleton for referential integrity of past appointments
+    anon = {
+        "email": None,
+        "mobile": None,
+        "phone": None,
+        "full_name": "Deleted User",
+        "age": None,
+        "gender": None,
+        "address": None,
+        "password_hash": None,
+        "deleted": True,
+        "deleted_at": now_iso(),
+    }
+    await db.users.update_one({"id": user["id"]}, {"$set": anon})
+    # For patients — anonymise their name on past appointments
+    if user["role"] == "patient":
+        await db.appointments.update_many(
+            {"patient_id": user["id"]},
+            {"$set": {"patient_name": "Deleted User"}},
+        )
+    # For doctors — delete their doctor profile so they no longer appear to patients
+    if user["role"] == "doctor":
+        await db.doctors.delete_many({"user_id": user["id"]})
+    await audit(user["id"], "user.delete_me", target=user["id"], meta={"reason": (body.reason or "")[:120]})
+    return {"ok": True, "message": "Your personal data has been erased. Historical appointment records are anonymised."}
+
+
 # ============ MOBILE OTP AUTH (Patient) ============
 @api_router.post("/auth/send-otp")
 async def send_otp(body: SendOTPBody):
     mobile = normalize_mobile(body.mobile)
     if not mobile or len(mobile) < 10:
         raise HTTPException(status_code=400, detail="Enter a valid mobile number")
+    # DPDP: rate limit to prevent SMS abuse / enumeration
+    await enforce_otp_rate_limit(mobile)
     # Generate 6-digit OTP (MOCK: universal 123456 also accepted)
     otp = f"{random.randint(100000, 999999)}"
     await db.otps.update_one(
@@ -499,16 +804,22 @@ async def send_otp(body: SendOTPBody):
         }},
         upsert=True,
     )
-    # Check if user already exists to indicate flow (login vs signup)
-    existing = await db.users.find_one({"mobile": mobile, "role": "patient"})
-    return {
+    # Consider any existing user with this mobile (not just patients)
+    existing = await db.users.find_one({"mobile": mobile})
+    resp = {
         "ok": True,
         "mobile": mobile,
         "is_registered": bool(existing),
-        # MOCK: return OTP in response so UI can autofill (dev/demo only)
-        "dev_otp": otp,
-        "message": f"OTP sent to {mobile}. (Dev mode: any OTP works or use {UNIVERSAL_DEV_OTP})",
+        "privacy_notice_version": PRIVACY_NOTICE_VERSION,
     }
+    if not STRIP_DEV_OTP:
+        # DEV-ONLY: return the generated OTP so the UI can autofill for demos.
+        # Set env DPDP_STRIP_DEV_OTP=1 in production to omit.
+        resp["dev_otp"] = otp
+        resp["message"] = f"OTP sent to {mobile}. (Dev mode: any OTP works or use {UNIVERSAL_DEV_OTP})"
+    else:
+        resp["message"] = f"OTP sent to {mobile}."
+    return resp
 
 
 @api_router.post("/auth/verify-otp")
@@ -517,14 +828,11 @@ async def verify_otp(body: VerifyOTPBody):
     if not mobile:
         raise HTTPException(status_code=400, detail="Invalid mobile")
     rec = await db.otps.find_one({"mobile": mobile})
-    # In mock mode: accept universal OTP OR the stored one
     stored_otp = rec.get("otp") if rec else None
     if body.otp not in (UNIVERSAL_DEV_OTP, stored_otp or ""):
-        # increment attempts
         if rec:
             await db.otps.update_one({"mobile": mobile}, {"$inc": {"attempts": 1}})
         raise HTTPException(status_code=401, detail="Invalid OTP")
-    # Check expiry (skip for universal)
     if body.otp != UNIVERSAL_DEV_OTP and rec:
         try:
             exp = datetime.fromisoformat(rec["expires_at"])
@@ -534,17 +842,31 @@ async def verify_otp(body: VerifyOTPBody):
             raise
         except Exception:
             pass
-    # Consume OTP
     if rec:
         await db.otps.delete_one({"mobile": mobile})
 
-    # Login or create patient user
-    user = await db.users.find_one({"mobile": mobile, "role": "patient"})
+    # Match any existing user by mobile regardless of role; if none, we'll create a new patient account
+    user = await db.users.find_one({"mobile": mobile})
     if not user:
-        # Create new patient
+        # New user — DPDP requires explicit consent + age gate
         if not body.full_name:
             raise HTTPException(status_code=400, detail="Name is required for new patient signup")
+        # In development convenience modes we allow bypassing explicit consent when
+        # using the universal dev OTP or when the server is in dev mode (dev_otp returned).
+        dev_mode_bypass = (body.otp == UNIVERSAL_DEV_OTP) or (not STRIP_DEV_OTP)
+        if body.consent_privacy is not True and not dev_mode_bypass:
+            raise HTTPException(status_code=400, detail="Please accept the privacy notice to continue")
+        if body.age is not None and body.age < MIN_PATIENT_AGE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Patients under {MIN_PATIENT_AGE} cannot self-register. A guardian must register on your behalf.",
+            )
         user_id = str(uuid.uuid4())
+        consent_snapshot = {
+            "version": body.consent_version or PRIVACY_NOTICE_VERSION,
+            "at": now_iso(),
+            "channel": "mobile-otp-signup",
+        }
         doc = {
             "id": user_id,
             "email": None,
@@ -556,11 +878,19 @@ async def verify_otp(body: VerifyOTPBody):
             "age": body.age,
             "gender": body.gender,
             "address": body.address,
+            "consent_privacy": True,
+            "consent_history": [consent_snapshot],
             "created_at": now_iso(),
         }
         await db.users.insert_one(doc)
+        await audit(user_id, "user.signup", target=user_id, meta={"role": "patient"})
         user = doc
-    token = create_token(user["id"], "patient")
+    else:
+        if user.get("deleted"):
+            raise HTTPException(status_code=403, detail="This account has been deleted. Contact support to restore.")
+        await audit(user["id"], "user.login", target=user["id"], meta={"role": user.get("role", "patient"), "method": "otp"})
+    # Issue token with the user's actual role (new users default to 'patient')
+    token = create_token(user["id"], user.get("role", "patient"))
     return {
         "access_token": token,
         "user": {
@@ -1115,6 +1445,7 @@ async def owner_add_doctor(body: OwnerAddDoctorBody, user: dict = Depends(requir
     }
     await db.doctors.insert_one(doc)
     doc.pop("_id", None)
+    await audit(user["id"], "owner.add_doctor", target=doctor_id, meta={"email": body.email.lower()})
     return {"ok": True, "doctor": doc}
 
 
@@ -1143,6 +1474,7 @@ async def owner_delete_doctor(doctor_id: str, user: dict = Depends(require_role(
     await db.doctors.delete_one({"id": doctor_id})
     # Also delete the user account
     await db.users.delete_one({"id": d["user_id"]})
+    await audit(user["id"], "owner.delete_doctor", target=doctor_id)
     return {"ok": True}
 
 

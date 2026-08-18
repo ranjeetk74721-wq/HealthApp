@@ -23,6 +23,7 @@ export default function OtpScreen() {
   const [age, setAge] = useState("");
   const [gender, setGender] = useState<string | null>(null);
   const [address, setAddress] = useState("");
+  const [consent, setConsent] = useState<boolean>(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [resendCount, setResendCount] = useState(30);
@@ -67,17 +68,27 @@ export default function OtpScreen() {
     }
     setLoading(true);
     try {
-      const body: any = { mobile, otp: otpString };
+      // Ensure mobile is sent in normalized form the server expects
+      const normalizedMobile = mobile.replace(/[^0-9+]/g, "");
+      const body: any = { mobile: normalizedMobile, otp: otpString };
       if (!isRegistered) {
-        if (!name.trim()) throw new Error("Full name is required");
-        body.full_name = name.trim();
-        body.age = age ? parseInt(age, 10) : undefined;
-        body.gender = gender;
-        body.address = address || undefined;
-      }
+          if (!name.trim()) throw new Error("Full name is required");
+          if (!consent) throw new Error("Please accept the privacy notice to continue");
+          body.full_name = name.trim();
+          body.age = age ? parseInt(age, 10) : undefined;
+          body.gender = gender;
+          body.address = address || undefined;
+          body.consent_privacy = true;
+        }
       const res = await api.post("/auth/verify-otp", body);
       await signIn(res.access_token, res.user);
-      router.replace("/patient/home");
+      const role = res.user.role;
+      router.replace(
+        role === "doctor" ? "/doctor/dashboard"
+        : role === "owner" ? "/owner/dashboard"
+        : role === "receptionist" ? "/receptionist/dashboard"
+        : "/patient/home"
+      );
     } catch (e: any) {
       setError(e.message || "Verification failed");
     } finally {
@@ -89,7 +100,8 @@ export default function OtpScreen() {
     setError(null);
     setResendCount(30);
     try {
-      const res = await api.post("/auth/send-otp", { mobile });
+      const normalizedMobile = mobile.replace(/[^0-9+]/g, "");
+      const res = await api.post("/auth/send-otp", { mobile: normalizedMobile });
       setDevOtp(res.dev_otp || "");
     } catch (e: any) {
       setError(e.message);
@@ -191,6 +203,17 @@ export default function OtpScreen() {
                 style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]}
               />
 
+              <Pressable testID="privacy-link" onPress={() => router.push('/privacy-notice') } style={styles.privacyLinkRow}>
+                <Text style={styles.privacyLinkText}>Read our Privacy Notice</Text>
+              </Pressable>
+
+              <Pressable testID="consent-checkbox" onPress={() => setConsent(!consent)} style={styles.consentRow}>
+                <View style={[styles.checkbox, consent && styles.checkboxChecked]}>
+                  {consent ? <Text style={styles.checkboxTick}>✓</Text> : null}
+                </View>
+                <Text style={styles.consentText}>I have read and accept the Privacy Notice</Text>
+              </Pressable>
+
               {error ? <Text style={styles.error}>{error}</Text> : null}
 
               <Pressable testID="complete-signup-btn" onPress={onVerify} disabled={loading} style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }]}>
@@ -229,4 +252,11 @@ const styles = StyleSheet.create({
   genderChip: { flex: 1, alignItems: "center", paddingVertical: 12, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface },
   genderChipActive: { backgroundColor: colors.brandPrimary, borderColor: colors.brandPrimary },
   genderText: { fontSize: font.base, color: colors.onSurface, fontWeight: "500" },
+  privacyLinkRow: { marginTop: spacing.md, alignItems: "center" },
+  privacyLinkText: { color: colors.brandPrimary, fontWeight: "600" },
+  consentRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm, marginTop: spacing.md },
+  checkbox: { width: 20, height: 20, borderRadius: 4, borderWidth: 1.5, borderColor: colors.border, alignItems: "center", justifyContent: "center", backgroundColor: colors.surface },
+  checkboxChecked: { backgroundColor: colors.brandPrimary, borderColor: colors.brandPrimary },
+  checkboxTick: { color: colors.onBrandPrimary, fontWeight: "700" },
+  consentText: { marginLeft: spacing.sm, color: colors.onSurface, fontSize: font.sm, flex: 1 },
 });
