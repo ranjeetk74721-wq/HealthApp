@@ -351,6 +351,26 @@ def init_firebase_admin_if_available():
     client_email = os.environ.get("FIREBASE_CLIENT_EMAIL")
     private_key = os.environ.get("FIREBASE_PRIVATE_KEY")
     project_id = os.environ.get("FIREBASE_PROJECT_ID")
+    # If the service account JSON was pasted raw into the .env file (common mistake),
+    # try to extract a JSON object from the file and use it.
+    if not svc_json:
+        try:
+            env_path = ROOT_DIR / ".env"
+            if env_path.exists():
+                txt = env_path.read_text()
+                # Find a JSON object in the .env file content
+                start = txt.find('{')
+                end = txt.rfind('}')
+                if start != -1 and end != -1 and end > start:
+                    candidate = txt[start:end+1]
+                    try:
+                        parsed = json.loads(candidate)
+                        svc_json = json.dumps(parsed)
+                        os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"] = svc_json
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     try:
         if svc_json:
             cred = credentials.Certificate(json.loads(svc_json))
