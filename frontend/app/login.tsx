@@ -34,16 +34,15 @@ export default function Login() {
     }
     setSendingOtp(true);
     try {
-      const res = await api.post("/auth/send-otp", { mobile: clean });
-      // Navigate to OTP screen with mobile + is_registered flag + dev_otp for autofill
-      router.push({
-        pathname: "/otp",
-        params: {
-          mobile: res.mobile,
-          is_registered: res.is_registered ? "1" : "0",
-          dev_otp: res.dev_otp || "",
-        },
-      } as any);
+      // Try Firebase phone auth if configured; otherwise fall back to backend send-otp
+      let useFirebase = !!process.env.EXPO_PUBLIC_FIREBASE_API_KEY;
+      if (!useFirebase) {
+        const res = await api.post("/auth/send-otp", { mobile: clean });
+        router.push({ pathname: "/otp", params: { mobile: res.mobile, is_registered: res.is_registered ? "1" : "0", dev_otp: res.dev_otp || "" } } as any);
+      } else {
+        // For Firebase, navigate to OTP screen which will handle sending via Firebase
+        router.push({ pathname: "/otp", params: { mobile: `+91${clean}`, is_registered: "0", firebase: "1" } } as any);
+      }
     } catch (e: any) {
       setError(e.message || "Failed to send OTP");
     } finally {

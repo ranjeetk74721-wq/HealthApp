@@ -58,6 +58,17 @@ app = FastAPI()
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer(auto_error=False)
 
+
+@app.on_event("startup")
+async def ensure_db_indexes():
+    try:
+        # Ensure sparse index on firebase_uid for quick lookups (sparse so missing fields allowed)
+        await db.users.create_index([("firebase_uid", 1)], sparse=True)
+        # Ensure index on mobile
+        await db.users.create_index([("mobile", 1)], unique=False)
+    except Exception:
+        pass
+
 Role = Literal["patient", "doctor", "receptionist", "owner"]
 
 

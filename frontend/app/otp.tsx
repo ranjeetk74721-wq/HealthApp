@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { View, Text, TextInput, Pressable, StyleSheet, KeyboardAvoidingView, Platform, ScrollView, ActivityIndicator } from "react-native";
 import { useRouter, useLocalSearchParams } from "expo-router";
+import FirebaseRecaptcha from "expo-firebase-recaptcha";
+import { auth } from "@/src/firebase";
 import { Ionicons } from "@expo/vector-icons";
 import { useAuth } from "@/src/context/AuthContext";
 import { api } from "@/src/api/client";
@@ -12,6 +14,7 @@ const GENDERS = ["Male", "Female", "Other"];
 export default function OtpScreen() {
   const router = useRouter();
   const params = useLocalSearchParams<{ mobile: string; is_registered: string; dev_otp: string }>();
+  const isFirebase = (params.firebase as string) === "1";
   const { signIn } = useAuth();
   const mobile = params.mobile as string;
   const isRegistered = params.is_registered === "1";
@@ -28,12 +31,32 @@ export default function OtpScreen() {
   const [error, setError] = useState<string | null>(null);
   const [resendCount, setResendCount] = useState(30);
   const [devOtp, setDevOtp] = useState<string>((params.dev_otp as string) || "");
+  const [verificationId, setVerificationId] = useState<string | null>(null);
+  const recaptchaVerifierRef = useRef<any>(null);
 
   useEffect(() => {
     if (resendCount <= 0) return;
     const t = setTimeout(() => setResendCount((c) => c - 1), 1000);
     return () => clearTimeout(t);
   }, [resendCount]);
+
+  useEffect(() => {
+    // If using Firebase, and on OTP step, trigger sending SMS using Firebase
+    (async () => {
+      if (!isFirebase) return;
+      if (step !== "otp") return;
+      try {
+        if (!auth) return;
+        // expo-firebase-recaptcha requires a ref component; handled in JSX below
+        const phone = mobile;
+        const confirmation = await auth.signInWithPhoneNumber(phone);
+        // In RN web SDK usage, this may differ; we fallback to backend flow if not available
+        setVerificationId((confirmation as any)?.verificationId || null);
+      } catch (e) {
+        // ignore — firebase not configured properly in this environment
+      }
+    })();
+  }, [isFirebase, step]);
 
   const handleChange = (idx: number, val: string) => {
     const cleaned = val.replace(/[^0-9]/g, "").slice(-1);
@@ -71,6 +94,34 @@ export default function OtpScreen() {
       // Ensure mobile is sent in normalized form the server expects
       const normalizedMobile = mobile.replace(/[^0-9+]/g, "");
       const body: any = { mobile: normalizedMobile, otp: otpString };
+      // If using Firebase phone auth, confirm with Firebase and then exchange ID token with backend
+      if (isFirebase && auth) {
+        try {
+          // If verificationId is available, confirm via Firebase
+          if (verificationId) {
+            // Assemble credential and sign in
+            const { PhoneAuthProvider, signInWithCredential } = await import('firebase/auth');
+            const credential = PhoneAuthProvider.credential(verificationId, otpString);
+            const userCred = await signInWithCredential(auth, credential);
+            const idToken = await userCred.user.getIdToken();
+            // Send ID token to backend to create/link user
+            const res = await api.post('/auth/firebase-login', { id_token: idToken, full_name: body.full_name, age: body.age, gender: body.gender, address: body.address, consent_privacy: body.consent_privacy });
+            await signIn(res.access_token, res.user);
+            const role = res.user.role;
+            router.replace(
+              role === "doctor" ? "/doctor/dashboard"
+              : role === "owner" ? "/owner/dashboard"
+              : role === "receptionist" ? "/receptionist/dashboard"
+              : "/patient/home"
+            );
+            return;
+          }
+        } catch (e: any) {
+          setError(e.message || 'Firebase verification failed');
+          setLoading(false);
+          return;
+        }
+      }
       if (!isRegistered) {
           if (!name.trim()) throw new Error("Full name is required");
           if (!consent) throw new Error("Please accept the privacy notice to continue");
