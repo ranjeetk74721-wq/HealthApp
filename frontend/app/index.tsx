@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { View, ActivityIndicator, StyleSheet } from "react-native";
+import { View, ActivityIndicator, StyleSheet, Text } from "react-native";
 import { useRouter } from "expo-router";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors } from "@/src/theme";
@@ -21,15 +21,17 @@ export default function Index() {
     } else if (user.role === "owner") {
       router.replace("/owner/dashboard");
     }
-  }, [loading, user]);
+  }, [loading, router, user]);
 
   return (
-    <View style={styles.container} testID="splash-loader">
+    <View style={styles.container} testID="splash-loader" accessibilityLabel="Loading Meribaari">
       <ActivityIndicator size="large" color={colors.brand} />
+      <Text style={styles.loadingText}>Loading Meribaari...</Text>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.surface, alignItems: "center", justifyContent: "center" },
+  container: { flex: 1, backgroundColor: colors.surface, alignItems: "center", justifyContent: "center", gap: 12 },
+  loadingText: { color: colors.onSurfaceSecondary, fontSize: 16, fontWeight: "600" },
 });

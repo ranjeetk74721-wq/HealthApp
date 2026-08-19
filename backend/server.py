@@ -21,8 +21,12 @@ from pydantic import BaseModel
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
+mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+client = AsyncIOMotorClient(
+    mongo_url,
+    serverSelectionTimeoutMS=2000,
+    connectTimeoutMS=2000,
+)
 db = client[os.environ["DB_NAME"]]
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "clinicqueue-secret-key-change-in-prod")
@@ -68,6 +72,15 @@ async def ensure_db_indexes():
         await db.users.create_index([("mobile", 1)], unique=False)
     except Exception:
         pass
+
+
+@app.get("/health")
+async def health_check():
+    try:
+        await client.admin.command("ping")
+        return {"status": "ok", "database": "connected"}
+    except Exception:
+        return {"status": "degraded", "database": "unavailable"}
 
 Role = Literal["patient", "doctor", "receptionist", "owner"]
 
@@ -1513,6 +1526,12 @@ async def owner_delete_doctor(doctor_id: str, user: dict = Depends(require_role(
 @app.on_event("startup")
 async def seed_data():
     logger.info("Seeding data...")
+    try:
+        await client.admin.command("ping")
+    except Exception as exc:
+        logger.warning("Skipping seed data because MongoDB is unavailable: %s", exc)
+        return
+
     # Seed sample doctors if none
     if await db.doctors.count_documents({}) == 0:
         sample_doctors = [

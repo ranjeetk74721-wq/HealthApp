@@ -1,6 +1,14 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import Constants from "expo-constants";
+import { Platform } from "react-native";
 
-const BASE = process.env.EXPO_PUBLIC_BACKEND_URL + "/api";
+const configuredBase = process.env.EXPO_PUBLIC_BACKEND_URL || "http://localhost:8000";
+const expoHost = Constants.expoConfig?.hostUri?.split(":")[0];
+const isLocalhost = /localhost|127\.0\.0\.1/.test(configuredBase);
+const backendBase = Platform.OS !== "web" && isLocalhost && expoHost
+  ? `http://${expoHost}:8000`
+  : configuredBase;
+const BASE = backendBase.replace(/\/$/, "") + "/api";
 
 async function getToken() {
   return await AsyncStorage.getItem("cq_token");
@@ -10,7 +18,14 @@ async function request(path: string, opts: RequestInit = {}) {
   const token = await getToken();
   const headers: any = { "Content-Type": "application/json", ...(opts.headers || {}) };
   if (token) headers.Authorization = `Bearer ${token}`;
-  const res = await fetch(`${BASE}${path}`, { ...opts, headers });
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, { ...opts, headers });
+  } catch {
+    throw new Error(
+      `Unable to reach the ClinicQueue API at ${backendBase}. Start MongoDB and the FastAPI server on port 8000, then try again.`,
+    );
+  }
   const text = await res.text();
   let data: any = null;
   try {
