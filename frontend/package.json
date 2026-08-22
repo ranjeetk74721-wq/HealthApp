@@ -8,6 +8,7 @@
     "start:lan": "expo start --lan",
     "start:lan:clear": "expo start --lan --clear",
     "start:tunnel": "expo start --tunnel",
+    "build": "expo export",
     "start:go": "expo start --lan",
     "build:android": "eas build --platform android",
     "reset-project": "node ./scripts/reset-project.js",
