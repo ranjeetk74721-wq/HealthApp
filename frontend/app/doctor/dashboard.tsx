@@ -3,7 +3,7 @@ import { View, Text, StyleSheet, ScrollView, ActivityIndicator, Pressable, Refre
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
-import { api } from "@/src/api/client";
+import { api, getBackendWebSocketBase } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 
@@ -27,8 +27,6 @@ const STATUS_COLORS: Record<string, string> = {
   completed: colors.success,
   skipped: colors.muted,
 };
-
-const WS_BASE = (process.env.EXPO_PUBLIC_BACKEND_URL || "").replace(/^http/, "ws");
 
 export default function DoctorDashboard() {
   const router = useRouter();
@@ -60,10 +58,10 @@ export default function DoctorDashboard() {
   // WebSocket subscription per doctor id
   useEffect(() => {
     const doctorId = data?.doctor?.id;
-    if (!doctorId || !WS_BASE) return;
+    if (!doctorId) return;
     if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
     try {
-      const ws = new WebSocket(`${WS_BASE}/api/ws/queue/doctor/${doctorId}`);
+      const ws = new WebSocket(`${getBackendWebSocketBase()}/api/ws/queue/doctor/${doctorId}`);
       wsRef.current = ws;
       ws.onopen = () => setWsConnected(true);
       ws.onmessage = () => { load(true); };

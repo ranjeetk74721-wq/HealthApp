@@ -3,7 +3,7 @@ import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, Refre
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
-import { api } from "@/src/api/client";
+import { api, getBackendWebSocketBase } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 
@@ -15,8 +15,6 @@ const actions = [
 ];
 
 const GENDERS = ["Male", "Female", "Other"];
-
-const WS_BASE = (process.env.EXPO_PUBLIC_BACKEND_URL || "").replace(/^http/, "ws");
 
 export default function ReceptionistDashboard() {
   const router = useRouter();
@@ -62,13 +60,13 @@ export default function ReceptionistDashboard() {
 
   // Setup WebSocket per selected doctor
   useEffect(() => {
-    if (!selectedDoc || !WS_BASE) return;
+    if (!selectedDoc) return;
     // Close any prior connection
     if (wsRef.current) {
       try { wsRef.current.close(); } catch {}
       wsRef.current = null;
     }
-    const url = `${WS_BASE}/api/ws/queue/doctor/${selectedDoc}`;
+    const url = `${getBackendWebSocketBase()}/api/ws/queue/doctor/${selectedDoc}`;
     let closed = false;
     try {
       const ws = new WebSocket(url);

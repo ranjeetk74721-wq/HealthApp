@@ -4,10 +4,19 @@ import { Platform } from "react-native";
 
 const configuredBase = process.env.EXPO_PUBLIC_BACKEND_URL || "http://localhost:8000";
 const expoHost = Constants.expoConfig?.hostUri?.split(":")[0];
-const isLocalhost = /localhost|127\.0\.0\.1/.test(configuredBase);
-const backendBase = Platform.OS !== "web" && isLocalhost && expoHost
-  ? `http://${expoHost}:8000`
-  : configuredBase;
+
+export function getBackendBase() {
+  const isLocalhost = /localhost|127\.0\.0\.1/.test(configuredBase);
+  return Platform.OS !== "web" && isLocalhost && expoHost
+    ? `http://${expoHost}:8000`
+    : configuredBase;
+}
+
+export function getBackendWebSocketBase() {
+  return getBackendBase().replace(/^http/, "ws");
+}
+
+const backendBase = getBackendBase();
 const BASE = backendBase.replace(/\/$/, "") + "/api";
 
 async function getToken() {

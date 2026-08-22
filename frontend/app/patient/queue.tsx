@@ -3,10 +3,8 @@ import { View, Text, StyleSheet, ScrollView, ActivityIndicator, Pressable, Refre
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect } from "expo-router";
-import { api } from "@/src/api/client";
+import { api, getBackendWebSocketBase } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
-
-const WS_BASE = (process.env.EXPO_PUBLIC_BACKEND_URL || "").replace(/^http/, "ws");
 
 export default function PatientQueue() {
   const [data, setData] = useState<any | null>(null);
@@ -42,13 +40,13 @@ export default function PatientQueue() {
   }, []);
 
   const connectWs = (apptId: string) => {
-    if (!WS_BASE) return;
+    const wsBase = getBackendWebSocketBase();
     if (wsRef.current) {
       try { wsRef.current.close(); } catch {}
       wsRef.current = null;
     }
     try {
-      const ws = new WebSocket(`${WS_BASE}/api/ws/queue/appt/${apptId}`);
+      const ws = new WebSocket(`${wsBase}/api/ws/queue/appt/${apptId}`);
       wsRef.current = ws;
       ws.onopen = () => setWsConnected(true);
       ws.onmessage = () => { load(); };

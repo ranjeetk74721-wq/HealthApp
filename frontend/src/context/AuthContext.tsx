@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, ReactNode } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Platform } from "react-native";
+import { getBackendBase } from "@/src/api/client";
 
 export type Role = "patient" | "doctor" | "receptionist" | "owner";
 
@@ -44,8 +45,8 @@ async function registerForPush(user_id: string) {
     }
     if (finalStatus !== "granted") return;
     const tokenResp = await Notifications.getDevicePushTokenAsync();
-    const base = process.env.EXPO_PUBLIC_BACKEND_URL;
-    if (!base || !tokenResp?.data) return;
+    const base = getBackendBase();
+    if (!tokenResp?.data) return;
     await fetch(`${base}/api/register-push`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

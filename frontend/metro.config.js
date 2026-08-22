@@ -1,6 +1,7 @@
 // metro.config.js
 const { getDefaultConfig } = require("expo/metro-config");
 const path = require('path');
+const os = require('os');
 const { FileStore } = require('metro-cache');
 
 const config = getDefaultConfig(__dirname);
@@ -19,7 +20,7 @@ config.cacheStores = [
 // // Alternative: use a more aggressive exclusion pattern
 // config.resolver.blacklistRE = /node_modules\/.*\/(android|ios|windows|macos|__tests__|\.git|.*\.android\.js|.*\.ios\.js)$/;
 
-// Reduce the number of workers to decrease resource usage
-config.maxWorkers = 2;
+// Use available CPU parallelism so QR reloads do not rebuild serially.
+config.maxWorkers = Math.max(2, os.cpus().length - 1);
 
 module.exports = config;
