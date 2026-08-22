@@ -2,7 +2,11 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants from "expo-constants";
 import { Platform } from "react-native";
 
-const configuredBase = process.env.EXPO_PUBLIC_BACKEND_URL || "http://localhost:8000";
+const configuredBase = process.env.EXPO_PUBLIC_BACKEND_URL || (
+  Platform.OS === "web" && typeof window !== "undefined" && !/localhost|127\.0\.0\.1/.test(window.location.hostname)
+    ? "https://healthapp-b4mo.onrender.com"
+    : "http://localhost:8000"
+);
 const expoHost = Constants.expoConfig?.hostUri?.split(":")[0];
 
 export function getBackendBase() {
