@@ -74,6 +74,16 @@ async def ensure_db_indexes():
         pass
 
 
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "ClinicQueue API",
+        "docs_url": "/docs",
+        "health_check": "/health"
+    }
+
+
 @app.get("/health")
 async def health_check():
     try:
