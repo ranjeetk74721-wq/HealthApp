@@ -2,14 +2,16 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants from "expo-constants";
 import { Platform } from "react-native";
 
-const configuredBase = process.env.EXPO_PUBLIC_BACKEND_URL || (
-  Platform.OS === "web" && typeof window !== "undefined" && !/localhost|127\.0\.0\.1/.test(window.location.hostname)
-    ? "https://healthapp-b4mo.onrender.com"
-    : "http://localhost:8000"
-);
+const configuredBase = process.env.EXPO_PUBLIC_BACKEND_URL || "http://localhost:8000";
 const expoHost = Constants.expoConfig?.hostUri?.split(":")[0];
 
 export function getBackendBase() {
+  if (Platform.OS === "web" && typeof window !== "undefined") {
+    const hostname = window.location.hostname;
+    if (!/localhost|127\.0\.0\.1/.test(hostname)) {
+      return "https://healthapp-b4mo.onrender.com";
+    }
+  }
   const isLocalhost = /localhost|127\.0\.0\.1/.test(configuredBase);
   return Platform.OS !== "web" && isLocalhost && expoHost
     ? `http://${expoHost}:8000`
@@ -20,8 +22,9 @@ export function getBackendWebSocketBase() {
   return getBackendBase().replace(/^http/, "ws");
 }
 
-const backendBase = getBackendBase();
-const BASE = backendBase.replace(/\/$/, "") + "/api";
+export function getApiBase() {
+  return getBackendBase().replace(/\/$/, "") + "/api";
+}
 
 async function getToken() {
   return await AsyncStorage.getItem("cq_token");
@@ -32,11 +35,12 @@ async function request(path: string, opts: RequestInit = {}) {
   const headers: any = { "Content-Type": "application/json", ...(opts.headers || {}) };
   if (token) headers.Authorization = `Bearer ${token}`;
   let res: Response;
+  const apiBase = getApiBase();
   try {
-    res = await fetch(`${BASE}${path}`, { ...opts, headers });
+    res = await fetch(`${apiBase}${path}`, { ...opts, headers });
   } catch {
     throw new Error(
-      `Unable to reach the ClinicQueue API at ${backendBase}. Start MongoDB and the FastAPI server on port 8000, then try again.`,
+      `Unable to reach the ClinicQueue API at ${getBackendBase()}. Start MongoDB and the FastAPI server on port 8000, then try again.`,
     );
   }
   const text = await res.text();
