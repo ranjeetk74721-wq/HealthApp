@@ -50,11 +50,6 @@
     ],
     "experiments": {
       "typedRoutes": true
-    },
-    "extra": {
-      "eas": {
-        "projectId": "com.emergent.patientqueue.gtzdaf"
-      }
     }
   }
 }

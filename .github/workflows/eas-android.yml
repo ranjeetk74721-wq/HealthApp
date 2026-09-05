@@ -32,10 +32,23 @@ jobs:
           cache: yarn
           cache-dependency-path: frontend/yarn.lock
 
+      - name: Set up EAS CLI
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Validate EXPO_TOKEN
+        run: |
+          if [ -z "${{ secrets.EXPO_TOKEN }}" ]; then
+            echo "::error::EXPO_TOKEN secret is not set in GitHub Repository Secrets. Please add EXPO_TOKEN under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
       - name: Install dependencies
         run: yarn install --frozen-lockfile
 
       - name: Build Android with EAS
-        run: npx eas-cli build --platform android --profile ${{ github.event.inputs.profile || 'preview' }} --non-interactive
+        run: eas build --platform android --profile ${{ github.event.inputs.profile || 'preview' }} --non-interactive
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
