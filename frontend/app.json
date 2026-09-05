@@ -1,7 +1,8 @@
 {
   "expo": {
     "name": "Meribaari",
-    "slug": "meribaari",
+    "slug": "ranjeet23",
+    "owner": "ranjeet123s-team",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
