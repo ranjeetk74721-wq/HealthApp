@@ -1,101 +1,152 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { View, Text, StyleSheet, ScrollView, ActivityIndicator, Pressable, RefreshControl, Modal, TextInput } from "react-native";
+import {
+  View, Text, StyleSheet, ScrollView, ActivityIndicator, Pressable,
+  RefreshControl, Modal, TextInput, Alert,
+} from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
 import { api, getBackendWebSocketBase } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
+import CalendarSummary from "@/src/components/CalendarSummary";
+
+const POLL_INTERVAL_MS = 20_000;
 
 const modes = [
-  { key: "active", label: "Active", icon: "play-circle" as const, color: colors.success },
-  { key: "break", label: "Break", icon: "pause-circle" as const, color: colors.warning },
+  { key: "active",    label: "Active",    icon: "play-circle"  as const, color: colors.success },
+  { key: "break",     label: "Break",     icon: "pause-circle" as const, color: colors.warning },
   { key: "emergency", label: "Emergency", icon: "alert-circle" as const, color: colors.error },
 ];
 
 const rowActions = [
-  { label: "Arrived", path: "/reception/mark_arrived", color: colors.info, icon: "checkmark-circle" as const, showOn: ["booked"] },
-  { label: "Call", path: "/reception/start_consultation", color: colors.brandPrimary, icon: "mic" as const, showOn: ["arrived", "booked"] },
-  { label: "Done", path: "/reception/complete", color: colors.success, icon: "checkmark-done" as const, showOn: ["in_consultation", "arrived"] },
-  { label: "Skip", path: "/reception/skip", color: colors.warning, icon: "arrow-forward" as const, showOn: ["booked", "arrived"] },
+  { label: "Arrived", path: "/reception/mark_arrived",      color: colors.info,         icon: "checkmark-circle" as const, showOn: ["booked"] },
+  { label: "Call",    path: "/reception/start_consultation", color: colors.brandPrimary, icon: "mic"              as const, showOn: ["arrived", "booked"] },
+  { label: "Done",    path: "/reception/complete",           color: colors.success,      icon: "checkmark-done"   as const, showOn: ["in_consultation", "arrived"] },
+  { label: "Skip",    path: "/reception/skip",               color: colors.warning,      icon: "arrow-forward"    as const, showOn: ["booked", "arrived"] },
 ];
 
 const STATUS_COLORS: Record<string, string> = {
-  booked: colors.info,
-  arrived: colors.warning,
-  in_consultation: colors.brandPrimary,
-  completed: colors.success,
-  skipped: colors.muted,
+  booked: colors.info, arrived: colors.warning,
+  in_consultation: colors.brandPrimary, completed: colors.success, skipped: colors.muted,
 };
 
 export default function DoctorDashboard() {
   const router = useRouter();
   const { user, signOut } = useAuth();
-  const [data, setData] = useState<any | null>(null);
-  const [appts, setAppts] = useState<any[]>([]);
+  const [data, setData]       = useState<any | null>(null);
+  const [appts, setAppts]     = useState<any[]>([]);
+  const [summaryData, setSummaryData] = useState<any[]>([]);
+  const [receptionists, setReceptionists] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [prescOpen, setPrescOpen] = useState<any | null>(null);
   const [prescText, setPrescText] = useState("");
-  const [editOpen, setEditOpen] = useState(false);
-  const [editFees, setEditFees] = useState("");
+  const [editOpen, setEditOpen]   = useState(false);
+  const [editFees, setEditFees]   = useState("");
   const [editTimings, setEditTimings] = useState("");
-  const [editBio, setEditBio] = useState("");
-  const [editAvgMin, setEditAvgMin] = useState("");
-  const [editSaving, setEditSaving] = useState(false);
+  const [editBio, setEditBio]         = useState("");
+  const [editAvgMin, setEditAvgMin]   = useState("");
+  const [editSaving, setEditSaving]   = useState(false);
+
+  // Receptionist add state
+  const [recModalOpen, setRecModalOpen] = useState(false);
+  const [recName, setRecName] = useState("");
+  const [recEmail, setRecEmail] = useState("");
+  const [recPassword, setRecPassword] = useState("");
+  const [recMobile, setRecMobile] = useState("");
+  const [recSaving, setRecSaving] = useState(false);
+  const [recError, setRecError] = useState<string | null>(null);
+
   const wsRef = useRef<WebSocket | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
+  const timerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isFocused = useRef(true);
 
-  const load = useCallback(async (silent = false) => {
+  const load = useCallback(async (silent = false, bypassCache = false) => {
+    const shouldBypass = silent || bypassCache;
     try {
-      const [d, a] = await Promise.all([api.get("/doctor/dashboard"), api.get("/doctor/appointments")]);
+      const [d, a, sum, recs] = await Promise.all([
+        api.get("/doctor/dashboard", { bypassCache: shouldBypass }),
+        api.get("/doctor/appointments", { bypassCache: shouldBypass }),
+        api.get("/appointments/calendar-summary", { bypassCache: shouldBypass }).catch(() => []),
+        api.get("/doctor/receptionists", { bypassCache: shouldBypass }).catch(() => []),
+      ]);
       setData(d);
       setAppts(a);
-    } catch (e) { console.log(e); }
-    finally { if (!silent) setLoading(false); setRefreshing(false); }
-  }, []);
+      setSummaryData(sum || []);
+      setReceptionists(recs || []);
+    } catch (err: any) {
+      if (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired"))) {
+        await signOut();
+        router.replace("/login");
+      }
+    } finally {
+      if (!silent) setLoading(false);
+      setRefreshing(false);
+    }
+  }, [router, signOut]);
 
-  // WebSocket subscription per doctor id
+  // WebSocket — subscribe to doctor's queue channel
   useEffect(() => {
     const doctorId = data?.doctor?.id;
     if (!doctorId) return;
-    if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
+
+    if (wsRef.current) { try { wsRef.current.close(); } catch { /* ignore */ } wsRef.current = null; }
+
     try {
       const ws = new WebSocket(`${getBackendWebSocketBase()}/api/ws/queue/doctor/${doctorId}`);
       wsRef.current = ws;
-      ws.onopen = () => setWsConnected(true);
-      ws.onmessage = () => { load(true); };
-      ws.onerror = () => setWsConnected(false);
-      ws.onclose = () => setWsConnected(false);
+      ws.onopen = () => {
+        setWsConnected(true);
+        // WS is live — stop fallback polling
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      };
+      ws.onmessage = () => { if (isFocused.current) load(true); };
+      ws.onerror   = () => setWsConnected(false);
+      ws.onclose   = () => {
+        setWsConnected(false);
+        // Restart fallback polling if still on screen
+        if (isFocused.current && !timerRef.current) {
+          timerRef.current = setInterval(() => load(true), POLL_INTERVAL_MS);
+        }
+      };
     } catch { setWsConnected(false); }
-    return () => {
-      if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data?.doctor?.id]);
 
-  useFocusEffect(useCallback(() => {
-    load();
-    const t = setInterval(() => load(true), 15000);
-    return () => clearInterval(t);
-  }, [load]));
+    return () => {
+      if (wsRef.current) { try { wsRef.current.close(); } catch { /* ignore */ } wsRef.current = null; }
+    };
+  }, [data?.doctor?.id, load]);
+
+  useFocusEffect(
+    useCallback(() => {
+      isFocused.current = true;
+      load();
+      if (!wsConnected) {
+        timerRef.current = setInterval(() => load(true), POLL_INTERVAL_MS);
+      }
+      return () => {
+        isFocused.current = false;
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      };
+    }, [load, wsConnected]),
+  );
 
   const changeStatus = async (status: string) => {
-    try { await api.post("/doctor/status", { status }); load(true); } catch (e) { console.log(e); }
+    try { await api.post("/doctor/status", { status }); load(true); } catch { /* ignore */ }
   };
 
   const doAction = async (path: string, appt_id: string) => {
-    try { await api.post(path, { appointment_id: appt_id }); load(true); } catch (e) { console.log(e); }
+    try { await api.post(path, { appointment_id: appt_id }); load(true); } catch { /* ignore */ }
   };
 
   const savePresc = async () => {
     if (!prescOpen) return;
     try {
       await api.post("/doctor/prescription", { appointment_id: prescOpen.id, prescription: prescText });
-      setPrescOpen(null);
-      setPrescText("");
+      setPrescOpen(null); setPrescText("");
       load(true);
-    } catch (e) { console.log(e); }
+    } catch { /* ignore */ }
   };
 
   const openEditProfile = () => {
@@ -117,24 +168,74 @@ export default function DoctorDashboard() {
       if (!isNaN(avgMinNum) && avgMinNum > 0 && avgMinNum !== (data?.doctor?.avg_consult_minutes ?? 15)) {
         updates.avg_consult_minutes = avgMinNum;
       }
-      if (Object.keys(updates).length > 0) {
-        await api.post("/doctor/update_profile", updates);
-      }
+      if (Object.keys(updates).length > 0) await api.post("/doctor/update_profile", updates);
       setEditOpen(false);
       load(true);
-    } catch (e) { console.log(e); }
+    } catch { /* ignore */ }
     finally { setEditSaving(false); }
   };
 
-  if (loading || !data) return <SafeAreaView style={styles.safe}><ActivityIndicator style={{ marginTop: 60 }} color={colors.brand} /></SafeAreaView>;
+  const handleAddReceptionist = async () => {
+    setRecError(null);
+    if (!recName.trim() || !recEmail.trim() || !recPassword.trim()) {
+      setRecError("Name, Email & Password are required");
+      return;
+    }
+    setRecSaving(true);
+    try {
+      await api.post("/doctor/add-receptionist", {
+        full_name: recName.trim(),
+        email: recEmail.trim().toLowerCase(),
+        password: recPassword,
+        mobile: recMobile.trim() || undefined
+      });
+      setRecName(""); setRecEmail(""); setRecPassword(""); setRecMobile(""); setRecModalOpen(false);
+      load(true);
+    } catch (e: any) {
+      setRecError(e.message || "Failed to add receptionist");
+    } finally { setRecSaving(false); }
+  };
+
+  const handleDeleteReceptionist = (id: string, name?: string) => {
+    Alert.alert(
+      "Remove Receptionist?",
+      `Are you sure you want to remove ${name || "this receptionist"}? This will permanently delete their account from the database.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Remove", style: "destructive",
+          onPress: async () => {
+            try {
+              setReceptionists((prev) => prev.filter((r) => r.id !== id));
+              await api.del(`/doctor/receptionists/${id}`);
+              load(true);
+            } catch (e: any) {
+              Alert.alert("Error", e.message || "Failed to delete receptionist");
+              load(true);
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  if (loading || !data) {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <ActivityIndicator style={{ marginTop: 60 }} color={colors.brand} />
+      </SafeAreaView>
+    );
+  }
 
   const currentMode = data.status;
-  const nextPatient = appts.find((a) => a.status === "in_consultation")
-    || appts.find((a) => a.status === "arrived")
-    || appts.find((a) => a.status === "booked");
+  const nextPatient =
+    appts.find((a) => a.status === "in_consultation") ||
+    appts.find((a) => a.status === "arrived") ||
+    appts.find((a) => a.status === "booked");
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
+      {/* ── Header ── */}
       <View style={styles.header}>
         <View style={{ flex: 1 }}>
           <Text style={styles.hello}>Good day, Doctor</Text>
@@ -146,17 +247,30 @@ export default function DoctorDashboard() {
         <Pressable onPress={openEditProfile} testID="doctor-edit-profile" style={styles.iconBtn}>
           <Ionicons name="create-outline" size={20} color={colors.brandPrimary} />
         </Pressable>
-        <Pressable onPress={async () => { await signOut(); router.replace("/login"); }} testID="doctor-logout" style={styles.iconBtn}>
+        <Pressable
+          onPress={async () => { await signOut(); router.replace("/login"); }}
+          testID="doctor-logout"
+          style={styles.iconBtn}
+        >
           <Ionicons name="log-out-outline" size={22} color={colors.onSurfaceSecondary} />
         </Pressable>
       </View>
 
-      <ScrollView contentContainerStyle={styles.scroll} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} />}>
+      <ScrollView
+        contentContainerStyle={styles.scroll}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true); }} />}
+      >
+        {/* ── Status chips ── */}
         <View style={styles.modeRow}>
           {modes.map((m) => {
             const active = currentMode === m.key;
             return (
-              <Pressable key={m.key} testID={`mode-${m.key}`} onPress={() => changeStatus(m.key)} style={[styles.modeChip, active && { backgroundColor: m.color, borderColor: m.color }]}>
+              <Pressable
+                key={m.key}
+                testID={`mode-${m.key}`}
+                onPress={() => changeStatus(m.key)}
+                style={[styles.modeChip, active && { backgroundColor: m.color, borderColor: m.color }]}
+              >
                 <Ionicons name={m.icon} size={16} color={active ? "#fff" : m.color} />
                 <Text style={[styles.modeText, active && { color: "#fff" }]}>{m.label}</Text>
               </Pressable>
@@ -164,6 +278,7 @@ export default function DoctorDashboard() {
           })}
         </View>
 
+        {/* ── KPIs ── */}
         <View style={styles.kpiRow}>
           <View style={styles.kpiCard}><Text style={styles.kpiLabel}>Total</Text><Text style={styles.kpiValue}>{data.total_patients}</Text></View>
           <View style={styles.kpiCard}><Text style={styles.kpiLabel}>Completed</Text><Text style={[styles.kpiValue, { color: colors.success }]}>{data.completed}</Text></View>
@@ -171,6 +286,35 @@ export default function DoctorDashboard() {
           <View style={styles.kpiCard}><Text style={styles.kpiLabel}>Earnings</Text><Text style={[styles.kpiValue, { color: colors.brandPrimary }]}>₹{data.earnings}</Text></View>
         </View>
 
+        {/* ── View-Only Calendar Summary ── */}
+        <Text style={styles.sectionTitle}>Daily Patient Calendar</Text>
+        <CalendarSummary summaryData={summaryData} />
+
+        {/* ── Receptionist Management ── */}
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: spacing.md }}>
+          <Text style={styles.sectionTitle}>Assigned Receptionists</Text>
+          <Pressable onPress={() => setRecModalOpen(true)} style={{ backgroundColor: colors.brandPrimary, paddingHorizontal: spacing.md, paddingVertical: 6, borderRadius: radius.md, flexDirection: "row", alignItems: "center", gap: 4 }}>
+            <Ionicons name="add" size={16} color="#fff" />
+            <Text style={{ color: "#fff", fontWeight: "600", fontSize: font.sm }}>Add Receptionist</Text>
+          </Pressable>
+        </View>
+        {receptionists.length === 0 ? (
+          <Text style={{ color: colors.muted, fontSize: font.sm }}>No receptionists assigned yet.</Text>
+        ) : (
+          receptionists.map((r) => (
+            <View key={r.id} style={{ flexDirection: "row", alignItems: "center", backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, marginBottom: 4 }}>
+              <View style={{ flex: 1 }}>
+                <Text style={{ fontSize: font.base, fontWeight: "600", color: colors.onSurface }}>{r.full_name}</Text>
+                <Text style={{ fontSize: 11, color: colors.muted }}>{r.email} {r.mobile || r.phone ? `· ${r.mobile || r.phone}` : ""}</Text>
+              </View>
+              <Pressable onPress={() => handleDeleteReceptionist(r.id, r.full_name)} style={{ padding: spacing.xs }}>
+                <Ionicons name="trash-outline" size={18} color={colors.error} />
+              </Pressable>
+            </View>
+          ))
+        )}
+
+        {/* ── Next patient card ── */}
         {nextPatient && (
           <View style={styles.nextCard}>
             <Text style={styles.nextLabel}>NEXT PATIENT</Text>
@@ -190,6 +334,7 @@ export default function DoctorDashboard() {
           </View>
         )}
 
+        {/* ── Schedule list ── */}
         <Text style={styles.sectionTitle}>Today&apos;s Schedule</Text>
         {appts.length === 0 ? (
           <View style={styles.empty}><Text style={styles.emptyText}>No patients scheduled today</Text></View>
@@ -224,7 +369,11 @@ export default function DoctorDashboard() {
                       <Ionicons name={act.icon} size={14} color={act.color} />
                     </Pressable>
                   ))}
-                  <Pressable testID={`presc-${a.id}`} onPress={() => { setPrescOpen(a); setPrescText(a.prescription || ""); }} style={[styles.rowActBtn, { backgroundColor: colors.brandSecondary }]}>
+                  <Pressable
+                    testID={`presc-${a.id}`}
+                    onPress={() => { setPrescOpen(a); setPrescText(a.prescription || ""); }}
+                    style={[styles.rowActBtn, { backgroundColor: colors.brandSecondary }]}
+                  >
                     <Ionicons name="document-text-outline" size={14} color={colors.brandPrimary} />
                   </Pressable>
                 </View>
@@ -234,6 +383,7 @@ export default function DoctorDashboard() {
         )}
       </ScrollView>
 
+      {/* ── Prescription Modal ── */}
       <Modal transparent visible={!!prescOpen} animationType="slide" onRequestClose={() => setPrescOpen(null)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setPrescOpen(null)}>
           <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
@@ -256,12 +406,42 @@ export default function DoctorDashboard() {
         </Pressable>
       </Modal>
 
+      {/* ── Add Receptionist Modal ── */}
+      <Modal transparent visible={recModalOpen} animationType="slide" onRequestClose={() => setRecModalOpen(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setRecModalOpen(false)}>
+          <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+            <View style={styles.sheetHandle} />
+            <Text style={styles.sheetTitle}>Add Receptionist</Text>
+            <Text style={styles.sheetSub}>Create a receptionist for your hospital (Hospital ID is locked to your hospital)</Text>
+            
+            <Text style={styles.editLabel}>Full Name*</Text>
+            <TextInput value={recName} onChangeText={setRecName} placeholder="e.g. Rahul Sharma" placeholderTextColor={colors.muted} style={styles.editInput} />
+            
+            <Text style={styles.editLabel}>Login Email*</Text>
+            <TextInput value={recEmail} onChangeText={setRecEmail} keyboardType="email-address" autoCapitalize="none" placeholder="receptionist@hospital.com" placeholderTextColor={colors.muted} style={styles.editInput} />
+            
+            <Text style={styles.editLabel}>Login Password*</Text>
+            <TextInput value={recPassword} onChangeText={setRecPassword} secureTextEntry placeholder="Temporary password" placeholderTextColor={colors.muted} style={styles.editInput} />
+            
+            <Text style={styles.editLabel}>Mobile Number (Optional)</Text>
+            <TextInput value={recMobile} onChangeText={setRecMobile} keyboardType="phone-pad" placeholder="9876543210" placeholderTextColor={colors.muted} style={styles.editInput} />
+            
+            {recError ? <Text style={{ color: colors.error, fontSize: font.sm, marginTop: 6, textAlign: "center" }}>{recError}</Text> : null}
+
+            <Pressable onPress={handleAddReceptionist} disabled={recSaving} style={styles.saveBtn}>
+              {recSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveBtnText}>Save Receptionist</Text>}
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* ── Edit Profile Modal ── */}
       <Modal transparent visible={editOpen} animationType="slide" onRequestClose={() => setEditOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setEditOpen(false)}>
           <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
             <View style={styles.sheetHandle} />
             <Text style={styles.sheetTitle}>Update My Profile</Text>
-            <Text style={styles.sheetSub}>Update your consultation fees & timings</Text>
+            <Text style={styles.sheetSub}>Update your consultation fees &amp; timings</Text>
             <Text style={styles.editLabel}>Consultation Fees (₹)</Text>
             <TextInput testID="edit-fees" value={editFees} onChangeText={(v) => setEditFees(v.replace(/[^0-9]/g, ""))} keyboardType="number-pad" placeholder="500" placeholderTextColor={colors.muted} style={styles.editInput} />
             <Text style={styles.editLabel}>⏱ Avg. Time per Patient (minutes)</Text>
@@ -316,7 +496,6 @@ const styles = StyleSheet.create({
   symptoms: { fontSize: 11, color: colors.onSurfaceSecondary, marginTop: 2 },
   rowActions: { flexDirection: "row", gap: 4, flexWrap: "wrap", maxWidth: 120, justifyContent: "flex-end" },
   rowActBtn: { width: 30, height: 30, borderRadius: radius.pill, alignItems: "center", justifyContent: "center" },
-  smallBtn: { width: 36, height: 36, borderRadius: radius.pill, backgroundColor: colors.brandSecondary, alignItems: "center", justifyContent: "center" },
   modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
   sheet: { backgroundColor: colors.surface, padding: spacing.lg, borderTopLeftRadius: 24, borderTopRightRadius: 24, gap: spacing.sm, paddingBottom: spacing.xxl },
   sheetHandle: { width: 40, height: 4, backgroundColor: colors.borderStrong, borderRadius: 2, alignSelf: "center", marginBottom: spacing.md },

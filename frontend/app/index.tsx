@@ -18,7 +18,7 @@ export default function Index() {
       router.replace("/doctor/dashboard");
     } else if (user.role === "receptionist") {
       router.replace("/receptionist/dashboard");
-    } else if (user.role === "owner") {
+    } else if (user.role === "owner" || user.role === "admin") {
       router.replace("/owner/dashboard");
     }
   }, [loading, router, user]);

@@ -8,14 +8,12 @@ export default function Root({ children }: PropsWithChildren) {
       <head>
         <meta charSet="utf-8" />
         <meta httpEquiv="X-UA-Compatible" content="IE=edge" />
-        <meta
-          name="viewport"
-          content="width=device-width, initial-scale=1, shrink-to-fit=no"
-        />
+        <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+        <meta name="theme-color" content="#0369A1" />
+        <meta name="description" content="Meribaari — Skip the wait. Book clinic appointments and track your live queue position." />
+        <title>Meribaari — Skip the wait</title>
         {/*
-          Disable body scrolling on web to make ScrollView components work correctly.
-          If you want to enable scrolling, remove `ScrollViewStyleReset` and
-          set `overflow: auto` on the body style below.
+          Disable body scrolling on web so ScrollView works correctly.
         */}
         <ScrollViewStyleReset />
         <style

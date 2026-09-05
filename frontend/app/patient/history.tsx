@@ -1,10 +1,12 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { View, Text, StyleSheet, ScrollView, ActivityIndicator, RefreshControl, Pressable, Modal } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect } from "expo-router";
 import { api } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
+
+const STALE_AFTER_MS = 30_000;
 
 const statusColor: Record<string, string> = {
   booked: colors.info,
@@ -20,14 +22,20 @@ export default function History() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [selected, setSelected] = useState<any | null>(null);
+  const lastFetchedAt = useRef<number>(0);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force = false) => {
+    if (!force && Date.now() - lastFetchedAt.current < STALE_AFTER_MS && items.length > 0) {
+      setLoading(false);
+      return;
+    }
     try {
-      const res = await api.get("/appointments/me");
+      const res = await api.get("/appointments/me", { bypassCache: force });
       setItems(res);
-    } catch (e) { console.log(e); }
+      lastFetchedAt.current = Date.now();
+    } catch { /* keep existing data */ }
     finally { setLoading(false); setRefreshing(false); }
-  }, []);
+  }, [items.length]);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
@@ -36,7 +44,7 @@ export default function History() {
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
       <View style={styles.header}><Text style={styles.title}>Appointment History</Text></View>
-      <ScrollView contentContainerStyle={styles.scroll} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} />}>
+      <ScrollView contentContainerStyle={styles.scroll} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true); }} />}>
         {items.length === 0 ? (
           <View style={styles.empty}><Ionicons name="document-text-outline" size={48} color={colors.muted} /><Text style={styles.emptyText}>No appointments yet</Text></View>
         ) : (

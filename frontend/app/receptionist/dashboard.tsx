@@ -1,17 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, RefreshControl, Modal, TextInput, KeyboardAvoidingView, Platform } from "react-native";
+import {
+  View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator,
+  RefreshControl, Modal, TextInput, KeyboardAvoidingView, Platform,
+} from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
 import { api, getBackendWebSocketBase } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
+import CalendarSummary from "@/src/components/CalendarSummary";
+
+const POLL_INTERVAL_MS = 10_000;
 
 const actions = [
-  { label: "Arrived", path: "/reception/mark_arrived", color: colors.info, icon: "checkmark-circle" as const },
-  { label: "Start", path: "/reception/start_consultation", color: colors.brandPrimary, icon: "play" as const },
-  { label: "Complete", path: "/reception/complete", color: colors.success, icon: "checkmark-done" as const },
-  { label: "Skip", path: "/reception/skip", color: colors.warning, icon: "arrow-forward" as const },
+  { label: "Arrived",  path: "/reception/mark_arrived",      color: colors.info,         icon: "checkmark-circle" as const },
+  { label: "Start",    path: "/reception/start_consultation", color: colors.brandPrimary, icon: "play"             as const },
+  { label: "Complete", path: "/reception/complete",           color: colors.success,      icon: "checkmark-done"   as const },
+  { label: "Skip",     path: "/reception/skip",               color: colors.warning,      icon: "arrow-forward"    as const },
 ];
 
 const GENDERS = ["Male", "Female", "Other"];
@@ -19,99 +25,135 @@ const GENDERS = ["Male", "Female", "Other"];
 export default function ReceptionistDashboard() {
   const router = useRouter();
   const { user, signOut } = useAuth();
-  const [doctors, setDoctors] = useState<any[]>([]);
+  const [doctors, setDoctors]       = useState<any[]>([]);
   const [selectedDoc, setSelectedDoc] = useState<string | null>(null);
-  const [queue, setQueue] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [queue, setQueue]           = useState<any[]>([]);
+  const [summaryData, setSummaryData] = useState<any[]>([]);
+  const [loading, setLoading]       = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [emergencyOpen, setEmergencyOpen] = useState(false);
   const [emergencyName, setEmergencyName] = useState("");
 
   // Add Patient sheet
-  const [addOpen, setAddOpen] = useState(false);
-  const [pName, setPName] = useState("");
-  const [pMobile, setPMobile] = useState("");
-  const [pAge, setPAge] = useState("");
-  const [pGender, setPGender] = useState<string | null>(null);
-  const [pSymptoms, setPSymptoms] = useState("");
-  const [pAddress, setPAddress] = useState("");
-  const [pSlot, setPSlot] = useState("");
+  const [addOpen, setAddOpen]       = useState(false);
+  const [pName, setPName]           = useState("");
+  const [pMobile, setPMobile]       = useState("");
+  const [pAge, setPAge]             = useState("");
+  const [pGender, setPGender]       = useState<string | null>(null);
+  const [pSymptoms, setPSymptoms]   = useState("");
+  const [pAddress, setPAddress]     = useState("");
+  const [pSlot, setPSlot]           = useState("");
   const [addLoading, setAddLoading] = useState(false);
-  const [addError, setAddError] = useState<string | null>(null);
-  const [addToast, setAddToast] = useState<string | null>(null);
+  const [addError, setAddError]     = useState<string | null>(null);
+  const [addToast, setAddToast]     = useState<string | null>(null);
 
-  // WebSocket
-  const wsRef = useRef<WebSocket | null>(null);
+  const wsRef     = useRef<WebSocket | null>(null);
+  const timerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isFocused = useRef(true);
   const [wsConnected, setWsConnected] = useState(false);
 
-  const load = useCallback(async (silent = false) => {
+  // Use a ref so load() always reads the latest selectedDoc without stale closure
+  const selectedDocRef = useRef<string | null>(null);
+  useEffect(() => { selectedDocRef.current = selectedDoc; }, [selectedDoc]);
+
+  const load = useCallback(async (silent = false, bypassCache = false) => {
+    const shouldBypass = silent || bypassCache;
     try {
-      const docs = await api.get("/reception/doctors");
+      const [docs, sum] = await Promise.all([
+        api.get("/reception/doctors", { bypassCache: shouldBypass }),
+        api.get("/appointments/calendar-summary", { bypassCache: shouldBypass }).catch(() => []),
+      ]);
       setDoctors(docs);
-      const doctorId = selectedDoc || (docs[0] && docs[0].id);
-      if (doctorId && !selectedDoc) setSelectedDoc(doctorId);
+      setSummaryData(sum || []);
+      const doctorId = selectedDocRef.current || (docs[0]?.id ?? null);
+      if (doctorId && !selectedDocRef.current) {
+        setSelectedDoc(doctorId);
+        selectedDocRef.current = doctorId;
+      }
       if (doctorId) {
-        const q = await api.get(`/reception/queue?doctor_id=${doctorId}`);
+        const q = await api.get(`/reception/queue?doctor_id=${doctorId}`, { bypassCache: shouldBypass });
         setQueue(q);
       }
-    } catch (e) { console.log(e); }
-    finally { if (!silent) setLoading(false); setRefreshing(false); }
-  }, [selectedDoc]);
+    } catch (err: any) {
+      if (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired"))) {
+        await signOut();
+        router.replace("/login");
+      }
+    } finally {
+      if (!silent) setLoading(false);
+      setRefreshing(false);
+    }
+  }, [router, signOut]);
 
-  // Setup WebSocket per selected doctor
+  // WebSocket — re-subscribe when selected doctor changes
   useEffect(() => {
     if (!selectedDoc) return;
-    // Close any prior connection
-    if (wsRef.current) {
-      try { wsRef.current.close(); } catch {}
-      wsRef.current = null;
-    }
+
+    if (wsRef.current) { try { wsRef.current.close(); } catch { /* ignore */ } wsRef.current = null; }
+
     const url = `${getBackendWebSocketBase()}/api/ws/queue/doctor/${selectedDoc}`;
-    let closed = false;
     try {
       const ws = new WebSocket(url);
       wsRef.current = ws;
-      ws.onopen = () => { if (!closed) setWsConnected(true); };
-      ws.onmessage = () => { load(true); };
-      ws.onerror = () => { setWsConnected(false); };
-      ws.onclose = () => { setWsConnected(false); };
-    } catch (e) {
-      setWsConnected(false);
-    }
+      ws.onopen = () => {
+        setWsConnected(true);
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      };
+      ws.onmessage = () => { if (isFocused.current) load(true); };
+      ws.onerror   = () => setWsConnected(false);
+      ws.onclose   = () => {
+        setWsConnected(false);
+        if (isFocused.current && !timerRef.current) {
+          timerRef.current = setInterval(() => load(true), POLL_INTERVAL_MS);
+        }
+      };
+    } catch { setWsConnected(false); }
+
     return () => {
-      closed = true;
-      if (wsRef.current) {
-        try { wsRef.current.close(); } catch {}
-        wsRef.current = null;
-      }
+      if (wsRef.current) { try { wsRef.current.close(); } catch { /* ignore */ } wsRef.current = null; }
     };
-  }, [selectedDoc]);
+  }, [selectedDoc, load]);
 
   useFocusEffect(
     useCallback(() => {
+      isFocused.current = true;
       load();
-      // Fallback polling every 10s (in case WS drops)
-      const t = setInterval(() => load(true), 10000);
-      return () => clearInterval(t);
-    }, [load]),
+      if (!wsConnected) {
+        timerRef.current = setInterval(() => load(true), POLL_INTERVAL_MS);
+      }
+      return () => {
+        isFocused.current = false;
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      };
+    }, [load, wsConnected]),
   );
 
+  // Reload queue when user manually picks a different doctor
+  useEffect(() => {
+    if (!selectedDoc) return;
+    api.get(`/reception/queue?doctor_id=${selectedDoc}`, { bypassCache: true })
+      .then(setQueue)
+      .catch(() => {});
+  }, [selectedDoc]);
+
   const doAction = async (path: string, appt_id: string) => {
-    try { await api.post(path, { appointment_id: appt_id }); load(true); } catch (e) { console.log(e); }
+    try { await api.post(path, { appointment_id: appt_id }); load(true); } catch { /* ignore */ }
   };
 
   const insertEmergency = async () => {
     if (!selectedDoc) return;
     try {
-      await api.post("/reception/emergency_insert", { doctor_id: selectedDoc, patient_name: emergencyName || "Emergency Patient" });
+      await api.post("/reception/emergency_insert", {
+        doctor_id: selectedDoc,
+        patient_name: emergencyName || "Emergency Patient",
+      });
       setEmergencyOpen(false); setEmergencyName(""); load(true);
-    } catch (e) { console.log(e); }
+    } catch { /* ignore */ }
   };
 
   const resetAddForm = () => {
     setPName(""); setPMobile(""); setPAge(""); setPGender(null);
-    setPSymptoms(""); setPAddress(""); setPSlot("");
-    setAddError(null);
+    setPSymptoms(""); setPAddress(""); setPSlot(""); setAddError(null);
   };
 
   const onAddPatient = async () => {
@@ -132,29 +174,32 @@ export default function ReceptionistDashboard() {
         slot: pSlot || "Walk-in",
       });
       setAddToast(`Added: ${res.patient.full_name} · Token #${res.appointment?.token_number}`);
-      resetAddForm();
-      setAddOpen(false);
-      load(true);
+      resetAddForm(); setAddOpen(false); load(true);
       setTimeout(() => setAddToast(null), 3000);
     } catch (e: any) {
       setAddError(e.message || "Could not add patient");
-    } finally {
-      setAddLoading(false);
-    }
+    } finally { setAddLoading(false); }
   };
 
-  if (loading) return <SafeAreaView style={styles.safe}><ActivityIndicator style={{ marginTop: 60 }} color={colors.brand} /></SafeAreaView>;
+  if (loading) {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <ActivityIndicator style={{ marginTop: 60 }} color={colors.brand} />
+      </SafeAreaView>
+    );
+  }
 
   const activeQueue = queue.filter((q) => q.status !== "cancelled");
   const stats = {
-    total: activeQueue.length,
-    arrived: activeQueue.filter((q) => q.status === "arrived").length,
+    total:     activeQueue.length,
+    arrived:   activeQueue.filter((q) => q.status === "arrived").length,
     completed: activeQueue.filter((q) => q.status === "completed").length,
-    pending: activeQueue.filter((q) => q.status === "booked").length,
+    pending:   activeQueue.filter((q) => q.status === "booked").length,
   };
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
+      {/* ── Header ── */}
       <View style={styles.header}>
         <View style={{ flex: 1 }}>
           <Text style={styles.hello}>Reception</Text>
@@ -168,6 +213,7 @@ export default function ReceptionistDashboard() {
         </Pressable>
       </View>
 
+      {/* ── Doctor picker ── */}
       <View style={styles.docPickerWrap}>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.docPickerRow}>
           {doctors.map((d) => {
@@ -181,6 +227,7 @@ export default function ReceptionistDashboard() {
         </ScrollView>
       </View>
 
+      {/* ── KPIs ── */}
       <View style={styles.kpiRow}>
         <View style={styles.kpiCard}><Text style={styles.kpiLabel}>Total</Text><Text style={styles.kpiValue}>{stats.total}</Text></View>
         <View style={styles.kpiCard}><Text style={styles.kpiLabel}>Arrived</Text><Text style={[styles.kpiValue, { color: colors.warning }]}>{stats.arrived}</Text></View>
@@ -188,9 +235,20 @@ export default function ReceptionistDashboard() {
         <View style={styles.kpiCard}><Text style={styles.kpiLabel}>Pending</Text><Text style={[styles.kpiValue, { color: colors.info }]}>{stats.pending}</Text></View>
       </View>
 
-      <ScrollView contentContainerStyle={styles.scroll} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} />}>
+      {/* ── Queue list ── */}
+      <ScrollView
+        contentContainerStyle={styles.scroll}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true); }} />}
+      >
+        {/* ── View-Only Calendar Summary ── */}
+        <Text style={{ fontSize: font.lg, fontWeight: "700", color: colors.onSurface, marginBottom: spacing.sm }}>Daily Patient Calendar</Text>
+        <CalendarSummary summaryData={summaryData} />
+
         {activeQueue.length === 0 ? (
-          <View style={styles.empty}><Ionicons name="people-outline" size={44} color={colors.muted} /><Text style={styles.emptyText}>No patients yet. Tap &quot;+ Add Patient&quot; to register a walk-in.</Text></View>
+          <View style={styles.empty}>
+            <Ionicons name="people-outline" size={44} color={colors.muted} />
+            <Text style={styles.emptyText}>No patients yet. Tap &quot;+ Add Patient&quot; to register a walk-in.</Text>
+          </View>
         ) : (
           activeQueue.map((a) => (
             <View key={a.id} style={styles.apptCard}>
@@ -214,6 +272,7 @@ export default function ReceptionistDashboard() {
         )}
       </ScrollView>
 
+      {/* ── Toast ── */}
       {addToast ? (
         <View style={styles.toast} testID="add-patient-toast">
           <Ionicons name="checkmark-circle" size={18} color="#fff" />
@@ -221,6 +280,7 @@ export default function ReceptionistDashboard() {
         </View>
       ) : null}
 
+      {/* ── FABs ── */}
       <View style={styles.fabRow}>
         <Pressable testID="add-patient-btn" onPress={() => setAddOpen(true)} style={[styles.fab, { backgroundColor: colors.brandPrimary }]}>
           <Ionicons name="person-add" size={20} color="#fff" />
@@ -232,7 +292,7 @@ export default function ReceptionistDashboard() {
         </Pressable>
       </View>
 
-      {/* Add Patient Modal */}
+      {/* ── Add Patient Modal ── */}
       <Modal transparent visible={addOpen} animationType="slide" onRequestClose={() => setAddOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setAddOpen(false)}>
           <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ justifyContent: "flex-end", flex: 1 }}>
@@ -241,16 +301,13 @@ export default function ReceptionistDashboard() {
               <ScrollView keyboardShouldPersistTaps="handled">
                 <Text style={styles.sheetTitle}>Add Walk-in Patient</Text>
                 <Text style={styles.sheetSub}>Patient will be added to the queue for the selected doctor.</Text>
-
                 <Text style={styles.label}>Full Name*</Text>
                 <TextInput testID="ap-name" placeholder="Patient name" placeholderTextColor={colors.muted} value={pName} onChangeText={setPName} style={styles.input} />
-
                 <Text style={styles.label}>Mobile Number*</Text>
                 <View style={styles.mobileWrap}>
                   <View style={styles.ccBadge}><Text style={styles.ccText}>+91</Text></View>
                   <TextInput testID="ap-mobile" placeholder="98765 43210" placeholderTextColor={colors.muted} value={pMobile} onChangeText={(t) => setPMobile(t.replace(/[^0-9]/g, "").slice(0, 10))} keyboardType="phone-pad" style={styles.mobileInput} />
                 </View>
-
                 <View style={{ flexDirection: "row", gap: spacing.sm }}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.label}>Age</Text>
@@ -267,18 +324,13 @@ export default function ReceptionistDashboard() {
                     </View>
                   </View>
                 </View>
-
                 <Text style={styles.label}>Symptoms / Reason</Text>
-                <TextInput testID="ap-symptoms" placeholder="Fever, cough, headache..." placeholderTextColor={colors.muted} value={pSymptoms} onChangeText={setPSymptoms} multiline style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]} />
-
+                <TextInput testID="ap-symptoms" placeholder="Fever, cough..." placeholderTextColor={colors.muted} value={pSymptoms} onChangeText={setPSymptoms} multiline style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]} />
                 <Text style={styles.label}>Address</Text>
                 <TextInput testID="ap-address" placeholder="Area, city" placeholderTextColor={colors.muted} value={pAddress} onChangeText={setPAddress} style={styles.input} />
-
                 <Text style={styles.label}>Slot (optional)</Text>
                 <TextInput testID="ap-slot" placeholder="e.g. 11:00 AM (leave blank for Walk-in)" placeholderTextColor={colors.muted} value={pSlot} onChangeText={setPSlot} style={styles.input} />
-
                 {addError ? <Text style={styles.error}>{addError}</Text> : null}
-
                 <Pressable testID="ap-submit" onPress={onAddPatient} disabled={addLoading} style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }]}>
                   {addLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Add to Queue</Text>}
                 </Pressable>
@@ -289,7 +341,7 @@ export default function ReceptionistDashboard() {
         </Pressable>
       </Modal>
 
-      {/* Emergency Modal */}
+      {/* ── Emergency Modal ── */}
       <Modal transparent visible={emergencyOpen} animationType="slide" onRequestClose={() => setEmergencyOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setEmergencyOpen(false)}>
           <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>

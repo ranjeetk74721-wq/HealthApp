@@ -1,57 +1,84 @@
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback } from "react";
 import { View, Text, StyleSheet, ScrollView, ActivityIndicator, Pressable, RefreshControl } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { useFocusEffect } from "expo-router";
+import { useRouter, useFocusEffect } from "expo-router";
 import { api, getBackendWebSocketBase } from "@/src/api/client";
+import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 
+// Polling interval when WebSocket is NOT connected (fallback)
+const POLL_INTERVAL_MS = 20_000;
+
 export default function PatientQueue() {
+  const router = useRouter();
+  const { signOut } = useAuth();
   const [data, setData] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const timerRef = useRef<any>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
   const currentApptId = useRef<string | null>(null);
+  const isFocused = useRef(true);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (silent = false, bypassCache = false) => {
+    const shouldBypass = silent || bypassCache;
+    if (!silent) setLoading(true);
     try {
-      const appts = await api.get("/appointments/me");
-      const active = appts.find((a: any) => ["booked", "arrived", "in_consultation"].includes(a.status));
+      const appts = await api.get("/appointments/me", { bypassCache: shouldBypass });
+      const active = appts.find((a: any) =>
+        ["booked", "arrived", "in_consultation"].includes(a.status),
+      );
       if (!active) {
         setData({ empty: true });
         currentApptId.current = null;
         return;
       }
-      const q = await api.get(`/appointments/${active.id}/queue`);
+      const q = await api.get(`/appointments/${active.id}/queue`, { bypassCache: shouldBypass });
       setData(q);
-      // Establish WS if new active appt
+      // Only open a new WS if the active appointment changed
       if (currentApptId.current !== active.id) {
         currentApptId.current = active.id;
         connectWs(active.id);
       }
-    } catch (e) {
-      console.log(e);
+    } catch (err: any) {
+      if (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired"))) {
+        await signOut();
+        router.replace("/login");
+      }
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [router, signOut]);
 
   const connectWs = (apptId: string) => {
-    const wsBase = getBackendWebSocketBase();
+    // Close any existing connection cleanly
     if (wsRef.current) {
-      try { wsRef.current.close(); } catch {}
+      try { wsRef.current.close(); } catch { /* ignore */ }
       wsRef.current = null;
     }
     try {
-      const ws = new WebSocket(`${wsBase}/api/ws/queue/appt/${apptId}`);
+      const ws = new WebSocket(`${getBackendWebSocketBase()}/api/ws/queue/appt/${apptId}`);
       wsRef.current = ws;
-      ws.onopen = () => setWsConnected(true);
-      ws.onmessage = () => { load(); };
+      ws.onopen = () => {
+        setWsConnected(true);
+        // Clear fallback polling when WS is active — WS handles updates
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      };
+      ws.onmessage = () => {
+        if (isFocused.current) load(true);
+      };
       ws.onerror = () => setWsConnected(false);
-      ws.onclose = () => setWsConnected(false);
+      ws.onclose = () => {
+        setWsConnected(false);
+        // WS dropped — restart fallback polling if still on screen
+        if (isFocused.current && !timerRef.current) {
+          timerRef.current = setInterval(() => load(true), POLL_INTERVAL_MS);
+        }
+      };
     } catch {
       setWsConnected(false);
     }
@@ -59,26 +86,46 @@ export default function PatientQueue() {
 
   useFocusEffect(
     useCallback(() => {
+      isFocused.current = true;
       load();
-      // Fallback polling every 15s (WS should handle most updates)
-      timerRef.current = setInterval(load, 15000);
+      // Start fallback polling only if WS is not connected
+      if (!wsConnected) {
+        timerRef.current = setInterval(() => load(true), POLL_INTERVAL_MS);
+      }
       return () => {
-        if (timerRef.current) clearInterval(timerRef.current);
-        if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
+        isFocused.current = false;
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+        // Close WS on screen blur to free resources
+        if (wsRef.current) {
+          try { wsRef.current.close(); } catch { /* ignore */ }
+          wsRef.current = null;
+        }
+        setWsConnected(false);
         currentApptId.current = null;
       };
+      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [load]),
   );
 
-  if (loading) return <SafeAreaView style={styles.safe}><ActivityIndicator style={{ marginTop: 60 }} color={colors.brand} /></SafeAreaView>;
+  if (loading) {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <ActivityIndicator style={{ marginTop: 60 }} color={colors.brand} />
+      </SafeAreaView>
+    );
+  }
 
   if (data?.empty) {
     return (
       <SafeAreaView style={styles.safe} edges={["top"]}>
         <View style={styles.emptyWrap}>
-          <View style={styles.emptyIcon}><Ionicons name="calendar-outline" size={44} color={colors.brand} /></View>
+          <View style={styles.emptyIcon}>
+            <Ionicons name="calendar-outline" size={44} color={colors.brand} />
+          </View>
           <Text style={styles.emptyTitle}>No active queue</Text>
-          <Text style={styles.emptySub}>Book an appointment to see your live queue position here.</Text>
+          <Text style={styles.emptySub}>
+            Book an appointment to see your live queue position here.
+          </Text>
         </View>
       </SafeAreaView>
     );
@@ -90,25 +137,41 @@ export default function PatientQueue() {
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
-      <ScrollView contentContainerStyle={styles.scroll} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} />}>
+      <ScrollView
+        contentContainerStyle={styles.scroll}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={() => { setRefreshing(true); load(true); }}
+          />
+        }
+      >
         <Text style={styles.title}>Live Queue</Text>
         <Text style={styles.doctorName}>{appt.doctor_name}</Text>
         <Text style={styles.slotText}>Token #{appt.token_number} · {appt.slot}</Text>
 
         <View style={styles.hero}>
-          <Text style={styles.heroLabel}>{isServing ? "IT'S YOUR TURN 🎉" : isDone ? "COMPLETED" : "YOU ARE NUMBER"}</Text>
+          <Text style={styles.heroLabel}>
+            {isServing ? "IT'S YOUR TURN 🎉" : isDone ? "COMPLETED" : "YOU ARE NUMBER"}
+          </Text>
           <Text style={styles.heroNumber} testID="queue-position">
             {isServing ? "NOW" : isDone ? "✓" : `#${data.my_position || 0}`}
           </Text>
           <Text style={styles.heroSub}>
-            {isServing ? "Please head to the consultation room" : isDone ? "Consultation completed" : `~${data.eta_minutes} minutes waiting time`}
+            {isServing
+              ? "Please head to the consultation room"
+              : isDone
+              ? "Consultation completed"
+              : `~${data.eta_minutes} minutes waiting time`}
           </Text>
         </View>
 
         <View style={styles.statsRow}>
           <View style={styles.statCard}>
             <Text style={styles.statLabel}>Currently serving</Text>
-            <Text style={styles.statValue}>{data.currently_serving != null ? `#${data.currently_serving}` : "-"}</Text>
+            <Text style={styles.statValue}>
+              {data.currently_serving != null ? `#${data.currently_serving}` : "-"}
+            </Text>
           </View>
           <View style={styles.statCard}>
             <Text style={styles.statLabel}>Completed today</Text>
@@ -121,14 +184,36 @@ export default function PatientQueue() {
         </View>
 
         <View style={styles.progressWrap}>
-          <View style={[styles.progressBar, { width: `${Math.min(100, (data.completed_count / Math.max(1, data.total_in_queue + data.completed_count)) * 100)}%` }]} />
+          <View
+            style={[
+              styles.progressBar,
+              {
+                width: `${Math.min(
+                  100,
+                  (data.completed_count /
+                    Math.max(1, data.total_in_queue + data.completed_count)) *
+                    100,
+                )}%`,
+              },
+            ]}
+          />
         </View>
 
         <View style={styles.notifyCard}>
-          <Ionicons name={wsConnected ? "flash" : "notifications"} size={20} color={wsConnected ? colors.success : colors.brandPrimary} />
+          <Ionicons
+            name={wsConnected ? "flash" : "notifications"}
+            size={20}
+            color={wsConnected ? colors.success : colors.brandPrimary}
+          />
           <View style={{ flex: 1 }}>
-            <Text style={styles.notifyTitle}>{wsConnected ? "Live updates active" : "Auto-refreshing"}</Text>
-            <Text style={styles.notifySub}>{wsConnected ? "Real-time queue updates via WebSocket" : "Updates every 15s"}</Text>
+            <Text style={styles.notifyTitle}>
+              {wsConnected ? "Live updates active" : "Auto-refreshing"}
+            </Text>
+            <Text style={styles.notifySub}>
+              {wsConnected
+                ? "Real-time queue updates via WebSocket"
+                : `Updates every ${POLL_INTERVAL_MS / 1000}s`}
+            </Text>
           </View>
         </View>
 
@@ -138,8 +223,8 @@ export default function PatientQueue() {
             onPress={async () => {
               try {
                 await api.post(`/appointments/${appt.id}/cancel`);
-                load();
-              } catch (e) { console.log(e); }
+                load(true);
+              } catch { /* ignore */ }
             }}
             style={styles.cancelBtn}
           >

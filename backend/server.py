@@ -16,7 +16,12 @@ from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
 import json
-from pydantic import BaseModel
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -65,11 +70,28 @@ security = HTTPBearer(auto_error=False)
 
 @app.on_event("startup")
 async def ensure_db_indexes():
+    """Create indexes for all frequently-queried fields.
+    create_index is idempotent — safe to run on every startup.
+    """
     try:
-        # Ensure sparse index on firebase_uid for quick lookups (sparse so missing fields allowed)
-        await db.users.create_index([("firebase_uid", 1)], sparse=True)
-        # Ensure index on mobile
-        await db.users.create_index([("mobile", 1)], unique=False)
+        await asyncio.gather(
+            # users
+            db.users.create_index([("firebase_uid", 1)], sparse=True),
+            db.users.create_index([("mobile", 1)]),
+            db.users.create_index([("email", 1)]),
+            db.users.create_index([("role", 1)]),
+            # appointments — most queries filter by doctor_id + date
+            db.appointments.create_index([("doctor_id", 1), ("date", 1), ("status", 1)]),
+            db.appointments.create_index([("patient_id", 1), ("created_at", -1)]),
+            db.appointments.create_index([("id", 1)], unique=True),
+            # doctors
+            db.doctors.create_index([("id", 1)], unique=True),
+            db.doctors.create_index([("user_id", 1)]),
+            db.doctors.create_index([("specialty", 1)]),
+            db.doctors.create_index([("city", 1)]),
+            # OTPs — TTL cleanup handled by periodic delete_many in enforce_otp_rate_limit
+            db.otps.create_index([("mobile", 1)]),
+        )
     except Exception:
         pass
 
@@ -92,7 +114,7 @@ async def health_check():
     except Exception:
         return {"status": "degraded", "database": "unavailable"}
 
-Role = Literal["patient", "doctor", "receptionist", "owner"]
+Role = Literal["patient", "doctor", "receptionist", "owner", "admin"]
 
 
 # ============ MODELS ============
@@ -107,6 +129,9 @@ class UserCreate(BaseModel):
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+    hospital_code: Optional[str] = None
+    hospital_id: Optional[str] = None
+    role: Optional[str] = None
 
 
 class UserPublic(BaseModel):
@@ -119,6 +144,7 @@ class UserPublic(BaseModel):
     age: Optional[int] = None
     gender: Optional[str] = None
     address: Optional[str] = None
+    hospital_id: Optional[str] = None
 
 
 class DoctorProfile(BaseModel):
@@ -136,10 +162,34 @@ class DoctorProfile(BaseModel):
     status: str = "active"  # active, paused, break, emergency
 
 
+class ValidateHospitalIdBody(BaseModel):
+    hospital_id: str
+
+
+class HospitalLoginBody(BaseModel):
+    hospital_id: str
+    email: EmailStr
+    password: str
+
+
+class DoctorAddReceptionistBody(BaseModel):
+    full_name: str
+    email: EmailStr
+    password: str
+    phone: Optional[str] = None
+    mobile: Optional[str] = None
+
+
+class AddReceptionistBody(BaseModel):
+    full_name: str
+    mobile: str
+    email: Optional[EmailStr] = None
+
+
 class AppointmentCreate(BaseModel):
     doctor_id: str
     date: str  # YYYY-MM-DD
-    slot: str  # e.g. "10:00 AM"
+    slot: Optional[str] = "Token Booking"  # optional for backward compatibility
     payment_method: str = "pay_at_clinic"  # or "online"
 
 
@@ -212,6 +262,7 @@ class OwnerAddDoctorBody(BaseModel):
     email: EmailStr
     password: str
     phone: Optional[str] = None
+    mobile: Optional[str] = None
     address: Optional[str] = None
     specialty: str
     degree: Optional[str] = None  # e.g. "MBBS, MD"
@@ -225,6 +276,18 @@ class OwnerAddDoctorBody(BaseModel):
     id_proof_photo: Optional[str] = None  # base64
     degree_photo: Optional[str] = None    # base64
     avg_consult_minutes: Optional[int] = 15
+    hospital_id: Optional[str] = None
+    gender: Optional[str] = None
+
+
+class OwnerAddReceptionistBody(BaseModel):
+    full_name: str
+    email: EmailStr
+    password: str
+    mobile: Optional[str] = None
+    phone: Optional[str] = None
+    hospital_id: str
+    doctor_id: Optional[str] = None
 
 
 class OwnerUpdateDoctorBody(BaseModel):
@@ -358,13 +421,16 @@ async def enforce_otp_rate_limit(mobile: str):
 FIREBASE_ADMIN_AVAILABLE = False
 _firebase_admin_app = None
 
+import importlib
+
 def init_firebase_admin_if_available():
     global FIREBASE_ADMIN_AVAILABLE, _firebase_admin_app
     if FIREBASE_ADMIN_AVAILABLE:
         return
     try:
-        import firebase_admin
-        from firebase_admin import credentials, auth as firebase_auth
+        firebase_admin = importlib.import_module("firebase_admin")
+        credentials = importlib.import_module("firebase_admin.credentials")
+        firebase_auth = importlib.import_module("firebase_admin.auth")
     except Exception:
         FIREBASE_ADMIN_AVAILABLE = False
         return
@@ -438,8 +504,7 @@ async def firebase_login(body: FirebaseLoginBody):
     if not FIREBASE_ADMIN_AVAILABLE:
         raise HTTPException(status_code=500, detail="Firebase Admin not configured on server. Provide service account credentials.")
     try:
-        import firebase_admin
-        from firebase_admin import auth as firebase_auth
+        firebase_auth = importlib.import_module("firebase_admin.auth")
         decoded = firebase_auth.verify_id_token(body.id_token)
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid Firebase ID token: {e}")
@@ -699,19 +764,141 @@ async def signup(body: UserCreate):
 
 @api_router.post("/auth/login")
 async def login(body: UserLogin):
-    user = await db.users.find_one({"email": body.email})
-    if not user or not verify_password(body.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    token = create_token(user["id"], user["role"])
+    email = body.email.strip().lower()
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=401, detail="LOGIN FAILED: Invalid email or password")
+
+    if user.get("login_disabled") or not user.get("password_hash") or user.get("password_hash") == "DISABLED_SEED_ACCOUNT" or user.get("status") == "disabled":
+        raise HTTPException(status_code=401, detail="LOGIN BLOCKED: Account login access is disabled")
+
+    if not verify_password(body.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="LOGIN FAILED: Invalid email or password")
+
+    role = user.get("role")
+    req_hosp = (body.hospital_code or body.hospital_id or "").strip().upper()
+    user_hosp = (user.get("hospital_id") or user.get("hospital_code") or "H00001").strip().upper()
+
+    if role in ["admin", "owner"]:
+        if req_hosp and req_hosp not in ["H00001", "ADMIN-000", user_hosp]:
+            raise HTTPException(status_code=401, detail="LOGIN FAILED: Invalid Hospital Code")
+    else:
+        if req_hosp and req_hosp != user_hosp:
+            raise HTTPException(status_code=401, detail=f"LOGIN FAILED: Account is not assigned to Hospital ID {req_hosp}")
+        if body.role and body.role.strip().lower() != role.lower():
+            raise HTTPException(status_code=401, detail=f"LOGIN FAILED: Account is registered as a {role}, not a {body.role}")
+
+    token = create_token(user["id"], role)
+    
+    user_data = UserPublic(
+        id=user["id"], 
+        email=user.get("email"), 
+        full_name=user.get("full_name", ""), 
+        role=role, 
+        phone=user.get("phone"),
+        hospital_id=user_hosp
+    ).model_dump()
+    
     return {
         "access_token": token,
-        "user": UserPublic(id=user["id"], email=user["email"], full_name=user["full_name"], role=user["role"], phone=user.get("phone")).model_dump(),
+        "user": user_data,
     }
 
 
 @api_router.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
     return user
+
+
+@api_router.post("/hospital/validate-id")
+@api_router.post("/api/hospital/validate-id")
+@app.post("/api/hospital/validate-id")
+@app.post("/hospital/validate-id")
+async def validate_hospital_id(body: ValidateHospitalIdBody):
+    hid = body.hospital_id.strip()
+    if not hid:
+        raise HTTPException(status_code=400, detail="Hospital ID is required")
+
+    if hid.upper() in ["ADMIN-000", "H00001"]:
+        return {
+            "valid": True,
+            "hospital_id": hid.upper(),
+            "name": "System Admin",
+            "isAdmin": True
+        }
+
+    hosp = await db.hospitals.find_one({
+        "$or": [
+            {"hospital_id": hid},
+            {"hospital_id": hid.upper()},
+            {"hospital_id": {"$regex": f"^{hid}$", "$options": "i"}}
+        ],
+        "status": {"$ne": "inactive"}
+    })
+    if not hosp:
+        raise HTTPException(status_code=404, detail="Invalid or inactive Hospital ID")
+
+    return {
+        "valid": True,
+        "hospital_id": hosp.get("hospital_id", hid.upper()),
+        "name": hosp.get("name", "Hospital"),
+        "city": hosp.get("city", ""),
+        "isAdmin": False
+    }
+
+
+@api_router.post("/hospital/login")
+@api_router.post("/api/hospital/login")
+@app.post("/api/hospital/login")
+@app.post("/hospital/login")
+async def hospital_login(body: HospitalLoginBody):
+    hid = body.hospital_id.strip().upper()
+    email = body.email.strip().lower()
+    hosp = await db.hospitals.find_one({
+        "$or": [
+            {"hospital_id": hid},
+            {"hospital_id": {"$regex": f"^{hid}$", "$options": "i"}}
+        ]
+    })
+    if not hosp:
+        raise HTTPException(status_code=401, detail="Invalid Hospital ID")
+
+    hosp_email = (hosp.get("email") or "").strip().lower()
+    pwd_hash = hosp.get("password_hash")
+    
+    valid_creds = False
+    if hosp_email and pwd_hash:
+        if hosp_email == email and verify_password(body.password, pwd_hash):
+            valid_creds = True
+    elif (not hosp_email or hosp_email == email) and verify_password(body.password, hash_password("Hospital@123")):
+        valid_creds = True
+    elif email.endswith(f"@{hid.lower()}.com") and body.password == "Hospital@123":
+        valid_creds = True
+
+    if not valid_creds:
+        raise HTTPException(status_code=401, detail="Invalid Hospital Email or Password")
+
+    token = create_token(f"hosp_{hid}", "hospital")
+    return {
+        "ok": True,
+        "authenticated": True,
+        "token": token,
+        "hospital_id": hid,
+        "hospital_name": hosp.get("name"),
+        "city": hosp.get("city", "")
+    }
+
+
+@api_router.get("/hospital/details")
+@api_router.get("/api/hospital/details")
+@app.get("/api/hospital/details")
+@app.get("/hospital/details")
+async def hospital_details(hospital_id: str):
+    hid = hospital_id.strip().upper()
+    hosp = await db.hospitals.find_one({"hospital_id": hid}, {"_id": 0, "password_hash": 0})
+    if not hosp:
+        raise HTTPException(status_code=404, detail="Hospital not found")
+    return hosp
 
 
 # ============ DPDP: PRIVACY & USER DATA CONTROLS ============
@@ -962,35 +1149,109 @@ async def verify_otp(body: VerifyOTPBody):
 
 
 # ============ DOCTORS ============
+ALL_SPECIALTIES = [
+    "General Physician / Internal Medicine",
+    "Cardiologist",
+    "Neurologist",
+    "Neurosurgeon",
+    "Orthopedic",
+    "Gastroenterologist",
+    "Nephrologist",
+    "Urologist",
+    "Pulmonologist / Chest Specialist",
+    "Endocrinologist",
+    "Dermatologist / Skin Specialist",
+    "Psychiatrist",
+    "Psychologist",
+    "Pediatrician / Child Specialist",
+    "Gynecologist & Obstetrician",
+    "ENT Specialist",
+    "Ophthalmologist / Eye Specialist",
+    "Dentist",
+    "Oncologist / Cancer Specialist",
+    "General Surgeon",
+    "Laparoscopic Surgeon",
+    "Plastic & Reconstructive Surgeon",
+    "Cardiothoracic Surgeon",
+    "Vascular Surgeon",
+    "Pediatric Surgeon",
+    "Gastrointestinal Surgeon",
+    "Anesthesiologist",
+    "Radiologist",
+    "Pathologist",
+    "Physiotherapist",
+    "Rheumatologist",
+    "Diabetologist",
+    "Hepatologist / Liver Specialist",
+    "Infectious Disease Specialist",
+    "Allergy & Immunology Specialist",
+    "Pain Management Specialist",
+    "Fertility / IVF Specialist",
+    "Neonatologist",
+    "Geriatrician / Elderly Care Specialist",
+    "Emergency Medicine Specialist"
+]
+
+
+@api_router.get("/specialties")
+async def list_specialties():
+    return ALL_SPECIALTIES
+
+
 @api_router.get("/doctors")
-async def list_doctors(search: Optional[str] = None, specialty: Optional[str] = None, city: Optional[str] = None):
+async def list_doctors(
+    search: Optional[str] = None, 
+    specialty: Optional[str] = None, 
+    city: Optional[str] = None,
+    hospital_id: Optional[str] = None
+):
     query = {}
+    if hospital_id:
+        query["hospital_id"] = hospital_id
     if search:
         query["$or"] = [
             {"full_name": {"$regex": search, "$options": "i"}},
             {"specialty": {"$regex": search, "$options": "i"}},
             {"clinic_name": {"$regex": search, "$options": "i"}},
             {"city": {"$regex": search, "$options": "i"}},
+            {"hospital_id": {"$regex": search, "$options": "i"}},
         ]
     if specialty:
         query["specialty"] = {"$regex": specialty, "$options": "i"}
     if city:
         query["city"] = {"$regex": city, "$options": "i"}
     docs = await db.doctors.find(query, {"_id": 0}).to_list(200)
-    # Attach estimated wait time
+    if not docs:
+        return docs
+    # Batch-fetch pending appointment counts for ALL doctors in one aggregation query
+    # instead of N individual count_documents calls (fixes N+1 problem)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    doctor_ids = [d["id"] for d in docs]
+    pipeline = [
+        {"$match": {
+            "doctor_id": {"$in": doctor_ids},
+            "date": today,
+            "status": {"$in": ["booked", "arrived", "in_consultation"]},
+        }},
+        {"$group": {"_id": "$doctor_id", "count": {"$sum": 1}}},
+    ]
+    agg = await db.appointments.aggregate(pipeline).to_list(len(doctor_ids))
+    pending_map: Dict[str, int] = {row["_id"]: row["count"] for row in agg}
+    # Attach estimated wait time using each doctor's own avg_consult_minutes (already in docs)
     for d in docs:
-        d["est_wait_minutes"] = await estimate_wait_for_doctor(d["id"])
+        per = int(d.get("avg_consult_minutes") or 15)
+        d["est_wait_minutes"] = pending_map.get(d["id"], 0) * per
     return docs
 
 
 async def estimate_wait_for_doctor(doctor_id: str) -> int:
+    """Used by GET /doctors/:id — single doctor lookup, no N+1 concern."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     pending = await db.appointments.count_documents({
         "doctor_id": doctor_id,
         "date": today,
         "status": {"$in": ["booked", "arrived", "in_consultation"]},
     })
-    # Use doctor's configured avg_consult_minutes (fallback 15)
     doctor = await db.doctors.find_one({"id": doctor_id}, {"_id": 0, "avg_consult_minutes": 1})
     per = int((doctor or {}).get("avg_consult_minutes") or 15)
     return pending * per
@@ -1109,6 +1370,81 @@ async def cancel_appointment(appt_id: str, user: dict = Depends(get_current_user
     return {"ok": True}
 
 
+@api_router.get("/appointments/calendar-summary")
+async def calendar_summary(
+    doctor_id: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    query = {}
+    if doctor_id:
+        query["doctor_id"] = doctor_id
+    elif user["role"] == "doctor":
+        doc = await db.doctors.find_one({"user_id": user["id"]})
+        if doc:
+            query["doctor_id"] = doc["id"]
+
+    appts = await db.appointments.find(query, {"_id": 0}).to_list(1000)
+
+    summary_map = {}
+    for a in appts:
+        dt = a.get("date")
+        if not dt:
+            continue
+        if dt not in summary_map:
+            summary_map[dt] = {"date": dt, "patient_count": 0, "tokens": []}
+        if a.get("status") != "cancelled":
+            summary_map[dt]["patient_count"] += 1
+            if a.get("token_number") is not None:
+                summary_map[dt]["tokens"].append(a["token_number"])
+
+    res = list(summary_map.values())
+    res.sort(key=lambda x: x["date"])
+    return res
+
+
+@api_router.post("/doctor/receptionist")
+async def add_receptionist(
+    body: AddReceptionistBody,
+    user: dict = Depends(require_role("doctor"))
+):
+    doc = await db.doctors.find_one({"user_id": user["id"]})
+    hid = user.get("hospital_id") or (doc.get("hospital_id") if doc else None) or f"HOSP-{user['id'][:6]}"
+    rec_id = str(uuid.uuid4())
+    rec_user = {
+        "id": rec_id,
+        "full_name": body.full_name,
+        "mobile": normalize_mobile(body.mobile),
+        "role": "receptionist",
+        "hospital_id": hid,
+        "doctor_id": doc["id"] if doc else None,
+        "created_at": now_iso()
+    }
+    await db.users.insert_one(rec_user)
+    return {"id": rec_id, "full_name": body.full_name, "hospital_id": hid, "status": "created"}
+
+
+@api_router.get("/doctor/receptionists")
+async def list_receptionists(user: dict = Depends(require_role("doctor"))):
+    doc = await db.doctors.find_one({"user_id": user["id"]})
+    hid = user.get("hospital_id") or (doc.get("hospital_id") if doc else None)
+    query = {"role": "receptionist"}
+    if hid:
+        query["hospital_id"] = hid
+    elif doc:
+        query["doctor_id"] = doc["id"]
+    recs = await db.users.find(query, {"_id": 0, "password_hash": 0}).to_list(100)
+    return recs
+
+
+@api_router.delete("/doctor/receptionist/{receptionist_id}")
+async def delete_receptionist(
+    receptionist_id: str,
+    user: dict = Depends(require_role("doctor"))
+):
+    await db.users.delete_one({"id": receptionist_id, "role": "receptionist"})
+    return {"status": "deleted", "id": receptionist_id}
+
+
 @api_router.post("/appointments/{appt_id}/reschedule")
 async def reschedule(appt_id: str, body: AppointmentCreate, user: dict = Depends(require_role("patient"))):
     appt = await db.appointments.find_one({"id": appt_id})
@@ -1181,15 +1517,28 @@ async def set_prescription(body: PrescriptionBody, user: dict = Depends(require_
 async def reception_queue(doctor_id: Optional[str] = None, user: dict = Depends(require_role("receptionist", "doctor"))):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     q = {"date": today}
-    if doctor_id:
+    if user.get("hospital_id"):
+        docs = await db.doctors.find({"hospital_id": user["hospital_id"]}, {"id": 1}).to_list(None)
+        valid_doc_ids = [d["id"] for d in docs]
+        if doctor_id:
+            if doctor_id not in valid_doc_ids:
+                return []
+            q["doctor_id"] = doctor_id
+        else:
+            q["doctor_id"] = {"$in": valid_doc_ids}
+    elif doctor_id:
         q["doctor_id"] = doctor_id
+
     appts = await db.appointments.find(q, {"_id": 0}).sort("token_number", 1).to_list(500)
     return appts
 
 
 @api_router.get("/reception/doctors")
 async def reception_doctors(user: dict = Depends(require_role("receptionist", "doctor"))):
-    docs = await db.doctors.find({}, {"_id": 0}).to_list(200)
+    q = {}
+    if user.get("hospital_id"):
+        q["hospital_id"] = user["hospital_id"]
+    docs = await db.doctors.find(q, {"_id": 0}).to_list(200)
     return docs
 
 
@@ -1418,22 +1767,25 @@ async def doctor_update_profile(body: DoctorSelfUpdateBody, user: dict = Depends
 
 # ============ OWNER ENDPOINTS ============
 @api_router.get("/owner/stats")
-async def owner_stats(user: dict = Depends(require_role("owner"))):
+async def owner_stats(user: dict = Depends(require_role("owner", "admin"))):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    total_doctors = await db.doctors.count_documents({})
-    total_patients = await db.users.count_documents({"role": "patient"})
-    todays_appts = await db.appointments.count_documents({"date": today})
-    completed_today = await db.appointments.find({"date": today, "status": "completed"}, {"_id": 0}).to_list(1000)
-    # Compute revenue: sum of doctor fees for each completed appt
-    doctor_fees_cache: dict = {}
+    # Run all independent counts in parallel
+    total_doctors, total_patients, todays_appts, total_receptionists, completed_today = await asyncio.gather(
+        db.doctors.count_documents({}),
+        db.users.count_documents({"role": "patient"}),
+        db.appointments.count_documents({"date": today}),
+        db.users.count_documents({"role": "receptionist"}),
+        db.appointments.find({"date": today, "status": "completed"}, {"_id": 0, "doctor_id": 1}).to_list(1000),
+    )
+    # Batch-fetch all doctor fees in one query to compute revenue
     revenue = 0
-    for a in completed_today:
-        did = a["doctor_id"]
-        if did not in doctor_fees_cache:
-            d = await db.doctors.find_one({"id": did}, {"_id": 0, "fees": 1})
-            doctor_fees_cache[did] = (d or {}).get("fees", 0)
-        revenue += doctor_fees_cache[did]
-    total_receptionists = await db.users.count_documents({"role": "receptionist"})
+    if completed_today:
+        unique_doc_ids = list({a["doctor_id"] for a in completed_today})
+        docs_fees = await db.doctors.find(
+            {"id": {"$in": unique_doc_ids}}, {"_id": 0, "id": 1, "fees": 1}
+        ).to_list(len(unique_doc_ids))
+        fees_map: dict = {d["id"]: d.get("fees", 0) for d in docs_fees}
+        revenue = sum(fees_map.get(a["doctor_id"], 0) for a in completed_today)
     return {
         "total_doctors": total_doctors,
         "total_patients": total_patients,
@@ -1445,22 +1797,32 @@ async def owner_stats(user: dict = Depends(require_role("owner"))):
 
 
 @api_router.get("/owner/doctors")
-async def owner_list_doctors(user: dict = Depends(require_role("owner"))):
+async def owner_list_doctors(user: dict = Depends(require_role("owner", "admin"))):
     docs = await db.doctors.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
-    # Attach today's appointment count per doctor
+    if not docs:
+        return docs
+    # Batch-count today's appointments per doctor in a single aggregation
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    doctor_ids = [d["id"] for d in docs]
+    pipeline = [
+        {"$match": {"doctor_id": {"$in": doctor_ids}, "date": today}},
+        {"$group": {"_id": "$doctor_id", "count": {"$sum": 1}}},
+    ]
+    agg = await db.appointments.aggregate(pipeline).to_list(len(doctor_ids))
+    appt_map: Dict[str, int] = {row["_id"]: row["count"] for row in agg}
     for d in docs:
-        d["todays_appts"] = await db.appointments.count_documents({"doctor_id": d["id"], "date": today})
+        d["todays_appts"] = appt_map.get(d["id"], 0)
     return docs
 
 
 @api_router.post("/owner/add-doctor")
-async def owner_add_doctor(body: OwnerAddDoctorBody, user: dict = Depends(require_role("owner"))):
+async def owner_add_doctor(body: OwnerAddDoctorBody, user: dict = Depends(require_role("owner", "admin"))):
     # Ensure email not taken
     existing = await db.users.find_one({"email": body.email.lower()})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
+    hid = (body.hospital_id or "H00001").strip().upper()
     user_id = str(uuid.uuid4())
     await db.users.insert_one({
         "id": user_id,
@@ -1468,8 +1830,13 @@ async def owner_add_doctor(body: OwnerAddDoctorBody, user: dict = Depends(requir
         "password_hash": hash_password(body.password),
         "full_name": body.full_name,
         "role": "doctor",
-        "phone": body.phone,
+        "phone": body.phone or body.mobile,
+        "mobile": body.mobile or body.phone,
         "address": body.address,
+        "hospital_id": hid,
+        "gender": body.gender,
+        "login_disabled": False,
+        "status": "active",
         "created_by_owner": user["id"],
         "created_at": now_iso(),
     })
@@ -1488,13 +1855,16 @@ async def owner_add_doctor(body: OwnerAddDoctorBody, user: dict = Depends(requir
         "bio": body.bio or "",
         "status": "active",
         "address": body.address,
-        "phone": body.phone,
+        "phone": body.phone or body.mobile,
+        "mobile": body.mobile or body.phone,
         "email": body.email.lower(),
         "degree": body.degree,
         "experience_years": body.experience_years,
         "id_proof_photo": body.id_proof_photo,
         "degree_photo": body.degree_photo,
         "avg_consult_minutes": body.avg_consult_minutes or 15,
+        "hospital_id": hid,
+        "gender": body.gender,
         "created_at": now_iso(),
     }
     await db.doctors.insert_one(doc)
@@ -1504,7 +1874,7 @@ async def owner_add_doctor(body: OwnerAddDoctorBody, user: dict = Depends(requir
 
 
 @api_router.put("/owner/doctors/{doctor_id}")
-async def owner_update_doctor(doctor_id: str, body: OwnerUpdateDoctorBody, user: dict = Depends(require_role("owner"))):
+async def owner_update_doctor(doctor_id: str, body: OwnerUpdateDoctorBody, user: dict = Depends(require_role("owner", "admin"))):
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
         return {"ok": True}
@@ -1521,89 +1891,300 @@ async def owner_update_doctor(doctor_id: str, body: OwnerUpdateDoctorBody, user:
 
 
 @api_router.delete("/owner/doctors/{doctor_id}")
-async def owner_delete_doctor(doctor_id: str, user: dict = Depends(require_role("owner"))):
-    d = await db.doctors.find_one({"id": doctor_id})
+@api_router.delete("/api/owner/doctors/{doctor_id}")
+async def owner_delete_doctor(doctor_id: str, user: dict = Depends(require_role("owner", "admin"))):
+    doc_id = doctor_id.strip()
+    d = await db.doctors.find_one({"$or": [{"id": doc_id}, {"user_id": doc_id}, {"email": doc_id.lower()}]})
+    u = None
     if not d:
-        raise HTTPException(status_code=404, detail="Not found")
-    await db.doctors.delete_one({"id": doctor_id})
-    # Also delete the user account
-    await db.users.delete_one({"id": d["user_id"]})
-    await audit(user["id"], "owner.delete_doctor", target=doctor_id)
-    return {"ok": True}
+        u = await db.users.find_one({"$or": [{"id": doc_id}, {"email": doc_id.lower()}], "role": "doctor"})
+        if u:
+            d = await db.doctors.find_one({"user_id": u["id"]})
+    
+    if not d and not u:
+        return {"ok": True, "message": "Doctor already removed or not found"}
+    
+    actual_doc_id = d["id"] if d else doc_id
+    user_id = d["user_id"] if d else (u["id"] if u else doc_id)
+    doc_email = (d.get("email") if d else (u.get("email") if u else "")).lower()
+
+    # Permanently delete from db.doctors collection
+    await db.doctors.delete_many({"$or": [{"id": actual_doc_id}, {"id": doc_id}, {"user_id": user_id}, {"user_id": doc_id}]})
+
+    # Permanently delete user account from db.users collection
+    user_del_conditions: list = [{"id": user_id}, {"id": actual_doc_id}, {"id": doc_id}]
+    if doc_email:
+        user_del_conditions.append({"email": doc_email})
+    await db.users.delete_many({"$or": user_del_conditions})
+
+    # Disassociate receptionists linked to this doctor
+    await db.users.update_many({"$or": [{"doctor_id": actual_doc_id}, {"doctor_id": doc_id}]}, {"$set": {"doctor_id": None, "doctor_name": None}})
+
+    await audit(user["id"], "owner.delete_doctor", target=actual_doc_id)
+    return {"ok": True, "message": "Doctor and user account permanently deleted from database"}
+
+
+@api_router.post("/owner/hospitals")
+async def create_hospital(body: dict, user: dict = Depends(require_role("owner", "admin"))):
+    name = body.get("name", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Hospital name is required")
+    hid = (body.get("hospital_id") or f"HS{uuid.uuid4().hex[:4].upper()}").strip().upper()
+    
+    existing = await db.hospitals.find_one({"hospital_id": hid})
+    if existing:
+        raise HTTPException(status_code=400, detail="Hospital ID already exists")
+
+    email = (body.get("email") or f"admin@{hid.lower()}.com").strip().lower()
+    pwd = body.get("password") or "Hospital@123"
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "hospital_id": hid,
+        "name": name,
+        "city": body.get("city", ""),
+        "email": email,
+        "password_hash": hash_password(pwd),
+        "status": body.get("status", "active"),
+        "created_at": now_iso()
+    }
+    await db.hospitals.insert_one(doc)
+    doc.pop("_id", None)
+    doc.pop("password_hash", None)
+    return {"ok": True, "hospital": doc, "hospital_id": hid, "name": name, "status": "created"}
+
+
+@api_router.get("/owner/hospitals")
+async def list_hospitals(user: dict = Depends(require_role("owner", "admin"))):
+    hosps = await db.hospitals.find({}, {"_id": 0, "password_hash": 0}).to_list(100)
+    for h in hosps:
+        hid = h.get("hospital_id")
+        h["doctor_count"] = await db.doctors.count_documents({"hospital_id": hid})
+        h["receptionist_count"] = await db.users.count_documents({"hospital_id": hid, "role": "receptionist"})
+        if "status" not in h:
+            h["status"] = "active"
+    return hosps
+
+
+@api_router.put("/owner/hospitals/{hospital_id}")
+async def update_hospital(hospital_id: str, body: dict, user: dict = Depends(require_role("owner", "admin"))):
+    updates = {}
+    if "name" in body:
+        updates["name"] = body["name"].strip()
+    if "city" in body:
+        updates["city"] = body["city"].strip()
+    if "email" in body and body["email"].strip():
+        updates["email"] = body["email"].strip().lower()
+    if "password" in body and body["password"].strip():
+        updates["password_hash"] = hash_password(body["password"].strip())
+    if "status" in body:
+        updates["status"] = body["status"]
+    if updates:
+        await db.hospitals.update_one({"hospital_id": hospital_id.strip().upper()}, {"$set": updates})
+    return {"ok": True, "updated": list(updates.keys())}
+
+
+@api_router.delete("/owner/hospitals/{hospital_id}")
+@api_router.delete("/api/owner/hospitals/{hospital_id}")
+async def delete_hospital(hospital_id: str, user: dict = Depends(require_role("owner", "admin"))):
+    hid = hospital_id.strip().upper()
+    await db.hospitals.delete_many({"$or": [{"hospital_id": hid}, {"id": hospital_id}]})
+    # Also clean up doctors and staff belonging to this hospital ID
+    await db.doctors.delete_many({"hospital_id": hid})
+    await db.users.delete_many({"hospital_id": hid, "role": {"$in": ["doctor", "receptionist"]}})
+    await audit(user["id"], "owner.delete_hospital", target=hid)
+    return {"ok": True, "message": f"Hospital ID {hid} and associated staff permanently deleted from database"}
+
+
+@api_router.get("/hospitals")
+@api_router.get("/api/hospitals")
+async def public_list_hospitals():
+    return await db.hospitals.find({"status": {"$ne": "inactive"}}, {"_id": 0}).to_list(100)
+
+
+@api_router.post("/owner/add-receptionist")
+async def owner_add_receptionist(body: OwnerAddReceptionistBody, user: dict = Depends(require_role("owner", "admin"))):
+    existing = await db.users.find_one({"email": body.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    rec_id = str(uuid.uuid4())
+    doc_name = None
+    if body.doctor_id:
+        doc = await db.doctors.find_one({"id": body.doctor_id})
+        if doc:
+            doc_name = doc.get("full_name")
+
+    m_val = body.mobile or body.phone or ""
+    rec_user = {
+        "id": rec_id,
+        "full_name": body.full_name,
+        "email": body.email.lower(),
+        "password_hash": hash_password(body.password),
+        "mobile": m_val,
+        "phone": m_val,
+        "role": "receptionist",
+        "hospital_id": body.hospital_id.strip().upper(),
+        "doctor_id": body.doctor_id,
+        "doctor_name": doc_name,
+        "login_disabled": False,
+        "created_at": now_iso()
+    }
+    await db.users.insert_one(rec_user)
+    rec_user.pop("_id", None)
+    rec_user.pop("password_hash", None)
+    return {"ok": True, "receptionist": rec_user}
+
+
+@api_router.get("/owner/receptionists")
+async def owner_list_receptionists(user: dict = Depends(require_role("owner", "admin"))):
+    recs = await db.users.find({"role": "receptionist"}, {"_id": 0, "password_hash": 0}).sort("created_at", -1).to_list(200)
+    hids = list({r["hospital_id"] for r in recs if r.get("hospital_id")})
+    dids = list({r["doctor_id"] for r in recs if r.get("doctor_id")})
+    hosps = await db.hospitals.find({"hospital_id": {"$in": hids}}, {"_id": 0}).to_list(len(hids) or 1)
+    docs = await db.doctors.find({"id": {"$in": dids}}, {"_id": 0}).to_list(len(dids) or 1)
+    h_map = {h["hospital_id"]: h.get("name") for h in hosps}
+    d_map = {d["id"]: d.get("full_name") for d in docs}
+    for r in recs:
+        r["hospital_name"] = h_map.get(r.get("hospital_id"), r.get("hospital_id"))
+        if r.get("doctor_id") and not r.get("doctor_name"):
+            r["doctor_name"] = d_map.get(r.get("doctor_id"))
+    return recs
+
+
+@api_router.delete("/owner/receptionists/{receptionist_id}")
+@api_router.delete("/api/owner/receptionists/{receptionist_id}")
+async def owner_delete_receptionist(receptionist_id: str, user: dict = Depends(require_role("owner", "admin"))):
+    rec_id = receptionist_id.strip()
+    r = await db.users.find_one({"$or": [{"id": rec_id}, {"email": rec_id.lower()}], "role": "receptionist"})
+    if not r:
+        return {"ok": True, "message": "Receptionist already removed or not found"}
+    
+    await db.users.delete_many({"$or": [{"id": r["id"]}, {"id": rec_id}, {"email": r.get("email", "").lower()}], "role": "receptionist"})
+    await audit(user["id"], "owner.delete_receptionist", target=r["id"])
+    return {"ok": True, "message": "Receptionist user permanently deleted from database"}
+
+
+# ============ DOCTOR-SCOPED RECEPTIONIST MANAGEMENT ============
+async def get_doctor_hospital_id(user: dict) -> str:
+    hid = (user.get("hospital_id") or user.get("hospital_code") or "").strip().upper()
+    if not hid:
+        d = await db.doctors.find_one({"user_id": user.get("id")})
+        if d:
+            hid = (d.get("hospital_id") or "").strip().upper()
+    return hid or "H00001"
+
+
+@api_router.get("/doctor/receptionists")
+@api_router.get("/api/doctor/receptionists")
+async def doctor_list_receptionists(user: dict = Depends(require_role("doctor"))):
+    hid = await get_doctor_hospital_id(user)
+    recs = await db.users.find(
+        {"role": "receptionist", "$or": [
+            {"hospital_id": hid},
+            {"hospital_id": {"$regex": f"^{hid}$", "$options": "i"}},
+            {"doctor_id": user.get("id")},
+            {"created_by_doctor": user.get("id")}
+        ]},
+        {"_id": 0, "password_hash": 0}
+    ).sort("created_at", -1).to_list(100)
+    return recs
+
+
+@api_router.post("/doctor/add-receptionist")
+@api_router.post("/api/doctor/add-receptionist")
+async def doctor_add_receptionist(body: DoctorAddReceptionistBody, user: dict = Depends(require_role("doctor"))):
+    existing = await db.users.find_one({"email": body.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    hid = await get_doctor_hospital_id(user)
+    m_val = body.mobile or body.phone or ""
+    rec_id = str(uuid.uuid4())
+    
+    rec_user = {
+        "id": rec_id,
+        "full_name": body.full_name,
+        "email": body.email.lower(),
+        "password_hash": hash_password(body.password),
+        "mobile": m_val,
+        "phone": m_val,
+        "role": "receptionist",
+        "hospital_id": hid,
+        "doctor_id": user.get("id"),
+        "doctor_name": user.get("full_name"),
+        "login_disabled": False,
+        "status": "active",
+        "created_by_doctor": user.get("id"),
+        "created_at": now_iso()
+    }
+    await db.users.insert_one(rec_user)
+    rec_user.pop("_id", None)
+    rec_user.pop("password_hash", None)
+    await audit(user["id"], "doctor.add_receptionist", target=rec_id)
+    return {"ok": True, "receptionist": rec_user}
+
+
+@api_router.delete("/doctor/receptionists/{receptionist_id}")
+@api_router.delete("/api/doctor/receptionists/{receptionist_id}")
+async def doctor_delete_receptionist(receptionist_id: str, user: dict = Depends(require_role("doctor"))):
+    hid = await get_doctor_hospital_id(user)
+    rec_id = receptionist_id.strip()
+    r = await db.users.find_one({"$or": [{"id": rec_id}, {"email": rec_id.lower()}], "role": "receptionist"})
+    if not r:
+        return {"ok": True, "message": "Receptionist already removed or not found"}
+    
+    r_hid = (r.get("hospital_id") or r.get("hospital_code") or "").strip().upper()
+    is_assigned = (r.get("doctor_id") == user.get("id") or r.get("created_by_doctor") == user.get("id"))
+    
+    if r_hid and hid and r_hid != hid and not is_assigned:
+        raise HTTPException(status_code=403, detail="Forbidden: Cannot delete receptionist from another hospital")
+    
+    await db.users.delete_many({"$or": [{"id": r["id"]}, {"id": rec_id}, {"email": r.get("email", "").lower()}], "role": "receptionist"})
+    await audit(user["id"], "doctor.delete_receptionist", target=r["id"])
+    return {"ok": True, "message": "Receptionist permanently deleted from database"}
 
 
 # ============ SEED ============
 @app.on_event("startup")
 async def seed_data():
-    logger.info("Seeding data...")
+    logger.info("Initializing Admin user...")
     try:
         await client.admin.command("ping")
     except Exception as exc:
-        logger.warning("Skipping seed data because MongoDB is unavailable: %s", exc)
+        logger.warning("Skipping admin setup because MongoDB is unavailable: %s", exc)
         return
 
-    # Seed sample doctors if none
-    if await db.doctors.count_documents({}) == 0:
-        sample_doctors = [
-            {"name": "Dr. Rajesh Kumar", "specialty": "Cardiology", "city": "Mumbai", "clinic": "Heart Care Clinic", "fees": 800, "timings": "10:00 AM - 2:00 PM", "photo": "https://images.pexels.com/photos/5722160/pexels-photo-5722160.jpeg?auto=compress&cs=tinysrgb&w=400"},
-            {"name": "Dr. Priya Sharma", "specialty": "Dermatology", "city": "Delhi", "clinic": "SkinGlow Clinic", "fees": 600, "timings": "11:00 AM - 4:00 PM", "photo": "https://images.pexels.com/photos/5407206/pexels-photo-5407206.jpeg?auto=compress&cs=tinysrgb&w=400"},
-            {"name": "Dr. Amit Patel", "specialty": "Pediatrics", "city": "Ahmedabad", "clinic": "Little Angels Clinic", "fees": 500, "timings": "9:00 AM - 1:00 PM", "photo": "https://images.pexels.com/photos/6098051/pexels-photo-6098051.jpeg?auto=compress&cs=tinysrgb&w=400"},
-            {"name": "Dr. Neha Reddy", "specialty": "Dental", "city": "Bengaluru", "clinic": "Smile Dental Care", "fees": 700, "timings": "10:00 AM - 6:00 PM", "photo": "https://images.pexels.com/photos/6749772/pexels-photo-6749772.jpeg?auto=compress&cs=tinysrgb&w=400"},
-            {"name": "Dr. Suresh Iyer", "specialty": "General Physician", "city": "Chennai", "clinic": "Family Health Clinic", "fees": 400, "timings": "8:00 AM - 12:00 PM", "photo": "https://images.pexels.com/photos/5722164/pexels-photo-5722164.jpeg?auto=compress&cs=tinysrgb&w=400"},
-            {"name": "Dr. Kavita Joshi", "specialty": "Orthopedics", "city": "Pune", "clinic": "BoneCare Ortho", "fees": 900, "timings": "12:00 PM - 6:00 PM", "photo": "https://images.pexels.com/photos/5327585/pexels-photo-5327585.jpeg?auto=compress&cs=tinysrgb&w=400"},
-        ]
-        for sd in sample_doctors:
-            user_id = str(uuid.uuid4())
-            email = sd["name"].lower().replace(" ", "").replace(".", "") + "@clinic.com"
-            await db.users.insert_one({
-                "id": user_id,
-                "email": email,
-                "password_hash": hash_password("doctor123"),
-                "full_name": sd["name"],
-                "role": "doctor",
-                "phone": "+91-9999999999",
-                "created_at": now_iso(),
-            })
-            await db.doctors.insert_one({
-                "id": str(uuid.uuid4()),
-                "user_id": user_id,
-                "full_name": sd["name"],
-                "specialty": sd["specialty"],
-                "city": sd["city"],
-                "clinic_name": sd["clinic"],
-                "fees": sd["fees"],
-                "timings": sd["timings"],
-                "rating": 4.6,
-                "photo": sd["photo"],
-                "bio": f"Experienced {sd['specialty']} specialist with 10+ years of practice.",
+    # Seed Admin User (ranjeet7421@gmail.com, H00001)
+    admin_email = "ranjeet7421@gmail.com"
+    admin_user = await db.users.find_one({"email": admin_email})
+    if not admin_user:
+        await db.users.insert_one({
+            "id": str(uuid.uuid4()),
+            "email": admin_email,
+            "password_hash": hash_password("Ranjeet@74"),
+            "full_name": "Admin",
+            "role": "admin",
+            "hospital_id": "H00001",
+            "hospital_code": "H00001",
+            "status": "active",
+            "login_disabled": False,
+            "created_at": now_iso(),
+        })
+    else:
+        await db.users.update_one(
+            {"email": admin_email},
+            {"$set": {
+                "role": "admin",
+                "hospital_id": "H00001",
+                "hospital_code": "H00001",
+                "password_hash": hash_password("Ranjeet@74"),
                 "status": "active",
-                "avg_consult_minutes": 15,
-            })
+                "login_disabled": False,
+            }}
+        )
 
-    # Seed a demo receptionist
-    if not await db.users.find_one({"email": "reception@clinic.com"}):
-        await db.users.insert_one({
-            "id": str(uuid.uuid4()),
-            "email": "reception@clinic.com",
-            "password_hash": hash_password("reception123"),
-            "full_name": "Front Desk",
-            "role": "receptionist",
-            "phone": "+91-9000000000",
-            "created_at": now_iso(),
-        })
-
-    # Seed the app owner (admin)
-    if not await db.users.find_one({"email": "owner@meribaari.com"}):
-        await db.users.insert_one({
-            "id": str(uuid.uuid4()),
-            "email": "owner@meribaari.com",
-            "password_hash": hash_password("owner123"),
-            "full_name": "App Owner",
-            "role": "owner",
-            "phone": "+91-9000000001",
-            "created_at": now_iso(),
-        })
-    logger.info("Seed complete.")
+    logger.info("Admin user verified.")
 
 
 app.include_router(api_router)
@@ -1615,12 +2196,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
 
 
 @app.on_event("shutdown")

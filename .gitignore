@@ -81,12 +81,23 @@ memory/test_credentials.md
 # Mobile development
 android-sdk/
 
-# Environment files
+# Environment files — block all by default, then allow safe public ones
 .env
 backend/.env
 frontend/.env
-.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 *.env
 credentials.json
 *.key
 .credentials
+# Allow .env.example and .env.production (no secrets, only public API URL)
+!.env.example
+!backend/.env.example
+!frontend/.env.example
+!frontend/.env.production
+# Never commit EAS/Google Play credentials
+google-services-key.json
+GoogleService-Info.plist

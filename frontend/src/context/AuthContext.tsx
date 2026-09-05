@@ -32,6 +32,8 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 const TOKEN_KEY = "cq_token";
 const USER_KEY = "cq_user";
+// Key to cache the last registered push token so we skip re-registration when unchanged
+const PUSH_TOKEN_KEY = "cq_push_token";
 
 async function registerForPush(user_id: string) {
   if (Platform.OS === "web") return;
@@ -44,16 +46,26 @@ async function registerForPush(user_id: string) {
       finalStatus = req.status;
     }
     if (finalStatus !== "granted") return;
+
     const tokenResp = await Notifications.getDevicePushTokenAsync();
-    const base = getBackendBase();
     if (!tokenResp?.data) return;
+    const newToken = String(tokenResp.data);
+
+    // Only call backend if the push token changed — avoids network call on every launch
+    const cachedToken = await AsyncStorage.getItem(PUSH_TOKEN_KEY);
+    if (cachedToken === newToken) return;
+
+    const base = getBackendBase();
     await fetch(`${base}/api/register-push`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id, platform: Platform.OS, device_token: String(tokenResp.data) }),
+      body: JSON.stringify({ user_id, platform: Platform.OS, device_token: newToken }),
     });
-  } catch (e) {
-    // Non-fatal - push may not be available in Expo Go
+
+    // Cache the token after successful registration
+    await AsyncStorage.setItem(PUSH_TOKEN_KEY, newToken);
+  } catch {
+    // Non-fatal — push may not be available in Expo Go
   }
 }
 
@@ -63,12 +75,17 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   useEffect(() => {
     (async () => {
       try {
-        const t = await AsyncStorage.getItem(TOKEN_KEY);
-        const u = await AsyncStorage.getItem(USER_KEY);
+        // Read token and user in parallel — faster than sequential reads
+        const [t, u] = await Promise.all([
+          AsyncStorage.getItem(TOKEN_KEY),
+          AsyncStorage.getItem(USER_KEY),
+        ]);
         const parsedUser = u ? JSON.parse(u) : null;
         setState({ token: t, user: parsedUser, loading: false });
-        // Re-register push on app open
-        if (parsedUser?.id) registerForPush(parsedUser.id);
+        // Register push non-blockingly — does not delay auth resolution
+        if (parsedUser?.id) {
+          registerForPush(parsedUser.id).catch(() => {});
+        }
       } catch {
         setState({ token: null, user: null, loading: false });
       }
@@ -76,16 +93,23 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   const signIn = useCallback(async (token: string, user: AuthUser) => {
-    await AsyncStorage.setItem(TOKEN_KEY, token);
-    await AsyncStorage.setItem(USER_KEY, JSON.stringify(user));
+    // Persist token and user in parallel
+    await Promise.all([
+      AsyncStorage.setItem(TOKEN_KEY, token),
+      AsyncStorage.setItem(USER_KEY, JSON.stringify(user)),
+    ]);
     setState({ token, user, loading: false });
-    // Register for push (only meaningful for patients typically, but harmless for all)
-    if (user.id) registerForPush(user.id);
+    if (user.id) {
+      registerForPush(user.id).catch(() => {});
+    }
   }, []);
 
   const signOut = useCallback(async () => {
-    await AsyncStorage.removeItem(TOKEN_KEY);
-    await AsyncStorage.removeItem(USER_KEY);
+    await Promise.all([
+      AsyncStorage.removeItem(TOKEN_KEY),
+      AsyncStorage.removeItem(USER_KEY),
+      AsyncStorage.removeItem(PUSH_TOKEN_KEY),
+    ]);
     setState({ token: null, user: null, loading: false });
   }, []);
 

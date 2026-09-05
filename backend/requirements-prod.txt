@@ -1,0 +1,16 @@
+# Production-only dependencies for Render deployment.
+# Stripped from the full requirements.txt — only packages actually imported in server.py.
+fastapi==0.110.1
+motor==3.3.1
+pymongo==4.6.3
+uvicorn==0.25.0
+gunicorn==21.2.0
+python-dotenv==1.2.2
+bcrypt==4.1.3
+PyJWT==2.13.0
+pydantic==2.13.4
+pydantic[email]
+email-validator==2.3.0
+httpx==0.28.1
+starlette==0.37.2
+python-multipart==0.0.32

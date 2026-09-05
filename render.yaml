@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: meribaari-api
+    env: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements-prod.txt
+    startCommand: gunicorn server:app -w 2 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120
+    rootDir: backend
+    envVars:
+      - key: MONGO_URL
+        sync: false          # Set in Render dashboard — never commit credentials
+      - key: DB_NAME
+        value: clinicqueue
+      - key: JWT_SECRET
+        sync: false          # Set in Render dashboard
+      - key: DPDP_STRIP_DEV_OTP
+        value: "1"           # Hide dev OTP in production
+      - key: EMERGENT_PUSH_KEY
+        sync: false          # Set in Render dashboard if push is enabled
+    healthCheckPath: /health

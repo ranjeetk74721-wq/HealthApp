@@ -7,6 +7,13 @@ on:
       - "frontend/**"
       - ".github/workflows/eas-android.yml"
   workflow_dispatch:
+    inputs:
+      profile:
+        description: "EAS build profile"
+        required: false
+        default: "preview"
+        type: choice
+        options: [preview, production]
 
 jobs:
   build-android:
@@ -22,13 +29,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache: yarn
+          cache-dependency-path: frontend/yarn.lock
 
       - name: Install dependencies
-        run: npm ci
+        run: yarn install --frozen-lockfile
 
-      - name: Build Android APK with EAS
-        run: npx eas-cli build --platform android --profile preview --non-interactive
+      - name: Build Android with EAS
+        run: npx eas-cli build --platform android --profile ${{ github.event.inputs.profile || 'preview' }} --non-interactive
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}

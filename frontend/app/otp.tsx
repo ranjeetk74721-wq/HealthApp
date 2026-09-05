@@ -17,7 +17,7 @@ export default function OtpScreen() {
   const isRegistered = params.is_registered === "1";
 
   const [otp, setOtp] = useState<string[]>(["", "", "", "", "", ""]);
-  const inputs = useRef<Array<TextInput | null>>([]);
+  const inputs = useRef<(TextInput | null)[]>([]);
   const [step, setStep] = useState<"otp" | "profile">("otp");
   const [name, setName] = useState("");
   const [age, setAge] = useState("");
@@ -84,7 +84,7 @@ export default function OtpScreen() {
       const role = res.user.role;
       router.replace(
         role === "doctor" ? "/doctor/dashboard"
-        : role === "owner" ? "/owner/dashboard"
+        : (role === "owner" || role === "admin") ? "/owner/dashboard"
         : role === "receptionist" ? "/receptionist/dashboard"
         : "/patient/home"
       );

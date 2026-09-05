@@ -5,16 +5,16 @@ import { LogBox, Platform } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import * as Notifications from "expo-notifications";
 import * as Linking from "expo-linking";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { useIconFonts } from "@/src/hooks/use-icon-fonts";
 import { AuthProvider } from "@/src/context/AuthContext";
+import { startKeepAlive } from "@/src/api/client";
 
 LogBox.ignoreAllLogs(true);
 
 SplashScreen.preventAutoHideAsync();
 
-// ============ PUSH NOTIFICATIONS (module scope) ============
+// ── Push notification handler (module scope) ────────────────────────────────
 if (Platform.OS !== "web") {
   Notifications.setNotificationHandler({
     handleNotification: async () => ({
@@ -39,16 +39,22 @@ export default function RootLayout() {
   const [loaded, error] = useIconFonts();
   const router = useRouter();
 
+  // Hide splash screen as soon as fonts are ready (or errored)
   useEffect(() => {
     if (loaded || error) {
       SplashScreen.hideAsync();
     }
   }, [loaded, error]);
 
+  // Start Render keep-alive ping once on app open
+  useEffect(() => {
+    startKeepAlive();
+  }, []);
+
+  // Deep-link handler for notification taps
   useEffect(() => {
     if (Platform.OS === "web") return;
 
-    // Warm tap handler
     const tapSub = Notifications.addNotificationResponseReceivedListener((response) => {
       const data: any = response.notification.request.content.data || {};
       const url = data.deeplink || data.action_url;
@@ -60,7 +66,7 @@ export default function RootLayout() {
       }
     });
 
-    // Cold-start tap handler
+    // Handle cold-start notification tap
     Notifications.getLastNotificationResponseAsync().then((response) => {
       if (!response) return;
       const data: any = response.notification.request.content.data || {};
@@ -72,19 +78,6 @@ export default function RootLayout() {
         router.push(url as any);
       }
     });
-
-    // Weekly nudge for denied users
-    (async () => {
-      try {
-        const { status, canAskAgain } = await Notifications.getPermissionsAsync();
-        if (status !== "denied" || canAskAgain) return;
-        const lastNudge = await AsyncStorage.getItem("pushNudgeAt");
-        const oneWeek = 7 * 24 * 60 * 60 * 1000;
-        if (lastNudge && Date.now() - Number(lastNudge) <= oneWeek) return;
-        await AsyncStorage.setItem("pushNudgeAt", String(Date.now()));
-        // Silent stamp — no dialog in MVP; can add prompt later
-      } catch {}
-    })();
 
     return () => {
       tapSub.remove();

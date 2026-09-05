@@ -72,6 +72,13 @@ class TestAuth:
         r = s.post(f"{API}/auth/login", json={"email": RECEPTION_EMAIL, "password": "wrong"})
         assert r.status_code == 401
 
+    def test_hospital_id_login(self, s):
+        r = s.post(f"{API}/auth/hospital-login", json={"hospital_id": "HOSP-101"})
+        assert r.status_code == 200
+        data = r.json()
+        assert "access_token" in data
+        assert data["user"]["hospital_id"] == "HOSP-101"
+
 
 # ---------------- DOCTORS ----------------
 class TestDoctors:

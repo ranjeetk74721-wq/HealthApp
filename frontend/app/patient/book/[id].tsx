@@ -17,14 +17,11 @@ function getDates(count: number) {
   return arr;
 }
 
-const SLOTS = ["09:00 AM", "09:30 AM", "10:00 AM", "10:30 AM", "11:00 AM", "11:30 AM", "12:00 PM", "02:00 PM", "02:30 PM", "03:00 PM", "03:30 PM", "04:00 PM", "04:30 PM", "05:00 PM"];
-
 export default function BookAppointment() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
   const dates = useMemo(() => getDates(7), []);
   const [selectedDate, setSelectedDate] = useState<Date>(dates[0]);
-  const [selectedSlot, setSelectedSlot] = useState<string | null>(null);
   const [doctor, setDoctor] = useState<any>(null);
   const [showPay, setShowPay] = useState(false);
   const [booking, setBooking] = useState(false);
@@ -38,14 +35,13 @@ export default function BookAppointment() {
   const iso = (d: Date) => d.toISOString().split("T")[0];
 
   const book = async (method: "online" | "pay_at_clinic") => {
-    if (!selectedSlot) return;
     setBooking(true);
     setError(null);
     try {
       const res = await api.post("/appointments", {
         doctor_id: id,
         date: iso(selectedDate),
-        slot: selectedSlot,
+        slot: "Token Booking",
         payment_method: method,
       });
       setShowPay(false);
@@ -65,11 +61,11 @@ export default function BookAppointment() {
         <View style={styles.successWrap}>
           <View style={styles.successIcon}><Ionicons name="checkmark" size={44} color="#fff" /></View>
           <Text style={styles.successTitle} testID="booking-success">Appointment Booked!</Text>
-          <Text style={styles.successSub}>Your token number is</Text>
+          <Text style={styles.successSub}>Your sequential token number is</Text>
           <Text style={styles.tokenBig}>#{success.token_number}</Text>
           <View style={styles.successCard}>
             <Text style={styles.successRow}>{success.doctor_name}</Text>
-            <Text style={styles.successMeta}>{success.date} · {success.slot}</Text>
+            <Text style={styles.successMeta}>Date: {success.date} · Token #{success.token_number}</Text>
           </View>
           <Pressable testID="view-queue-btn" onPress={() => router.replace("/patient/queue")} style={styles.primaryBtn}>
             <Text style={styles.primaryBtnText}>View Live Queue</Text>
@@ -111,16 +107,11 @@ export default function BookAppointment() {
           })}
         </ScrollView>
 
-        <Text style={styles.sectionTitle}>Select Time Slot</Text>
-        <View style={styles.slotsGrid}>
-          {SLOTS.map((s) => {
-            const active = s === selectedSlot;
-            return (
-              <Pressable key={s} testID={`slot-${s}`} onPress={() => setSelectedSlot(s)} style={[styles.slotChip, active && styles.slotChipActive]}>
-                <Text style={[styles.slotText, active && { color: colors.onBrandPrimary }]}>{s}</Text>
-              </Pressable>
-            );
-          })}
+        <View style={styles.tokenInfoBox}>
+          <Ionicons name="ticket-outline" size={20} color={colors.brandPrimary} />
+          <Text style={styles.tokenInfoText}>
+            Tokens are assigned sequentially per date starting from #1. No fixed time slot required.
+          </Text>
         </View>
 
         {error ? <Text testID="book-error" style={{ color: colors.error, marginTop: spacing.md }}>{error}</Text> : null}
@@ -129,11 +120,10 @@ export default function BookAppointment() {
       <SafeAreaView edges={["bottom"]} style={styles.stickyCta}>
         <Pressable
           testID="proceed-payment-cta"
-          disabled={!selectedSlot}
           onPress={() => setShowPay(true)}
-          style={[styles.ctaBtn, !selectedSlot && { opacity: 0.4 }]}
+          style={styles.ctaBtn}
         >
-          <Text style={styles.ctaText}>{selectedSlot ? `Proceed · ${selectedSlot}` : "Select a time slot"}</Text>
+          <Text style={styles.ctaText}>Confirm Booking & Get Token</Text>
         </Pressable>
       </SafeAreaView>
 
@@ -211,4 +201,6 @@ const styles = StyleSheet.create({
   primaryBtn: { backgroundColor: colors.brandPrimary, borderRadius: radius.md, padding: spacing.lg, alignItems: "center", width: "100%", marginTop: spacing.md },
   primaryBtnText: { color: colors.onBrandPrimary, fontSize: font.lg, fontWeight: "700" },
   linkBtn: { padding: spacing.sm },
+  tokenInfoBox: { flexDirection: "row", alignItems: "center", gap: spacing.sm, padding: spacing.md, backgroundColor: colors.brandSecondary, borderRadius: radius.md, marginTop: spacing.md },
+  tokenInfoText: { flex: 1, fontSize: font.sm, color: colors.onBrandSecondary, lineHeight: 18 },
 });

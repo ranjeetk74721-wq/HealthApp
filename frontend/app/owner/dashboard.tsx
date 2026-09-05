@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, RefreshControl, Modal, TextInput, KeyboardAvoidingView, Platform, Image, Alert } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
@@ -8,9 +8,15 @@ import { api } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 
+const STALE_AFTER_MS = 30_000;
+
 const SPECIALTIES = [
-  "Cardiology", "Dermatology", "Pediatrics", "Dental",
-  "General Physician", "Orthopedics", "ENT", "Ophthalmology",
+  "Cardiology", "Dermatology", "Pediatrics", "Dental", "General Physician", "Orthopedics", "ENT", "Ophthalmology",
+  "Gynecology", "Neurology", "Gastroenterology", "Urology", "Psychiatry", "Pulmonology", "Oncology", "Endocrinology",
+  "Nephrology", "Rheumatology", "Radiology", "Pathology", "Anesthesiology", "Plastic Surgery", "Vascular Surgery",
+  "Neurosurgery", "General Surgery", "Pediatric Surgery", "Surgical Oncology", "Cardiothoracic Surgery", "Audiology",
+  "Physiotherapy", "Dietitian / Nutritionist", "Ayurveda", "Homeopathy", "Unani", "Emergency Medicine", "Nuclear Medicine",
+  "Geriatrics", "Hematology", "Immunology & Allergy", "Occupational Therapy", "Podiatry", "Speech Therapy"
 ];
 
 interface DocRow {
@@ -33,6 +39,29 @@ interface DocRow {
   avg_consult_minutes?: number | null;
   bio?: string | null;
   timings?: string;
+  hospital_id?: string;
+  gender?: string;
+}
+
+interface HospRow {
+  id?: string;
+  hospital_id: string;
+  name: string;
+  city?: string;
+  email?: string;
+  is_active?: boolean;
+  doctor_count?: number;
+  receptionist_count?: number;
+}
+
+interface RecRow {
+  id: string;
+  full_name: string;
+  email: string;
+  phone?: string;
+  hospital_id?: string;
+  doctor_id?: string;
+  doctor_name?: string;
 }
 
 export default function OwnerDashboard() {
@@ -40,6 +69,8 @@ export default function OwnerDashboard() {
   const { user, signOut } = useAuth();
   const [stats, setStats] = useState<any | null>(null);
   const [doctors, setDoctors] = useState<DocRow[]>([]);
+  const [hospitals, setHospitals] = useState<HospRow[]>([]);
+  const [receptionists, setReceptionists] = useState<RecRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
@@ -47,16 +78,44 @@ export default function OwnerDashboard() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const lastFetchedAt = useRef<number>(0);
 
-  // Form state
+  // Doctor Form state
   const [f, setF] = useState({
     full_name: "", email: "", password: "", phone: "", address: "",
     specialty: "", degree: "", experience_years: "", clinic_name: "",
     city: "", fees: "", timings: "", bio: "", avg_consult_minutes: "15",
+    hospital_id: "", gender: "Male",
   });
   const [photo, setPhoto] = useState<string | null>(null);
   const [idProof, setIdProof] = useState<string | null>(null);
   const [degreePhoto, setDegreePhoto] = useState<string | null>(null);
+
+  // Hospital Modal state
+  const [hospModalOpen, setHospModalOpen] = useState(false);
+  const [hospName, setHospName] = useState("");
+  const [hospCity, setHospCity] = useState("");
+  const [hospIdInput, setHospIdInput] = useState("");
+  const [hospEmail, setHospEmail] = useState("");
+  const [hospPassword, setHospPassword] = useState("");
+  const [hospSaving, setHospSaving] = useState(false);
+  
+  // Edit Hospital Modal state
+  const [editHospModalOpen, setEditHospModalOpen] = useState(false);
+  const [editingHosp, setEditingHosp] = useState<HospRow | null>(null);
+  const [editHospName, setEditHospName] = useState("");
+  const [editHospCity, setEditHospCity] = useState("");
+  const [editHospEmail, setEditHospEmail] = useState("");
+  const [editHospPassword, setEditHospPassword] = useState("");
+  const [editHospActive, setEditHospActive] = useState(true);
+
+  // Receptionist Modal state
+  const [addRecOpen, setAddRecOpen] = useState(false);
+  const [rf, setRf] = useState({
+    full_name: "", email: "", password: "", phone: "", hospital_id: "", doctor_id: "",
+  });
+  const [recSubmitting, setRecSubmitting] = useState(false);
+  const [recError, setRecError] = useState<string | null>(null);
 
   const setField = (k: string, v: string) => setF((prev) => ({ ...prev, [k]: v }));
   const resetForm = () => {
@@ -64,18 +123,113 @@ export default function OwnerDashboard() {
       full_name: "", email: "", password: "", phone: "", address: "",
       specialty: "", degree: "", experience_years: "", clinic_name: "",
       city: "", fees: "", timings: "", bio: "", avg_consult_minutes: "15",
+      hospital_id: hospitals[0]?.hospital_id || "H00001", gender: "Male",
     });
     setPhoto(null); setIdProof(null); setDegreePhoto(null); setError(null);
   };
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force = false) => {
+    if (!force && Date.now() - lastFetchedAt.current < STALE_AFTER_MS && stats !== null) {
+      return;
+    }
     try {
-      const [s, docs] = await Promise.all([api.get("/owner/stats"), api.get("/owner/doctors")]);
+      const [s, docs, hosps, recs] = await Promise.all([
+        api.get("/owner/stats", { bypassCache: force }),
+        api.get("/owner/doctors", { bypassCache: force }),
+        api.get("/owner/hospitals", { bypassCache: force }).catch(() => []),
+        api.get("/owner/receptionists", { bypassCache: force }).catch(() => []),
+      ]);
       setStats(s);
       setDoctors(docs);
-    } catch (e) { console.log(e); }
-    finally { setLoading(false); setRefreshing(false); }
-  }, []);
+      setHospitals(hosps || []);
+      setReceptionists(recs || []);
+      lastFetchedAt.current = Date.now();
+    } catch (e: any) {
+      if (e?.message && (e.message.includes("401") || e.message.includes("authenticated") || e.message.includes("expired"))) {
+        await signOut();
+        router.replace("/login");
+      }
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, [router, signOut, stats]);
+
+  const handleCreateHospital = async () => {
+    if (!hospName.trim()) return;
+    setHospSaving(true);
+    try {
+      const res = await api.post("/owner/hospitals", {
+        name: hospName.trim(),
+        city: hospCity.trim(),
+        hospital_id: hospIdInput.trim() || undefined,
+        email: hospEmail.trim() || undefined,
+        password: hospPassword.trim() || undefined,
+      });
+      setToast(`Generated Hospital ID: ${res.hospital_id}`);
+      setHospName(""); setHospCity(""); setHospIdInput(""); setHospEmail(""); setHospPassword(""); setHospModalOpen(false);
+      load(true);
+      setTimeout(() => setToast(null), 5000);
+    } catch (e: any) {
+      Alert.alert("Error", e.message || "Failed to create hospital");
+    } finally { setHospSaving(false); }
+  };
+
+  const openEditHospital = (h: HospRow) => {
+    setEditingHosp(h);
+    setEditHospName(h.name);
+    setEditHospCity(h.city || "");
+    setEditHospEmail(h.email || "");
+    setEditHospPassword("");
+    setEditHospActive(h.is_active ?? true);
+    setEditHospModalOpen(true);
+  };
+
+  const handleUpdateHospital = async () => {
+    if (!editingHosp) return;
+    setHospSaving(true);
+    try {
+      await api.put(`/owner/hospitals/${editingHosp.hospital_id}`, {
+        name: editHospName.trim(),
+        city: editHospCity.trim(),
+        email: editHospEmail.trim() || undefined,
+        password: editHospPassword.trim() || undefined,
+        is_active: editHospActive,
+      });
+      setToast(`Updated ${editingHosp.hospital_id}`);
+      setEditHospModalOpen(false);
+      setEditingHosp(null);
+      load(true);
+      setTimeout(() => setToast(null), 3000);
+    } catch (e: any) {
+      Alert.alert("Error", e.message || "Failed to update hospital");
+    } finally { setHospSaving(false); }
+  };
+
+  const handleDeleteHospital = (h: HospRow) => {
+    Alert.alert(
+      "Delete Hospital ID Permanently?",
+      `Are you sure you want to permanently delete ${h.hospital_id} (${h.name}) and its associated staff records from the database?`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete Permanently", style: "destructive",
+          onPress: async () => {
+            try {
+              setHospitals((prev) => prev.filter((item) => item.hospital_id !== h.hospital_id));
+              await api.del(`/owner/hospitals/${h.hospital_id}`);
+              setToast(`Hospital ID ${h.hospital_id} deleted permanently`);
+              load(true);
+              setTimeout(() => setToast(null), 3000);
+            } catch (e: any) {
+              Alert.alert("Error", e.message);
+              load(true);
+            }
+          }
+        }
+      ]
+    );
+  };
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
@@ -96,7 +250,7 @@ export default function OwnerDashboard() {
         const mime = res.assets[0].mimeType || "image/jpeg";
         setter(`data:${mime};base64,${res.assets[0].base64}`);
       }
-    } catch (e) {
+    } catch {
       Alert.alert("Error", "Could not pick image");
     }
   };
@@ -113,6 +267,7 @@ export default function OwnerDashboard() {
         email: f.email.trim().toLowerCase(),
         password: f.password,
         phone: f.phone || undefined,
+        mobile: f.phone || undefined,
         address: f.address || undefined,
         specialty: f.specialty,
         degree: f.degree || undefined,
@@ -123,18 +278,72 @@ export default function OwnerDashboard() {
         timings: f.timings,
         bio: f.bio || undefined,
         avg_consult_minutes: f.avg_consult_minutes ? parseInt(f.avg_consult_minutes, 10) : 15,
+        hospital_id: f.hospital_id || hospitals[0]?.hospital_id || "H00001",
+        gender: f.gender,
         photo, id_proof_photo: idProof, degree_photo: degreePhoto,
       });
       setToast(`Doctor added: ${f.full_name}`);
       resetForm();
       setAddOpen(false);
-      load();
+      load(true);
       setTimeout(() => setToast(null), 3000);
     } catch (e: any) {
       setError(e.message || "Failed to add doctor");
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const onSubmitReceptionist = async () => {
+    setRecError(null);
+    if (!rf.full_name.trim() || !rf.email.trim() || !rf.password.trim()) {
+      return setRecError("Full name, email & password required");
+    }
+    setRecSubmitting(true);
+    try {
+      await api.post("/owner/add-receptionist", {
+        full_name: rf.full_name.trim(),
+        email: rf.email.trim().toLowerCase(),
+        password: rf.password,
+        phone: rf.phone || undefined,
+        hospital_id: rf.hospital_id || hospitals[0]?.hospital_id || "H00001",
+        doctor_id: rf.doctor_id || undefined,
+      });
+      setToast(`Receptionist added: ${rf.full_name}`);
+      setRf({ full_name: "", email: "", password: "", phone: "", hospital_id: "", doctor_id: "" });
+      setAddRecOpen(false);
+      load(true);
+      setTimeout(() => setToast(null), 3000);
+    } catch (e: any) {
+      setRecError(e.message || "Failed to add receptionist");
+    } finally {
+      setRecSubmitting(false);
+    }
+  };
+
+  const onDeleteReceptionist = (r: RecRow) => {
+    Alert.alert(
+      "Remove Receptionist?",
+      `${r.full_name} will be removed. This cannot be undone.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Remove", style: "destructive",
+          onPress: async () => {
+            try {
+              setReceptionists((prev) => prev.filter((item) => item.id !== r.id));
+              await api.del(`/owner/receptionists/${r.id}`);
+              load(true);
+              setToast("Receptionist removed");
+              setTimeout(() => setToast(null), 2500);
+            } catch (e: any) {
+              Alert.alert("Error", e.message);
+              load(true);
+            }
+          },
+        },
+      ]
+    );
   };
 
   const onDelete = (d: DocRow) => {
@@ -146,8 +355,16 @@ export default function OwnerDashboard() {
         {
           text: "Remove", style: "destructive",
           onPress: async () => {
-            try { await api.del(`/owner/doctors/${d.id}`); load(); setToast("Doctor removed"); setTimeout(() => setToast(null), 2500); }
-            catch (e: any) { Alert.alert("Error", e.message); }
+            try {
+              setDoctors((prev) => prev.filter((item) => item.id !== d.id));
+              await api.del(`/owner/doctors/${d.id}`);
+              load(true);
+              setToast("Doctor removed");
+              setTimeout(() => setToast(null), 2500);
+            } catch (e: any) {
+              Alert.alert("Error", e.message);
+              load(true);
+            }
           },
         },
       ],
@@ -160,7 +377,7 @@ export default function OwnerDashboard() {
     <SafeAreaView style={styles.safe} edges={["top"]}>
       <View style={styles.header}>
         <View style={{ flex: 1 }}>
-          <Text style={styles.hello}>Owner Panel</Text>
+          <Text style={styles.hello}>Admin Panel</Text>
           <Text style={styles.name}>{user?.full_name}</Text>
         </View>
         <Pressable onPress={async () => { await signOut(); router.replace("/login"); }} testID="owner-logout" style={styles.iconBtn}>
@@ -168,37 +385,78 @@ export default function OwnerDashboard() {
         </Pressable>
       </View>
 
-      <ScrollView contentContainerStyle={styles.scroll} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} />}>
+      <ScrollView contentContainerStyle={styles.scroll} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true); }} />}>
         {stats && (
-          <>
-            <View style={styles.kpiRow}>
-              <View style={styles.kpiCard}>
-                <Ionicons name="medkit" size={20} color={colors.brandPrimary} />
-                <Text style={styles.kpiValue}>{stats.total_doctors}</Text>
-                <Text style={styles.kpiLabel}>Doctors</Text>
-              </View>
-              <View style={styles.kpiCard}>
-                <Ionicons name="people" size={20} color={colors.success} />
-                <Text style={styles.kpiValue}>{stats.total_patients}</Text>
-                <Text style={styles.kpiLabel}>Patients</Text>
-              </View>
-              <View style={styles.kpiCard}>
-                <Ionicons name="calendar" size={20} color={colors.warning} />
-                <Text style={styles.kpiValue}>{stats.todays_appointments}</Text>
-                <Text style={styles.kpiLabel}>Today&apos;s Appts</Text>
-              </View>
-              <View style={styles.kpiCard}>
-                <Ionicons name="cash" size={20} color={colors.info} />
-                <Text style={styles.kpiValue}>₹{stats.revenue_today}</Text>
-                <Text style={styles.kpiLabel}>Today&apos;s Revenue</Text>
-              </View>
+          <View style={styles.kpiRow}>
+            <View style={styles.kpiCard}>
+              <Ionicons name="business" size={20} color={colors.brandPrimary} />
+              <Text style={styles.kpiValue}>{hospitals.length}</Text>
+              <Text style={styles.kpiLabel}>Hospitals</Text>
             </View>
-          </>
+            <View style={styles.kpiCard}>
+              <Ionicons name="medkit" size={20} color={colors.info} />
+              <Text style={styles.kpiValue}>{stats.total_doctors}</Text>
+              <Text style={styles.kpiLabel}>Doctors</Text>
+            </View>
+            <View style={styles.kpiCard}>
+              <Ionicons name="people" size={20} color={colors.success} />
+              <Text style={styles.kpiValue}>{stats.total_patients}</Text>
+              <Text style={styles.kpiLabel}>Patients</Text>
+            </View>
+            <View style={styles.kpiCard}>
+              <Ionicons name="calendar" size={20} color={colors.warning} />
+              <Text style={styles.kpiValue}>{stats.todays_appointments}</Text>
+              <Text style={styles.kpiLabel}>Today&apos;s Appts</Text>
+            </View>
+          </View>
         )}
 
+        {/* ── Hospital ID Management Section ── */}
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: spacing.md, marginBottom: spacing.sm }}>
+          <Text style={styles.sectionTitle}>Hospitals ({hospitals.length})</Text>
+          <Pressable onPress={() => setHospModalOpen(true)} style={styles.addBtnSmall}>
+            <Ionicons name="add" size={16} color="#fff" />
+            <Text style={styles.addBtnSmallText}>Add Hospital</Text>
+          </Pressable>
+        </View>
+
+        {hospitals.length === 0 ? (
+          <Text style={{ color: colors.muted, fontSize: font.sm, marginBottom: spacing.md }}>No hospitals generated yet.</Text>
+        ) : (
+          hospitals.map((h) => (
+            <View key={h.id || h.hospital_id} style={styles.hospCard}>
+              <View style={{ flex: 1 }}>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                  <Text style={styles.hospBadge}>{h.hospital_id}</Text>
+                  <View style={[styles.statusTag, { backgroundColor: (h.is_active ?? true) ? colors.success + "20" : colors.muted + "20" }]}>
+                    <Text style={[styles.statusTagText, { color: (h.is_active ?? true) ? colors.success : colors.muted }]}>
+                      {(h.is_active ?? true) ? "Active" : "Inactive"}
+                    </Text>
+                  </View>
+                </View>
+                <Text style={styles.hospName}>{h.name}</Text>
+                {h.city ? <Text style={styles.hospCity}>📍 {h.city}</Text> : null}
+                {h.email ? <Text style={{ fontSize: font.xs, color: colors.muted, marginTop: 2 }}>✉️ {h.email}</Text> : null}
+                <Text style={styles.hospCounts}>
+                  👨‍⚕️ {h.doctor_count ?? 0} Doctors · 📋 {h.receptionist_count ?? 0} Receptionists
+                </Text>
+              </View>
+              <View style={{ flexDirection: "row", gap: 6 }}>
+                <Pressable onPress={() => openEditHospital(h)} style={styles.iconActionBtn}>
+                  <Ionicons name="create-outline" size={18} color={colors.brandPrimary} />
+                </Pressable>
+                <Pressable onPress={() => handleDeleteHospital(h)} style={styles.iconActionBtn}>
+                  <Ionicons name="trash-outline" size={18} color={colors.error} />
+                </Pressable>
+              </View>
+            </View>
+          ))
+        )}
+
+        {/* ── Doctors Management Section ── */}
         <View style={styles.sectionRow}>
           <Text style={styles.sectionTitle}>Doctors ({doctors.length})</Text>
-          <Pressable testID="add-doctor-btn" onPress={() => setAddOpen(true)} style={styles.addBtnSmall}>
+          <Pressable testID="add-doctor-btn" onPress={() => { resetForm(); setAddOpen(true); }} style={styles.addBtnSmall}>
             <Ionicons name="add" size={16} color="#fff" />
             <Text style={styles.addBtnSmallText}>Add Doctor</Text>
           </Pressable>
@@ -220,7 +478,10 @@ export default function OwnerDashboard() {
                 </View>
               )}
               <View style={{ flex: 1 }}>
-                <Text style={styles.docName}>{d.full_name}</Text>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                  <Text style={styles.docName}>{d.full_name}</Text>
+                  {d.hospital_id ? <Text style={styles.hospMiniBadge}>{d.hospital_id}</Text> : null}
+                </View>
                 <Text style={styles.docSpec}>{d.specialty} · {d.city}</Text>
                 <View style={styles.chipsRow}>
                   {d.degree ? <View style={styles.chip}><Text style={styles.chipText}>{d.degree}</Text></View> : null}
@@ -235,6 +496,38 @@ export default function OwnerDashboard() {
             </Pressable>
           ))
         )}
+
+        {/* ── Receptionist Management Section ── */}
+        <View style={styles.sectionRow}>
+          <Text style={styles.sectionTitle}>Receptionists ({receptionists.length})</Text>
+          <Pressable onPress={() => setAddRecOpen(true)} style={styles.addBtnSmall}>
+            <Ionicons name="person-add" size={16} color="#fff" />
+            <Text style={styles.addBtnSmallText}>Add Receptionist</Text>
+          </Pressable>
+        </View>
+
+        {receptionists.length === 0 ? (
+          <Text style={{ color: colors.muted, fontSize: font.sm, marginVertical: spacing.sm }}>No receptionists registered yet.</Text>
+        ) : (
+          receptionists.map((r) => (
+            <View key={r.id} style={styles.recCard}>
+              <View style={[styles.docPhoto, { width: 44, height: 44, backgroundColor: colors.info + "20", alignItems: "center", justifyContent: "center" }]}>
+                <Ionicons name="clipboard" size={20} color={colors.info} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                  <Text style={styles.docName}>{r.full_name}</Text>
+                  {r.hospital_id ? <Text style={styles.hospMiniBadge}>{r.hospital_id}</Text> : null}
+                </View>
+                <Text style={{ fontSize: font.sm, color: colors.muted }}>{r.email} {r.phone ? `· ${r.phone}` : ""}</Text>
+                {r.doctor_name ? <Text style={{ fontSize: 11, color: colors.brandPrimary, marginTop: 2 }}>Assigned Doctor: Dr. {r.doctor_name}</Text> : null}
+              </View>
+              <Pressable onPress={() => onDeleteReceptionist(r)} style={styles.delBtn} hitSlop={8}>
+                <Ionicons name="trash-outline" size={18} color={colors.error} />
+              </Pressable>
+            </View>
+          ))
+        )}
       </ScrollView>
 
       {toast ? (
@@ -244,7 +537,65 @@ export default function OwnerDashboard() {
         </View>
       ) : null}
 
-      {/* Add Doctor Modal */}
+      {/* ── Generate Hospital ID Modal ── */}
+      <Modal transparent visible={hospModalOpen} animationType="slide" onRequestClose={() => setHospModalOpen(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setHospModalOpen(false)}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+            <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <ScrollView keyboardShouldPersistTaps="handled">
+                <Text style={styles.sheetTitle}>Create Hospital / Branch</Text>
+                <Text style={styles.sheetSub}>Admin generates a unique Hospital ID & credentials for staff verification.</Text>
+                <TextInput placeholder="Hospital ID (e.g. H00002, auto-generated if blank)" placeholderTextColor={colors.muted} value={hospIdInput} onChangeText={setHospIdInput} autoCapitalize="characters" style={styles.input} />
+                <TextInput placeholder="Hospital Name*" placeholderTextColor={colors.muted} value={hospName} onChangeText={setHospName} style={styles.input} />
+                <TextInput placeholder="City (optional)" placeholderTextColor={colors.muted} value={hospCity} onChangeText={setHospCity} style={styles.input} />
+                <TextInput placeholder="Hospital Verification Email (optional, defaults to admin@ID.com)" placeholderTextColor={colors.muted} value={hospEmail} onChangeText={setHospEmail} keyboardType="email-address" autoCapitalize="none" style={styles.input} />
+                <TextInput placeholder="Hospital Verification Password (optional, defaults to Hospital@123)" placeholderTextColor={colors.muted} value={hospPassword} onChangeText={setHospPassword} secureTextEntry style={styles.input} />
+                <Pressable onPress={handleCreateHospital} disabled={hospSaving} style={styles.submitBtn}>
+                  {hospSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitBtnText}>Create Hospital ID</Text>}
+                </Pressable>
+                <View style={{ height: spacing.lg }} />
+              </ScrollView>
+            </Pressable>
+          </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
+
+      {/* ── Edit Hospital Modal ── */}
+      <Modal transparent visible={editHospModalOpen} animationType="slide" onRequestClose={() => setEditHospModalOpen(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setEditHospModalOpen(false)}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+            <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <ScrollView keyboardShouldPersistTaps="handled">
+                <Text style={styles.sheetTitle}>Edit Hospital {editingHosp?.hospital_id}</Text>
+                <Text style={styles.sheetSub}>Update hospital details, credentials, or toggle active status.</Text>
+                <TextInput placeholder="Hospital Name*" placeholderTextColor={colors.muted} value={editHospName} onChangeText={setEditHospName} style={styles.input} />
+                <TextInput placeholder="City" placeholderTextColor={colors.muted} value={editHospCity} onChangeText={setEditHospCity} style={styles.input} />
+                <TextInput placeholder="Hospital Verification Email" placeholderTextColor={colors.muted} value={editHospEmail} onChangeText={setEditHospEmail} keyboardType="email-address" autoCapitalize="none" style={styles.input} />
+                <TextInput placeholder="New Password (leave blank to keep existing)" placeholderTextColor={colors.muted} value={editHospPassword} onChangeText={setEditHospPassword} secureTextEntry style={styles.input} />
+                
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: spacing.md }}>
+                  <Text style={{ fontSize: font.base, color: colors.onSurface, fontWeight: "600" }}>Hospital Active Status</Text>
+                  <Pressable 
+                    onPress={() => setEditHospActive(!editHospActive)} 
+                    style={[styles.toggleBtn, editHospActive ? { backgroundColor: colors.success } : { backgroundColor: colors.muted }]}
+                  >
+                    <Text style={{ color: "#fff", fontWeight: "700", fontSize: font.xs }}>{editHospActive ? "ACTIVE" : "INACTIVE"}</Text>
+                  </Pressable>
+                </View>
+
+                <Pressable onPress={handleUpdateHospital} disabled={hospSaving} style={styles.submitBtn}>
+                  {hospSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitBtnText}>Save Changes</Text>}
+                </Pressable>
+                <View style={{ height: spacing.lg }} />
+              </ScrollView>
+            </Pressable>
+          </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
+
+      {/* ── Add Doctor Modal ── */}
       <Modal transparent visible={addOpen} animationType="slide" onRequestClose={() => setAddOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setAddOpen(false)}>
           <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
@@ -252,17 +603,45 @@ export default function OwnerDashboard() {
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
                 <Text style={styles.sheetTitle}>Add New Doctor</Text>
-                <Text style={styles.sheetSub}>Fill all details. Doctor will login with the credentials you set.</Text>
+                <Text style={styles.sheetSub}>Fill all details. Doctor will login with Hospital ID + Credentials.</Text>
+
+                <Text style={styles.groupLabel}>Hospital & Identification</Text>
+                <Text style={styles.subLabel}>Assigned Hospital ID*</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 6 }}>
+                  {hospitals.length === 0 ? (
+                    <Pressable style={[styles.specChip, styles.specChipActive]}>
+                      <Text style={{ color: "#fff" }}>H00001 (Default)</Text>
+                    </Pressable>
+                  ) : (
+                    hospitals.map((h) => {
+                      const active = (f.hospital_id || hospitals[0]?.hospital_id) === h.hospital_id;
+                      return (
+                        <Pressable key={h.hospital_id} onPress={() => setField("hospital_id", h.hospital_id)} style={[styles.specChip, active && styles.specChipActive]}>
+                          <Text style={[styles.specChipText, active && { color: "#fff" }]}>{h.hospital_id} - {h.name}</Text>
+                        </Pressable>
+                      );
+                    })
+                  )}
+                </ScrollView>
+
+                <Text style={styles.subLabel}>Gender</Text>
+                <View style={{ flexDirection: "row", gap: 10, marginVertical: 4 }}>
+                  {["Male", "Female", "Other"].map((g) => (
+                    <Pressable key={g} onPress={() => setField("gender", g)} style={[styles.specChip, f.gender === g && styles.specChipActive]}>
+                      <Text style={[styles.specChipText, f.gender === g && { color: "#fff" }]}>{g}</Text>
+                    </Pressable>
+                  ))}
+                </View>
 
                 <Text style={styles.groupLabel}>Basic Info</Text>
                 <TextInput testID="ad-name" placeholder="Full Name*" placeholderTextColor={colors.muted} value={f.full_name} onChangeText={(v) => setField("full_name", v)} style={styles.input} />
                 <TextInput testID="ad-email" placeholder="Login Email*" placeholderTextColor={colors.muted} value={f.email} onChangeText={(v) => setField("email", v)} keyboardType="email-address" autoCapitalize="none" style={styles.input} />
                 <TextInput testID="ad-password" placeholder="Temp Password*" placeholderTextColor={colors.muted} value={f.password} onChangeText={(v) => setField("password", v)} secureTextEntry style={styles.input} />
-                <TextInput testID="ad-phone" placeholder="Phone" placeholderTextColor={colors.muted} value={f.phone} onChangeText={(v) => setField("phone", v.replace(/[^0-9+]/g, ""))} keyboardType="phone-pad" style={styles.input} />
+                <TextInput testID="ad-phone" placeholder="Phone / Mobile Number" placeholderTextColor={colors.muted} value={f.phone} onChangeText={(v) => setField("phone", v.replace(/[^0-9+]/g, ""))} keyboardType="phone-pad" style={styles.input} />
                 <TextInput testID="ad-address" placeholder="Home / Personal Address" placeholderTextColor={colors.muted} value={f.address} onChangeText={(v) => setField("address", v)} style={styles.input} />
 
-                <Text style={styles.groupLabel}>Professional</Text>
-                <Text style={styles.subLabel}>Specialty*</Text>
+                <Text style={styles.groupLabel}>Professional Details</Text>
+                <Text style={styles.subLabel}>Specialty* (40+ Available)</Text>
                 <View style={styles.specWrap}>
                   {SPECIALTIES.map((s) => {
                     const active = f.specialty === s;
@@ -282,7 +661,7 @@ export default function OwnerDashboard() {
                     <TextInput testID="ad-fees" placeholder="Fees ₹*" placeholderTextColor={colors.muted} value={f.fees} onChangeText={(v) => setField("fees", v.replace(/[^0-9]/g, ""))} keyboardType="number-pad" style={styles.input} />
                   </View>
                 </View>
-                <TextInput testID="ad-clinic" placeholder="Clinic Name*" placeholderTextColor={colors.muted} value={f.clinic_name} onChangeText={(v) => setField("clinic_name", v)} style={styles.input} />
+                <TextInput testID="ad-clinic" placeholder="Clinic / Hospital Name*" placeholderTextColor={colors.muted} value={f.clinic_name} onChangeText={(v) => setField("clinic_name", v)} style={styles.input} />
                 <TextInput testID="ad-city" placeholder="City*" placeholderTextColor={colors.muted} value={f.city} onChangeText={(v) => setField("city", v)} style={styles.input} />
                 <TextInput testID="ad-timings" placeholder='Timings* (e.g. "10 AM - 4 PM")' placeholderTextColor={colors.muted} value={f.timings} onChangeText={(v) => setField("timings", v)} style={styles.input} />
                 <TextInput testID="ad-avgmin" placeholder="Avg. time per patient (min, default 15)" placeholderTextColor={colors.muted} value={f.avg_consult_minutes} onChangeText={(v) => setField("avg_consult_minutes", v.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" style={styles.input} />
@@ -313,7 +692,69 @@ export default function OwnerDashboard() {
         </Pressable>
       </Modal>
 
-      {/* View Doctor Modal */}
+      {/* ── Add Receptionist Modal ── */}
+      <Modal transparent visible={addRecOpen} animationType="slide" onRequestClose={() => setAddRecOpen(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setAddRecOpen(false)}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+            <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <ScrollView keyboardShouldPersistTaps="handled">
+                <Text style={styles.sheetTitle}>Add Receptionist</Text>
+                <Text style={styles.sheetSub}>Receptionist can login using Hospital Code + Email + Password.</Text>
+
+                <Text style={styles.groupLabel}>Hospital Assignment</Text>
+                <Text style={styles.subLabel}>Hospital ID*</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 6 }}>
+                  {hospitals.length === 0 ? (
+                    <Pressable style={[styles.specChip, styles.specChipActive]}>
+                      <Text style={{ color: "#fff" }}>H00001 (Default)</Text>
+                    </Pressable>
+                  ) : (
+                    hospitals.map((h) => {
+                      const active = (rf.hospital_id || hospitals[0]?.hospital_id) === h.hospital_id;
+                      return (
+                        <Pressable key={h.hospital_id} onPress={() => setRf((prev) => ({ ...prev, hospital_id: h.hospital_id }))} style={[styles.specChip, active && styles.specChipActive]}>
+                          <Text style={[styles.specChipText, active && { color: "#fff" }]}>{h.hospital_id} - {h.name}</Text>
+                        </Pressable>
+                      );
+                    })
+                  )}
+                </ScrollView>
+
+                <Text style={styles.groupLabel}>Account Credentials</Text>
+                <TextInput placeholder="Full Name*" placeholderTextColor={colors.muted} value={rf.full_name} onChangeText={(v) => setRf((prev) => ({ ...prev, full_name: v }))} style={styles.input} />
+                <TextInput placeholder="Login Email*" placeholderTextColor={colors.muted} value={rf.email} onChangeText={(v) => setRf((prev) => ({ ...prev, email: v }))} keyboardType="email-address" autoCapitalize="none" style={styles.input} />
+                <TextInput placeholder="Password*" placeholderTextColor={colors.muted} value={rf.password} onChangeText={(v) => setRf((prev) => ({ ...prev, password: v }))} secureTextEntry style={styles.input} />
+                <TextInput placeholder="Phone / Mobile (optional)" placeholderTextColor={colors.muted} value={rf.phone} onChangeText={(v) => setRf((prev) => ({ ...prev, phone: v.replace(/[^0-9+]/g, "") }))} keyboardType="phone-pad" style={styles.input} />
+
+                <Text style={styles.groupLabel}>Assign to Doctor (Optional)</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 6 }}>
+                  <Pressable onPress={() => setRf((prev) => ({ ...prev, doctor_id: "" }))} style={[styles.specChip, !rf.doctor_id && styles.specChipActive]}>
+                    <Text style={[styles.specChipText, !rf.doctor_id && { color: "#fff" }]}>All Doctors / General</Text>
+                  </Pressable>
+                  {doctors.map((d) => {
+                    const active = rf.doctor_id === d.id;
+                    return (
+                      <Pressable key={d.id} onPress={() => setRf((prev) => ({ ...prev, doctor_id: d.id }))} style={[styles.specChip, active && styles.specChipActive]}>
+                        <Text style={[styles.specChipText, active && { color: "#fff" }]}>Dr. {d.full_name}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
+
+                {recError ? <Text style={styles.error}>{recError}</Text> : null}
+
+                <Pressable onPress={onSubmitReceptionist} disabled={recSubmitting} style={styles.submitBtn}>
+                  {recSubmitting ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitBtnText}>Save Receptionist</Text>}
+                </Pressable>
+                <View style={{ height: spacing.xxl }} />
+              </ScrollView>
+            </Pressable>
+          </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
+
+      {/* ── View Doctor Modal ── */}
       <Modal transparent visible={!!viewDoc} animationType="slide" onRequestClose={() => setViewDoc(null)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setViewDoc(null)}>
           <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
@@ -330,7 +771,10 @@ export default function OwnerDashboard() {
                   )}
                   <Text style={styles.viewName}>{viewDoc.full_name}</Text>
                   <Text style={styles.viewSpec}>{viewDoc.specialty} · {viewDoc.city}</Text>
+                  {viewDoc.hospital_id ? <Text style={[styles.hospBadge, { marginTop: 4 }]}>Hospital ID: {viewDoc.hospital_id}</Text> : null}
                 </View>
+                <DetailRow icon="business" label="Hospital ID" value={viewDoc.hospital_id || "H00001"} />
+                <DetailRow icon="person" label="Gender" value={viewDoc.gender || "Not specified"} />
                 <DetailRow icon="school" label="Degree" value={viewDoc.degree || "—"} />
                 <DetailRow icon="briefcase" label="Experience" value={viewDoc.experience_years ? `${viewDoc.experience_years} years` : "—"} />
                 <DetailRow icon="business" label="Clinic" value={viewDoc.clinic_name} />
@@ -353,6 +797,19 @@ export default function OwnerDashboard() {
                     <Image source={{ uri: viewDoc.degree_photo }} style={styles.docImg} resizeMode="contain" />
                   </>
                 ) : null}
+
+                <Pressable 
+                  onPress={() => {
+                    const docToDelete = viewDoc;
+                    setViewDoc(null);
+                    if (docToDelete) onDelete(docToDelete);
+                  }} 
+                  style={[styles.submitBtn, { backgroundColor: colors.error, marginTop: spacing.lg, flexDirection: "row", justifyContent: "center", gap: 6 }]}
+                >
+                  <Ionicons name="trash-outline" size={18} color="#fff" />
+                  <Text style={styles.submitBtnText}>Delete Doctor from Database</Text>
+                </Pressable>
+
                 <View style={{ height: spacing.xxl }} />
               </ScrollView>
             )}
@@ -381,14 +838,25 @@ const styles = StyleSheet.create({
   iconBtn: { width: 40, height: 40, borderRadius: radius.pill, backgroundColor: colors.surface, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.border },
   scroll: { padding: spacing.lg, paddingTop: 0, gap: spacing.md, paddingBottom: spacing.xxxl },
   kpiRow: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm },
-  kpiCard: { flex: 1, minWidth: "47%", backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, gap: 4 },
+  kpiCard: { flex: 1, minWidth: "45%", backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, gap: 4 },
   kpiValue: { fontSize: font.xxl, fontWeight: "800", color: colors.onSurface, marginTop: 4 },
   kpiLabel: { fontSize: font.sm, color: colors.muted },
   sectionRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: spacing.md },
   sectionTitle: { fontSize: font.lg, fontWeight: "700", color: colors.onSurface },
   addBtnSmall: { flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: colors.brandPrimary, paddingHorizontal: spacing.md, paddingVertical: 8, borderRadius: radius.pill },
   addBtnSmallText: { color: "#fff", fontWeight: "700", fontSize: font.sm },
+  hospCard: { flexDirection: "row", alignItems: "center", backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, marginBottom: spacing.xs },
+  hospBadge: { fontSize: font.sm, fontWeight: "800", color: colors.brandPrimary, backgroundColor: colors.brandSecondary + "30", paddingHorizontal: 8, paddingVertical: 2, borderRadius: radius.sm },
+  hospMiniBadge: { fontSize: 10, fontWeight: "700", color: colors.brandPrimary, backgroundColor: colors.brandSecondary + "30", paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
+  statusTag: { paddingHorizontal: 8, paddingVertical: 2, borderRadius: radius.pill },
+  statusTagText: { fontSize: 10, fontWeight: "700" },
+  hospName: { fontSize: font.base, fontWeight: "700", color: colors.onSurface, marginTop: 4 },
+  hospCity: { fontSize: font.sm, color: colors.muted, marginTop: 2 },
+  hospCounts: { fontSize: font.xs, color: colors.onSurfaceSecondary, marginTop: 4, fontWeight: "500" },
+  iconActionBtn: { width: 34, height: 34, borderRadius: radius.md, backgroundColor: colors.surfaceSecondary, alignItems: "center", justifyContent: "center" },
+  toggleBtn: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: radius.pill },
   docCard: { flexDirection: "row", alignItems: "center", gap: spacing.md, backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border },
+  recCard: { flexDirection: "row", alignItems: "center", gap: spacing.md, backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, marginBottom: spacing.xs },
   docPhoto: { width: 56, height: 56, borderRadius: radius.md },
   docName: { fontSize: font.base, fontWeight: "700", color: colors.onSurface },
   docSpec: { fontSize: font.sm, color: colors.brandPrimary, marginTop: 2 },
@@ -421,10 +889,13 @@ const styles = StyleSheet.create({
   viewName: { fontSize: font.xl, fontWeight: "700", color: colors.onSurface, marginTop: spacing.md },
   viewSpec: { fontSize: font.base, color: colors.brandPrimary, marginTop: 2 },
   detailRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: colors.divider },
-  detailLabel: { fontSize: font.sm, color: colors.muted, width: 90 },
+  detailLabel: { fontSize: font.sm, color: colors.muted, width: 100 },
   detailValue: { flex: 1, fontSize: font.base, color: colors.onSurface, fontWeight: "500" },
   docSubHeader: { fontSize: font.sm, fontWeight: "700", color: colors.brandPrimary, marginTop: spacing.md, marginBottom: 6 },
   docImg: { width: "100%", height: 200, borderRadius: radius.md, backgroundColor: colors.surfaceSecondary },
   toast: { position: "absolute", bottom: 24, left: 20, right: 20, backgroundColor: colors.success, padding: spacing.md, borderRadius: radius.md, flexDirection: "row", alignItems: "center", gap: spacing.sm, elevation: 5 },
   toastText: { color: "#fff", fontWeight: "600", flex: 1 },
+  submitBtn: { backgroundColor: colors.brandPrimary, borderRadius: radius.md, padding: spacing.lg, alignItems: "center", marginTop: spacing.md },
+  submitBtnText: { color: colors.onBrandPrimary, fontSize: font.lg, fontWeight: "700" },
 });
+

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { View, Text, StyleSheet, ScrollView, Pressable, TextInput, ActivityIndicator, RefreshControl, Image } from "react-native";
 import { useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
@@ -32,36 +32,80 @@ const specialtyIcons: Record<string, any> = {
   Ophthalmology: "eye",
 };
 
+// How long (ms) before data is considered stale and needs a re-fetch on focus
+const STALE_AFTER_MS = 30_000;
+
 export default function PatientHome() {
   const router = useRouter();
   const { user, signOut } = useAuth();
   const [doctors, setDoctors] = useState<Doctor[]>([]);
   const [specialties, setSpecialties] = useState<any[]>([]);
+  const [hospitals, setHospitals] = useState<any[]>([]);
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [selectedSpecialty, setSelectedSpecialty] = useState<string | null>(null);
+  const [selectedHospital, setSelectedHospital] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [upcoming, setUpcoming] = useState<any | null>(null);
+  const lastFetchedAt = useRef<number>(0);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const load = useCallback(async () => {
+  // Debounce search input — only triggers API call 400ms after user stops typing
+  useEffect(() => {
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    searchTimerRef.current = setTimeout(() => {
+      setDebouncedSearch(search);
+    }, 400);
+    return () => {
+      if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    };
+  }, [search]);
+
+  const load = useCallback(async (force = false) => {
+    // Skip re-fetch if data is still fresh (within 30s) and no filter change
+    if (!force && Date.now() - lastFetchedAt.current < STALE_AFTER_MS && doctors.length > 0) {
+      return;
+    }
     try {
-      const [docs, specs, appts] = await Promise.all([
-        api.get(`/doctors${search ? `?search=${encodeURIComponent(search)}` : ""}${selectedSpecialty ? `${search ? "&" : "?"}specialty=${encodeURIComponent(selectedSpecialty)}` : ""}`),
-        api.get("/specialties"),
-        api.get("/appointments/me"),
+      let doctorUrl = "/doctors";
+      const params: string[] = [];
+      if (debouncedSearch) params.push(`search=${encodeURIComponent(debouncedSearch)}`);
+      if (selectedSpecialty) params.push(`specialty=${encodeURIComponent(selectedSpecialty)}`);
+      if (selectedHospital) params.push(`hospital_id=${encodeURIComponent(selectedHospital)}`);
+      if (params.length) doctorUrl += `?${params.join("&")}`;
+
+      // Parallel data fetching
+      const [docs, specs, appts, hosps] = await Promise.all([
+        api.get(doctorUrl, { bypassCache: force }),
+        api.get("/specialties", { bypassCache: force }).catch(() => []),
+        api.get("/appointments/me", { bypassCache: force }),
+        api.get("/hospitals", { bypassCache: force }).catch(() => []),
       ]);
       setDoctors(docs);
-      setSpecialties(specs);
+      const mappedSpecs = Array.isArray(specs) ? specs.map((s: any) => typeof s === "string" ? { name: s } : s) : [];
+      setSpecialties(mappedSpecs);
+      setHospitals(Array.isArray(hosps) ? hosps : []);
       const upcomingAppt = appts.find((a: any) => ["booked", "arrived", "in_consultation"].includes(a.status));
       setUpcoming(upcomingAppt || null);
-    } catch (e) {
-      console.log("Load error:", e);
+      lastFetchedAt.current = Date.now();
+    } catch (e: any) {
+      if (e?.message && (e.message.includes("401") || e.message.includes("authenticated") || e.message.includes("expired"))) {
+        await signOut();
+        router.replace("/login");
+      }
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [search, selectedSpecialty]);
+  }, [debouncedSearch, doctors.length, router, selectedSpecialty, selectedHospital, signOut]);
 
+  // Reload when search/specialty/hospital filter changes
+  useEffect(() => {
+    load(true);
+  }, [debouncedSearch, selectedSpecialty, selectedHospital, load]);
+
+  // On screen focus: only reload if data is stale (not on every tab switch)
   useFocusEffect(
     useCallback(() => {
       load();
@@ -72,7 +116,7 @@ export default function PatientHome() {
     <SafeAreaView style={styles.safe} edges={["top"]}>
       <ScrollView
         contentContainerStyle={styles.scroll}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} />}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true); }} />}
       >
         <View style={styles.header}>
           <View style={{ flex: 1 }}>
@@ -88,13 +132,18 @@ export default function PatientHome() {
           <Ionicons name="search" size={18} color={colors.muted} />
           <TextInput
             testID="doctor-search-input"
-            placeholder="Search doctors, specialties, city..."
+            placeholder="Search doctors, specialties, city, hospital..."
             placeholderTextColor={colors.muted}
             value={search}
             onChangeText={setSearch}
             style={styles.searchInput}
             returnKeyType="search"
           />
+          {search.length > 0 && (
+            <Pressable onPress={() => setSearch("")} hitSlop={8}>
+              <Ionicons name="close-circle" size={18} color={colors.muted} />
+            </Pressable>
+          )}
         </View>
 
         {upcoming && (
@@ -110,6 +159,23 @@ export default function PatientHome() {
               </View>
             </LinearGradient>
           </Pressable>
+        )}
+
+        {hospitals.length > 0 && (
+          <>
+            <Text style={styles.sectionTitle}>Select Hospital</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.specsRow}>
+              <Pressable onPress={() => setSelectedHospital(null)} style={[styles.specChip, !selectedHospital && styles.specChipActive]}>
+                <Text style={[styles.specChipText, !selectedHospital && styles.specChipTextActive]}>All Hospitals</Text>
+              </Pressable>
+              {hospitals.map((h: any) => (
+                <Pressable key={h.hospital_id} onPress={() => setSelectedHospital(selectedHospital === h.hospital_id ? null : h.hospital_id)} style={[styles.specChip, selectedHospital === h.hospital_id && styles.specChipActive]}>
+                  <Ionicons name="business" size={14} color={selectedHospital === h.hospital_id ? colors.onBrandPrimary : colors.brand} />
+                  <Text style={[styles.specChipText, selectedHospital === h.hospital_id && styles.specChipTextActive]}>{h.name}</Text>
+                </Pressable>
+              ))}
+            </ScrollView>
+          </>
         )}
 
         <Text style={styles.sectionTitle}>Specialties</Text>
