@@ -4,8 +4,8 @@
   "outputDirectory": "frontend/dist",
   "rewrites": [
     {
-      "source": "/api/(.*)",
-      "destination": "https://healthapp-b4mo.onrender.com/api/$1"
+      "source": "/api/:path*",
+      "destination": "https://healthapp-b4mo.onrender.com/api/:path*"
     },
     {
       "source": "/(.*)",
