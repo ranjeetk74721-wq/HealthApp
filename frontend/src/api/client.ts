@@ -20,8 +20,8 @@ export function getBackendBase() {
     if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0") {
       return "http://localhost:8000";
     }
-    // Deployed web (e.g. Vercel, Custom Domains) -> always connect to Render production backend!
-    return PRODUCTION_BACKEND_URL;
+    // Deployed web (e.g. Vercel) -> use relative path because vercel.json proxies /api to Render
+    return "";
   }
 
   const isLocalhost = !configuredBase || /localhost|127\.0\.0\.1/.test(configuredBase);
