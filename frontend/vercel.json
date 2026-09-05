@@ -4,6 +4,7 @@
   "installCommand": "yarn install --frozen-lockfile",
   "framework": null,
   "rewrites": [
+    { "source": "/api/(.*)", "destination": "https://healthapp-b4mo.onrender.com/api/$1" },
     { "source": "/(.*)", "destination": "/index.html" }
   ],
   "headers": [
