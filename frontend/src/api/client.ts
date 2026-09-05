@@ -2,28 +2,37 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants from "expo-constants";
 import { Platform } from "react-native";
 
-const configuredBase = process.env.EXPO_PUBLIC_BACKEND_URL || "http://localhost:8000";
+export const PRODUCTION_BACKEND_URL = "https://healthapp-b4mo.onrender.com";
+const configuredBase = process.env.EXPO_PUBLIC_BACKEND_URL;
 const expoHost = Constants.expoConfig?.hostUri?.split(":")[0];
 
 export function getBackendBase() {
   if (process.env.EXPO_PUBLIC_BACKEND_URL) {
-    return process.env.EXPO_PUBLIC_BACKEND_URL;
+    const envUrl = process.env.EXPO_PUBLIC_BACKEND_URL.trim();
+    if (envUrl && !envUrl.includes("localhost") && !envUrl.includes("127.0.0.1")) {
+      return envUrl;
+    }
   }
+
   if (Platform.OS === "web" && typeof window !== "undefined") {
     const hostname = window.location.hostname;
-    if (hostname && hostname !== "localhost" && hostname !== "127.0.0.1") {
-      return `http://${hostname}:8000`;
+    // Local development web
+    if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0") {
+      return "http://localhost:8000";
     }
-    return "http://localhost:8000";
+    // Deployed web (e.g. Vercel, Custom Domains) -> always connect to Render production backend!
+    return PRODUCTION_BACKEND_URL;
   }
-  const isLocalhost = /localhost|127\.0\.0\.1/.test(configuredBase);
+
+  const isLocalhost = !configuredBase || /localhost|127\.0\.0\.1/.test(configuredBase);
   return Platform.OS !== "web" && isLocalhost && expoHost
     ? `http://${expoHost}:8000`
-    : configuredBase;
+    : (configuredBase || PRODUCTION_BACKEND_URL);
 }
 
 export function getBackendWebSocketBase() {
-  return getBackendBase().replace(/^http/, "ws");
+  const base = getBackendBase();
+  return base.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://");
 }
 
 export function getApiBase() {
