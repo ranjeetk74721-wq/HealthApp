@@ -44,7 +44,7 @@ export default function Login() {
 
           <View style={styles.card}>
             <Text style={styles.title}>Login with Mobile</Text>
-            <Text style={styles.subtitle}>We'll send an OTP to verify your number</Text>
+            <Text style={styles.subtitle}>We&apos;ll send an OTP to verify your number</Text>
 
             <Text style={styles.label}>Mobile Number</Text>
             <View style={styles.mobileWrap}>
@@ -69,7 +69,7 @@ export default function Login() {
 
             <View style={styles.hintBox}>
               <Ionicons name="information-circle" size={16} color={colors.brandPrimary} />
-              <Text style={styles.hintText}>New here? Just enter your mobile — we'll set up your profile after OTP.</Text>
+              <Text style={styles.hintText}>New here? Just enter your mobile — we&apos;ll set up your profile after OTP.</Text>
             </View>
           </View>
 

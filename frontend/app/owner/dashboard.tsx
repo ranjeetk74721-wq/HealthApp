@@ -1,5 +1,9 @@
 import { useCallback, useRef, useState } from "react";
-import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, RefreshControl, Modal, TextInput, KeyboardAvoidingView, Platform, Image, Alert } from "react-native";
+import {
+  View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator,
+  RefreshControl, Modal, TextInput, KeyboardAvoidingView, Platform,
+  Image, Alert
+} from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
@@ -9,14 +13,56 @@ import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 
 const STALE_AFTER_MS = 30_000;
+const MAX_PHOTO_BYTES = 5 * 1024 * 1024; // 5 MB limit
 
-const SPECIALTIES = [
-  "Cardiology", "Dermatology", "Pediatrics", "Dental", "General Physician", "Orthopedics", "ENT", "Ophthalmology",
-  "Gynecology", "Neurology", "Gastroenterology", "Urology", "Psychiatry", "Pulmonology", "Oncology", "Endocrinology",
-  "Nephrology", "Rheumatology", "Radiology", "Pathology", "Anesthesiology", "Plastic Surgery", "Vascular Surgery",
-  "Neurosurgery", "General Surgery", "Pediatric Surgery", "Surgical Oncology", "Cardiothoracic Surgery", "Audiology",
-  "Physiotherapy", "Dietitian / Nutritionist", "Ayurveda", "Homeopathy", "Unani", "Emergency Medicine", "Nuclear Medicine",
-  "Geriatrics", "Hematology", "Immunology & Allergy", "Occupational Therapy", "Podiatry", "Speech Therapy"
+const DEFAULT_SPECIALTIES = [
+  "Cardiologist",
+  "Dermatologist",
+  "Endocrinologist",
+  "Gastroenterologist",
+  "General Physician",
+  "General Surgeon",
+  "Gynecologist",
+  "Obstetrician",
+  "Neurologist",
+  "Neurosurgeon",
+  "Nephrologist",
+  "Oncologist",
+  "Ophthalmologist",
+  "Orthopedic Surgeon / Orthopedist",
+  "Otolaryngologist (ENT Specialist)",
+  "Pediatrician",
+  "Psychiatrist",
+  "Pulmonologist",
+  "Radiologist",
+  "Urologist",
+  "Rheumatologist",
+  "Anesthesiologist",
+  "Pathologist",
+  "Dentist",
+  "Diabetologist",
+  "Cardiothoracic Surgeon",
+  "Plastic Surgeon",
+  "Vascular Surgeon",
+  "Pediatric Surgeon",
+  "Surgical Oncologist",
+  "Medical Oncologist",
+  "Interventional Cardiologist",
+  "Interventional Radiologist",
+  "Critical Care Specialist",
+  "Emergency Medicine Specialist",
+  "Family Medicine Specialist",
+  "Infectious Disease Specialist",
+  "Pain Medicine Specialist",
+  "Physical Medicine & Rehabilitation Specialist",
+  "Allergy & Immunology Specialist",
+  "Geriatrician",
+  "Neonatologist",
+  "Maternal-Fetal Medicine Specialist",
+  "Reproductive Medicine Specialist",
+  "Fertility Specialist",
+  "Sports Medicine Specialist",
+  "Other"
 ];
 
 interface DocRow {
@@ -31,6 +77,7 @@ interface DocRow {
   experience_years?: number | null;
   email?: string | null;
   phone?: string | null;
+  mobile?: string | null;
   address?: string | null;
   status?: string;
   todays_appts?: number;
@@ -59,6 +106,7 @@ interface RecRow {
   full_name: string;
   email: string;
   phone?: string;
+  mobile?: string;
   hospital_id?: string;
   doctor_id?: string;
   doctor_name?: string;
@@ -71,6 +119,7 @@ export default function OwnerDashboard() {
   const [doctors, setDoctors] = useState<DocRow[]>([]);
   const [hospitals, setHospitals] = useState<HospRow[]>([]);
   const [receptionists, setReceptionists] = useState<RecRow[]>([]);
+  const [specialties, setSpecialties] = useState<string[]>(DEFAULT_SPECIALTIES);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
@@ -80,7 +129,10 @@ export default function OwnerDashboard() {
   const [toast, setToast] = useState<string | null>(null);
   const lastFetchedAt = useRef<number>(0);
 
-  // Doctor Form state
+  // Search filter for specialist in Add Doctor
+  const [specSearch, setSpecSearch] = useState("");
+
+  // Doctor Form state (Add Doctor)
   const [f, setF] = useState({
     full_name: "", email: "", password: "", phone: "", address: "",
     specialty: "", degree: "", experience_years: "", clinic_name: "",
@@ -91,6 +143,28 @@ export default function OwnerDashboard() {
   const [idProof, setIdProof] = useState<string | null>(null);
   const [degreePhoto, setDegreePhoto] = useState<string | null>(null);
 
+  // Edit Doctor Modal state
+  const [editDocOpen, setEditDocOpen] = useState(false);
+  const [editingDocId, setEditingDocId] = useState<string | null>(null);
+  const [ef, setEf] = useState({
+    full_name: "", email: "", password: "", phone: "", address: "",
+    specialty: "", degree: "", experience_years: "", clinic_name: "",
+    city: "", fees: "", timings: "", bio: "", avg_consult_minutes: "15",
+    hospital_id: "", gender: "Male",
+  });
+  const [editPhoto, setEditPhoto] = useState<string | null>(null);
+  const [editIdProof, setEditIdProof] = useState<string | null>(null);
+  const [editDegreePhoto, setEditDegreePhoto] = useState<string | null>(null);
+  const [editDocSpecSearch, setEditDocSpecSearch] = useState("");
+  const [editDocSaving, setEditDocSaving] = useState(false);
+  const [editDocError, setEditDocError] = useState<string | null>(null);
+
+  // Add Specialist Category Modal state
+  const [addSpecModalOpen, setAddSpecModalOpen] = useState(false);
+  const [newSpecName, setNewSpecName] = useState("");
+  const [specSaving, setSpecSaving] = useState(false);
+  const [specError, setSpecError] = useState<string | null>(null);
+
   // Hospital Modal state
   const [hospModalOpen, setHospModalOpen] = useState(false);
   const [hospName, setHospName] = useState("");
@@ -99,7 +173,7 @@ export default function OwnerDashboard() {
   const [hospEmail, setHospEmail] = useState("");
   const [hospPassword, setHospPassword] = useState("");
   const [hospSaving, setHospSaving] = useState(false);
-  
+
   // Edit Hospital Modal state
   const [editHospModalOpen, setEditHospModalOpen] = useState(false);
   const [editingHosp, setEditingHosp] = useState<HospRow | null>(null);
@@ -109,7 +183,7 @@ export default function OwnerDashboard() {
   const [editHospPassword, setEditHospPassword] = useState("");
   const [editHospActive, setEditHospActive] = useState(true);
 
-  // Receptionist Modal state
+  // Add Receptionist Modal state
   const [addRecOpen, setAddRecOpen] = useState(false);
   const [rf, setRf] = useState({
     full_name: "", email: "", password: "", phone: "", hospital_id: "", doctor_id: "",
@@ -117,7 +191,18 @@ export default function OwnerDashboard() {
   const [recSubmitting, setRecSubmitting] = useState(false);
   const [recError, setRecError] = useState<string | null>(null);
 
+  // Edit Receptionist Modal state
+  const [editRecOpen, setEditRecOpen] = useState(false);
+  const [editingRecId, setEditingRecId] = useState<string | null>(null);
+  const [erf, setErf] = useState({
+    full_name: "", email: "", password: "", phone: "", hospital_id: "", doctor_id: "",
+  });
+  const [editRecSaving, setEditRecSaving] = useState(false);
+  const [editRecError, setEditRecError] = useState<string | null>(null);
+
   const setField = (k: string, v: string) => setF((prev) => ({ ...prev, [k]: v }));
+  const setEditField = (k: string, v: string) => setEf((prev) => ({ ...prev, [k]: v }));
+
   const resetForm = () => {
     setF({
       full_name: "", email: "", password: "", phone: "", address: "",
@@ -125,7 +210,19 @@ export default function OwnerDashboard() {
       city: "", fees: "", timings: "", bio: "", avg_consult_minutes: "15",
       hospital_id: hospitals[0]?.hospital_id || "H00001", gender: "Male",
     });
+    setSpecSearch("");
     setPhoto(null); setIdProof(null); setDegreePhoto(null); setError(null);
+  };
+
+  const loadSpecialties = async () => {
+    try {
+      const res = await api.get("/specialties");
+      if (Array.isArray(res) && res.length > 0) {
+        setSpecialties(res);
+      }
+    } catch {
+      // Use defaults if failed
+    }
   };
 
   const load = useCallback(async (force = false) => {
@@ -133,16 +230,20 @@ export default function OwnerDashboard() {
       return;
     }
     try {
-      const [s, docs, hosps, recs] = await Promise.all([
+      const [s, docs, hosps, recs, specs] = await Promise.all([
         api.get("/owner/stats", { bypassCache: force }),
         api.get("/owner/doctors", { bypassCache: force }),
         api.get("/owner/hospitals", { bypassCache: force }).catch(() => []),
         api.get("/owner/receptionists", { bypassCache: force }).catch(() => []),
+        api.get("/specialties", { bypassCache: force }).catch(() => DEFAULT_SPECIALTIES),
       ]);
       setStats(s);
       setDoctors(docs);
       setHospitals(hosps || []);
       setReceptionists(recs || []);
+      if (Array.isArray(specs) && specs.length > 0) {
+        setSpecialties(specs);
+      }
       lastFetchedAt.current = Date.now();
     } catch (e: any) {
       if (e?.message && (e.message.includes("401") || e.message.includes("authenticated") || e.message.includes("expired"))) {
@@ -155,6 +256,239 @@ export default function OwnerDashboard() {
     }
   }, [router, signOut, stats]);
 
+  useFocusEffect(useCallback(() => { load(); }, [load]));
+
+  const pickImage = async (setter: (v: string) => void) => {
+    try {
+      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (perm.status !== "granted") {
+        Alert.alert("Permission needed", "Please allow photo library access to upload images.");
+        return;
+      }
+      const res = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["images"],
+        base64: true,
+        quality: 0.7,
+        allowsEditing: false,
+      });
+      if (!res.canceled && res.assets[0]?.base64) {
+        const b64 = res.assets[0].base64;
+        const approxBytes = (b64.length * 3) / 4;
+        if (approxBytes > MAX_PHOTO_BYTES) {
+          Alert.alert("File Too Large", "Photo exceeds the maximum 5 MB limit. Please select a smaller photo.");
+          return;
+        }
+        const mime = res.assets[0].mimeType || "image/jpeg";
+        setter(`data:${mime};base64,${b64}`);
+      }
+    } catch {
+      Alert.alert("Error", "Could not pick image");
+    }
+  };
+
+  // ── Add Specialist Category ──
+  const handleAddSpecialistCategory = async () => {
+    setSpecError(null);
+    const catName = newSpecName.trim();
+    if (!catName) {
+      setSpecError("Specialist category name is required");
+      return;
+    }
+    setSpecSaving(true);
+    try {
+      const res = await api.post("/specialties", { name: catName });
+      const added = res.specialty || catName;
+      await loadSpecialties();
+      // Auto select in currently open form
+      if (addOpen) {
+        setField("specialty", added);
+      } else if (editDocOpen) {
+        setEditField("specialty", added);
+      }
+      setToast(`Specialist category added: ${added}`);
+      setNewSpecName("");
+      setAddSpecModalOpen(false);
+      setTimeout(() => setToast(null), 3000);
+    } catch (e: any) {
+      setSpecError(e.message || "Failed to add specialist category");
+    } finally {
+      setSpecSaving(false);
+    }
+  };
+
+  // ── Add Doctor ──
+  const onSubmit = async () => {
+    setError(null);
+    if (!f.full_name.trim() || !f.email.trim() || !f.password.trim()) return setError("Name, email & password required");
+    if (!f.specialty) return setError("Select a specialist category");
+    if (!f.clinic_name || !f.city || !f.fees || !f.timings) return setError("Clinic, city, fees, timings required");
+    setSubmitting(true);
+    try {
+      await api.post("/owner/add-doctor", {
+        full_name: f.full_name.trim(),
+        email: f.email.trim().toLowerCase(),
+        password: f.password,
+        phone: f.phone || undefined,
+        mobile: f.phone || undefined,
+        address: f.address || undefined,
+        specialty: f.specialty,
+        degree: f.degree || undefined,
+        experience_years: f.experience_years ? parseInt(f.experience_years, 10) : undefined,
+        clinic_name: f.clinic_name,
+        city: f.city,
+        fees: parseInt(f.fees, 10),
+        timings: f.timings,
+        bio: f.bio || undefined,
+        avg_consult_minutes: f.avg_consult_minutes ? parseInt(f.avg_consult_minutes, 10) : 15,
+        hospital_id: f.hospital_id || hospitals[0]?.hospital_id || "H00001",
+        gender: f.gender,
+        photo, id_proof_photo: idProof, degree_photo: degreePhoto,
+      });
+      setToast(`Doctor added: ${f.full_name}`);
+      resetForm();
+      setAddOpen(false);
+      load(true);
+      setTimeout(() => setToast(null), 3000);
+    } catch (e: any) {
+      setError(e.message || "Failed to add doctor");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // ── Open Edit Doctor ──
+  const openEditDoctor = (d: DocRow) => {
+    setEditingDocId(d.id);
+    setEf({
+      full_name: d.full_name,
+      email: d.email || "",
+      password: "",
+      phone: d.phone || d.mobile || "",
+      address: d.address || "",
+      specialty: d.specialty || "",
+      degree: d.degree || "",
+      experience_years: d.experience_years ? String(d.experience_years) : "",
+      clinic_name: d.clinic_name || "",
+      city: d.city || "",
+      fees: d.fees ? String(d.fees) : "",
+      timings: d.timings || "",
+      bio: d.bio || "",
+      avg_consult_minutes: d.avg_consult_minutes ? String(d.avg_consult_minutes) : "15",
+      hospital_id: d.hospital_id || "H00001",
+      gender: d.gender || "Male",
+    });
+    setEditPhoto(d.photo || null);
+    setEditIdProof(d.id_proof_photo || null);
+    setEditDegreePhoto(d.degree_photo || null);
+    setEditDocSpecSearch("");
+    setEditDocError(null);
+    setEditDocOpen(true);
+  };
+
+  // ── Save Edit Doctor ──
+  const handleUpdateDoctor = async () => {
+    if (!editingDocId) return;
+    setEditDocError(null);
+    if (!ef.full_name.trim()) {
+      setEditDocError("Doctor full name is required");
+      return;
+    }
+    setEditDocSaving(true);
+    try {
+      const payload: any = {
+        full_name: ef.full_name.trim(),
+        specialty: ef.specialty,
+        clinic_name: ef.clinic_name,
+        city: ef.city,
+        fees: ef.fees ? parseInt(ef.fees, 10) : undefined,
+        timings: ef.timings,
+        bio: ef.bio || undefined,
+        avg_consult_minutes: ef.avg_consult_minutes ? parseInt(ef.avg_consult_minutes, 10) : 15,
+        degree: ef.degree || undefined,
+        experience_years: ef.experience_years ? parseInt(ef.experience_years, 10) : undefined,
+        phone: ef.phone || undefined,
+        mobile: ef.phone || undefined,
+        address: ef.address || undefined,
+        hospital_id: ef.hospital_id || undefined,
+        gender: ef.gender || undefined,
+        photo: editPhoto,
+        id_proof_photo: editIdProof,
+        degree_photo: editDegreePhoto,
+      };
+      if (ef.email && ef.email.trim()) {
+        payload.email = ef.email.trim().toLowerCase();
+      }
+      if (ef.password && ef.password.trim()) {
+        payload.password = ef.password.trim();
+      }
+      await api.put(`/owner/doctors/${editingDocId}`, payload);
+      setToast(`Updated Dr. ${ef.full_name}`);
+      setEditDocOpen(false);
+      setEditingDocId(null);
+      if (viewDoc && viewDoc.id === editingDocId) {
+        setViewDoc({ ...viewDoc, ...payload });
+      }
+      load(true);
+      setTimeout(() => setToast(null), 3000);
+    } catch (e: any) {
+      setEditDocError(e.message || "Failed to update doctor");
+    } finally {
+      setEditDocSaving(false);
+    }
+  };
+
+  // ── Open Edit Receptionist ──
+  const openEditReceptionist = (r: RecRow) => {
+    setEditingRecId(r.id);
+    setErf({
+      full_name: r.full_name,
+      email: r.email,
+      password: "",
+      phone: r.phone || r.mobile || "",
+      hospital_id: r.hospital_id || "H00001",
+      doctor_id: r.doctor_id || "",
+    });
+    setEditRecError(null);
+    setEditRecOpen(true);
+  };
+
+  // ── Save Edit Receptionist ──
+  const handleUpdateReceptionist = async () => {
+    if (!editingRecId) return;
+    setEditRecError(null);
+    if (!erf.full_name.trim()) {
+      setEditRecError("Full name is required");
+      return;
+    }
+    setEditRecSaving(true);
+    try {
+      const payload: any = {
+        full_name: erf.full_name.trim(),
+        hospital_id: erf.hospital_id || undefined,
+        phone: erf.phone || undefined,
+        mobile: erf.phone || undefined,
+        doctor_id: erf.doctor_id || undefined,
+      };
+      if (erf.email && erf.email.trim()) {
+        payload.email = erf.email.trim().toLowerCase();
+      }
+      if (erf.password && erf.password.trim()) {
+        payload.password = erf.password.trim();
+      }
+      await api.put(`/owner/receptionists/${editingRecId}`, payload);
+      setToast(`Updated Receptionist: ${erf.full_name}`);
+      setEditRecOpen(false);
+      setEditingRecId(null);
+      load(true);
+      setTimeout(() => setToast(null), 3000);
+    } catch (e: any) {
+      setEditRecError(e.message || "Failed to update receptionist");
+    } finally {
+      setEditRecSaving(false);
+    }
+  };
+
+  // ── Hospital Actions ──
   const handleCreateHospital = async () => {
     if (!hospName.trim()) return;
     setHospSaving(true);
@@ -229,69 +563,6 @@ export default function OwnerDashboard() {
         }
       ]
     );
-  };
-
-  useFocusEffect(useCallback(() => { load(); }, [load]));
-
-  const pickImage = async (setter: (v: string) => void) => {
-    try {
-      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (perm.status !== "granted") {
-        Alert.alert("Permission needed", "Please allow photo library access to upload images.");
-        return;
-      }
-      const res = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ["images"],
-        base64: true,
-        quality: 0.6,
-        allowsEditing: false,
-      });
-      if (!res.canceled && res.assets[0]?.base64) {
-        const mime = res.assets[0].mimeType || "image/jpeg";
-        setter(`data:${mime};base64,${res.assets[0].base64}`);
-      }
-    } catch {
-      Alert.alert("Error", "Could not pick image");
-    }
-  };
-
-  const onSubmit = async () => {
-    setError(null);
-    if (!f.full_name.trim() || !f.email.trim() || !f.password.trim()) return setError("Name, email & password required");
-    if (!f.specialty) return setError("Select a specialty");
-    if (!f.clinic_name || !f.city || !f.fees || !f.timings) return setError("Clinic, city, fees, timings required");
-    setSubmitting(true);
-    try {
-      await api.post("/owner/add-doctor", {
-        full_name: f.full_name.trim(),
-        email: f.email.trim().toLowerCase(),
-        password: f.password,
-        phone: f.phone || undefined,
-        mobile: f.phone || undefined,
-        address: f.address || undefined,
-        specialty: f.specialty,
-        degree: f.degree || undefined,
-        experience_years: f.experience_years ? parseInt(f.experience_years, 10) : undefined,
-        clinic_name: f.clinic_name,
-        city: f.city,
-        fees: parseInt(f.fees, 10),
-        timings: f.timings,
-        bio: f.bio || undefined,
-        avg_consult_minutes: f.avg_consult_minutes ? parseInt(f.avg_consult_minutes, 10) : 15,
-        hospital_id: f.hospital_id || hospitals[0]?.hospital_id || "H00001",
-        gender: f.gender,
-        photo, id_proof_photo: idProof, degree_photo: degreePhoto,
-      });
-      setToast(`Doctor added: ${f.full_name}`);
-      resetForm();
-      setAddOpen(false);
-      load(true);
-      setTimeout(() => setToast(null), 3000);
-    } catch (e: any) {
-      setError(e.message || "Failed to add doctor");
-    } finally {
-      setSubmitting(false);
-    }
   };
 
   const onSubmitReceptionist = async () => {
@@ -370,6 +641,14 @@ export default function OwnerDashboard() {
       ],
     );
   };
+
+  const filteredSpecialties = specialties.filter((s) =>
+    s.toLowerCase().includes(specSearch.toLowerCase().trim())
+  );
+
+  const editFilteredSpecialties = specialties.filter((s) =>
+    s.toLowerCase().includes(editDocSpecSearch.toLowerCase().trim())
+  );
 
   if (loading) return <SafeAreaView style={styles.safe}><ActivityIndicator style={{ marginTop: 60 }} color={colors.brand} /></SafeAreaView>;
 
@@ -456,10 +735,16 @@ export default function OwnerDashboard() {
         {/* ── Doctors Management Section ── */}
         <View style={styles.sectionRow}>
           <Text style={styles.sectionTitle}>Doctors ({doctors.length})</Text>
-          <Pressable testID="add-doctor-btn" onPress={() => { resetForm(); setAddOpen(true); }} style={styles.addBtnSmall}>
-            <Ionicons name="add" size={16} color="#fff" />
-            <Text style={styles.addBtnSmallText}>Add Doctor</Text>
-          </Pressable>
+          <View style={{ flexDirection: "row", gap: 8 }}>
+            <Pressable onPress={() => { setNewSpecName(""); setSpecError(null); setAddSpecModalOpen(true); }} style={[styles.addBtnSmall, { backgroundColor: colors.surfaceSecondary, borderWidth: 1, borderColor: colors.border }]}>
+              <Ionicons name="pricetag-outline" size={15} color={colors.brandPrimary} />
+              <Text style={[styles.addBtnSmallText, { color: colors.brandPrimary }]}>+ Specialist</Text>
+            </Pressable>
+            <Pressable testID="add-doctor-btn" onPress={() => { resetForm(); setAddOpen(true); }} style={styles.addBtnSmall}>
+              <Ionicons name="add" size={16} color="#fff" />
+              <Text style={styles.addBtnSmallText}>Add Doctor</Text>
+            </Pressable>
+          </View>
         </View>
 
         {doctors.length === 0 ? (
@@ -490,9 +775,14 @@ export default function OwnerDashboard() {
                   {typeof d.todays_appts === "number" ? <View style={[styles.chip, { backgroundColor: colors.warning + "22" }]}><Text style={[styles.chipText, { color: colors.warning }]}>{d.todays_appts} today</Text></View> : null}
                 </View>
               </View>
-              <Pressable testID={`del-doc-${d.id}`} onPress={() => onDelete(d)} style={styles.delBtn} hitSlop={8}>
-                <Ionicons name="trash-outline" size={18} color={colors.error} />
-              </Pressable>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+                <Pressable testID={`edit-doc-${d.id}`} onPress={() => openEditDoctor(d)} style={[styles.iconActionBtn, { backgroundColor: colors.brandSecondary + "30" }]} hitSlop={8}>
+                  <Ionicons name="create-outline" size={18} color={colors.brandPrimary} />
+                </Pressable>
+                <Pressable testID={`del-doc-${d.id}`} onPress={() => onDelete(d)} style={styles.delBtn} hitSlop={8}>
+                  <Ionicons name="trash-outline" size={18} color={colors.error} />
+                </Pressable>
+              </View>
             </Pressable>
           ))
         )}
@@ -519,12 +809,17 @@ export default function OwnerDashboard() {
                   <Text style={styles.docName}>{r.full_name}</Text>
                   {r.hospital_id ? <Text style={styles.hospMiniBadge}>{r.hospital_id}</Text> : null}
                 </View>
-                <Text style={{ fontSize: font.sm, color: colors.muted }}>{r.email} {r.phone ? `· ${r.phone}` : ""}</Text>
+                <Text style={{ fontSize: font.sm, color: colors.muted }}>{r.email} {r.phone || r.mobile ? `· ${r.phone || r.mobile}` : ""}</Text>
                 {r.doctor_name ? <Text style={{ fontSize: 11, color: colors.brandPrimary, marginTop: 2 }}>Assigned Doctor: Dr. {r.doctor_name}</Text> : null}
               </View>
-              <Pressable onPress={() => onDeleteReceptionist(r)} style={styles.delBtn} hitSlop={8}>
-                <Ionicons name="trash-outline" size={18} color={colors.error} />
-              </Pressable>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+                <Pressable onPress={() => openEditReceptionist(r)} style={[styles.iconActionBtn, { backgroundColor: colors.brandSecondary + "30" }]} hitSlop={8}>
+                  <Ionicons name="create-outline" size={18} color={colors.brandPrimary} />
+                </Pressable>
+                <Pressable onPress={() => onDeleteReceptionist(r)} style={styles.delBtn} hitSlop={8}>
+                  <Ionicons name="trash-outline" size={18} color={colors.error} />
+                </Pressable>
+              </View>
             </View>
           ))
         )}
@@ -536,6 +831,34 @@ export default function OwnerDashboard() {
           <Text style={styles.toastText}>{toast}</Text>
         </View>
       ) : null}
+
+      {/* ── Add Specialist Category Modal ── */}
+      <Modal transparent visible={addSpecModalOpen} animationType="slide" onRequestClose={() => setAddSpecModalOpen(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setAddSpecModalOpen(false)}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+            <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <Text style={styles.sheetTitle}>Add Specialist Category</Text>
+              <Text style={styles.sheetSub}>Add a new medical specialist category (e.g. Diabetologist, Bariatric Surgeon, etc.)</Text>
+              
+              <Text style={styles.subLabel}>Specialist Category Name*</Text>
+              <TextInput
+                placeholder="e.g. Diabetologist, Hepatologist..."
+                placeholderTextColor={colors.muted}
+                value={newSpecName}
+                onChangeText={setNewSpecName}
+                style={styles.input}
+              />
+              {specError ? <Text style={styles.error}>{specError}</Text> : null}
+
+              <Pressable onPress={handleAddSpecialistCategory} disabled={specSaving} style={styles.submitBtn}>
+                {specSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitBtnText}>Add Specialist Category</Text>}
+              </Pressable>
+              <View style={{ height: spacing.lg }} />
+            </Pressable>
+          </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
 
       {/* ── Generate Hospital ID Modal ── */}
       <Modal transparent visible={hospModalOpen} animationType="slide" onRequestClose={() => setHospModalOpen(false)}>
@@ -641,17 +964,56 @@ export default function OwnerDashboard() {
                 <TextInput testID="ad-address" placeholder="Home / Personal Address" placeholderTextColor={colors.muted} value={f.address} onChangeText={(v) => setField("address", v)} style={styles.input} />
 
                 <Text style={styles.groupLabel}>Professional Details</Text>
-                <Text style={styles.subLabel}>Specialty* (40+ Available)</Text>
-                <View style={styles.specWrap}>
-                  {SPECIALTIES.map((s) => {
+                
+                {/* Searchable Specialist Selection */}
+                <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 4 }}>
+                  <Text style={styles.subLabel}>Specialist Category* ({f.specialty ? `Selected: ${f.specialty}` : "Please select"})</Text>
+                  <Pressable onPress={() => { setNewSpecName(""); setSpecError(null); setAddSpecModalOpen(true); }}>
+                    <Text style={{ color: colors.brandPrimary, fontWeight: "600", fontSize: font.xs }}>+ Add New</Text>
+                  </Pressable>
+                </View>
+
+                <View style={styles.searchBar}>
+                  <Ionicons name="search" size={16} color={colors.muted} />
+                  <TextInput
+                    placeholder="Search specialist category (e.g. Cardiologist, Dermatologist)..."
+                    placeholderTextColor={colors.muted}
+                    value={specSearch}
+                    onChangeText={setSpecSearch}
+                    style={styles.searchInput}
+                  />
+                  {specSearch ? (
+                    <Pressable onPress={() => setSpecSearch("")}>
+                      <Ionicons name="close-circle" size={16} color={colors.muted} />
+                    </Pressable>
+                  ) : null}
+                </View>
+
+                <ScrollView style={styles.specDropdownList} nestedScrollEnabled showsVerticalScrollIndicator>
+                  {filteredSpecialties.map((s) => {
                     const active = f.specialty === s;
                     return (
-                      <Pressable key={s} testID={`ad-spec-${s}`} onPress={() => setField("specialty", s)} style={[styles.specChip, active && styles.specChipActive]}>
-                        <Text style={[styles.specChipText, active && { color: "#fff" }]}>{s}</Text>
+                      <Pressable
+                        key={s}
+                        testID={`ad-spec-${s}`}
+                        onPress={() => setField("specialty", s)}
+                        style={[styles.specListItem, active && styles.specListItemActive]}
+                      >
+                        <Ionicons name={active ? "checkmark-circle" : "ellipse-outline"} size={16} color={active ? colors.brandPrimary : colors.muted} />
+                        <Text style={[styles.specListText, active && styles.specListTextActive]}>{s}</Text>
                       </Pressable>
                     );
                   })}
-                </View>
+                  {filteredSpecialties.length === 0 && (
+                    <View style={{ padding: spacing.md, alignItems: "center" }}>
+                      <Text style={{ color: colors.muted, fontSize: font.sm }}>No matching specialist found.</Text>
+                      <Pressable onPress={() => { setNewSpecName(specSearch); setSpecError(null); setAddSpecModalOpen(true); }} style={{ marginTop: 6 }}>
+                        <Text style={{ color: colors.brandPrimary, fontWeight: "700", fontSize: font.sm }}>+ Add &quot;{specSearch}&quot; as new category</Text>
+                      </Pressable>
+                    </View>
+                  )}
+                </ScrollView>
+
                 <TextInput testID="ad-degree" placeholder='Degree (e.g. "MBBS, MD")' placeholderTextColor={colors.muted} value={f.degree} onChangeText={(v) => setField("degree", v)} style={styles.input} />
                 <View style={{ flexDirection: "row", gap: spacing.sm }}>
                   <View style={{ flex: 1 }}>
@@ -667,16 +1029,16 @@ export default function OwnerDashboard() {
                 <TextInput testID="ad-avgmin" placeholder="Avg. time per patient (min, default 15)" placeholderTextColor={colors.muted} value={f.avg_consult_minutes} onChangeText={(v) => setField("avg_consult_minutes", v.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" style={styles.input} />
                 <TextInput testID="ad-bio" placeholder="Short bio (optional)" placeholderTextColor={colors.muted} value={f.bio} onChangeText={(v) => setField("bio", v)} multiline style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]} />
 
-                <Text style={styles.groupLabel}>Documents</Text>
+                <Text style={styles.groupLabel}>Documents (Max 5 MB each)</Text>
                 <View style={styles.imgRow}>
                   <Pressable testID="pick-photo" onPress={() => pickImage(setPhoto)} style={styles.imgPickBtn}>
-                    {photo ? <Image source={{ uri: photo }} style={styles.imgPreview} /> : <><Ionicons name="camera" size={20} color={colors.brandPrimary} /><Text style={styles.imgPickText}>Profile</Text></>}
+                    {photo ? <Image source={{ uri: photo }} style={styles.imgPreview} /> : <><Ionicons name="camera" size={20} color={colors.brandPrimary} /><Text style={styles.imgPickText}>Profile Photo</Text></>}
                   </Pressable>
                   <Pressable testID="pick-id" onPress={() => pickImage(setIdProof)} style={styles.imgPickBtn}>
                     {idProof ? <Image source={{ uri: idProof }} style={styles.imgPreview} /> : <><Ionicons name="card" size={20} color={colors.brandPrimary} /><Text style={styles.imgPickText}>ID Proof</Text></>}
                   </Pressable>
                   <Pressable testID="pick-degree" onPress={() => pickImage(setDegreePhoto)} style={styles.imgPickBtn}>
-                    {degreePhoto ? <Image source={{ uri: degreePhoto }} style={styles.imgPreview} /> : <><Ionicons name="document" size={20} color={colors.brandPrimary} /><Text style={styles.imgPickText}>Degree</Text></>}
+                    {degreePhoto ? <Image source={{ uri: degreePhoto }} style={styles.imgPreview} /> : <><Ionicons name="document" size={20} color={colors.brandPrimary} /><Text style={styles.imgPickText}>Degree Certificate</Text></>}
                   </Pressable>
                 </View>
 
@@ -684,6 +1046,148 @@ export default function OwnerDashboard() {
 
                 <Pressable testID="submit-add-doctor" onPress={onSubmit} disabled={submitting} style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }]}>
                   {submitting ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Save Doctor</Text>}
+                </Pressable>
+                <View style={{ height: spacing.xxl }} />
+              </ScrollView>
+            </Pressable>
+          </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
+
+      {/* ── Edit Doctor Modal ── */}
+      <Modal transparent visible={editDocOpen} animationType="slide" onRequestClose={() => setEditDocOpen(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setEditDocOpen(false)}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+            <Pressable style={[styles.sheet, { maxHeight: "92%", minHeight: "80%" }]} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <ScrollView keyboardShouldPersistTaps="handled">
+                <Text style={styles.sheetTitle}>Edit Doctor Details</Text>
+                <Text style={styles.sheetSub}>Update doctor profile, specialist category, credentials, and settings.</Text>
+
+                <Text style={styles.groupLabel}>Hospital & Identification</Text>
+                <Text style={styles.subLabel}>Assigned Hospital ID*</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 6 }}>
+                  {hospitals.map((h) => {
+                    const active = (ef.hospital_id || "H00001") === h.hospital_id;
+                    return (
+                      <Pressable key={h.hospital_id} onPress={() => setEditField("hospital_id", h.hospital_id)} style={[styles.specChip, active && styles.specChipActive]}>
+                        <Text style={[styles.specChipText, active && { color: "#fff" }]}>{h.hospital_id} - {h.name}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
+
+                <Text style={styles.subLabel}>Gender</Text>
+                <View style={{ flexDirection: "row", gap: 10, marginVertical: 4 }}>
+                  {["Male", "Female", "Other"].map((g) => (
+                    <Pressable key={g} onPress={() => setEditField("gender", g)} style={[styles.specChip, ef.gender === g && styles.specChipActive]}>
+                      <Text style={[styles.specChipText, ef.gender === g && { color: "#fff" }]}>{g}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+
+                <Text style={styles.groupLabel}>Basic Info</Text>
+                <Text style={styles.subLabel}>Full Name*</Text>
+                <TextInput placeholder="Full Name*" placeholderTextColor={colors.muted} value={ef.full_name} onChangeText={(v) => setEditField("full_name", v)} style={styles.input} />
+                
+                <Text style={styles.subLabel}>Login Email</Text>
+                <TextInput placeholder="Login Email" placeholderTextColor={colors.muted} value={ef.email} onChangeText={(v) => setEditField("email", v)} keyboardType="email-address" autoCapitalize="none" style={styles.input} />
+                
+                <Text style={styles.subLabel}>Change Password (leave blank to keep existing)</Text>
+                <TextInput placeholder="New Password" placeholderTextColor={colors.muted} value={ef.password} onChangeText={(v) => setEditField("password", v)} secureTextEntry style={styles.input} />
+                
+                <Text style={styles.subLabel}>Phone / Mobile</Text>
+                <TextInput placeholder="Phone / Mobile Number" placeholderTextColor={colors.muted} value={ef.phone} onChangeText={(v) => setEditField("phone", v.replace(/[^0-9+]/g, ""))} keyboardType="phone-pad" style={styles.input} />
+                
+                <Text style={styles.subLabel}>Address</Text>
+                <TextInput placeholder="Address" placeholderTextColor={colors.muted} value={ef.address} onChangeText={(v) => setEditField("address", v)} style={styles.input} />
+
+                <Text style={styles.groupLabel}>Professional Details</Text>
+                <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 4 }}>
+                  <Text style={styles.subLabel}>Specialist Category* ({ef.specialty ? `Selected: ${ef.specialty}` : "Please select"})</Text>
+                  <Pressable onPress={() => { setNewSpecName(""); setSpecError(null); setAddSpecModalOpen(true); }}>
+                    <Text style={{ color: colors.brandPrimary, fontWeight: "600", fontSize: font.xs }}>+ Add New</Text>
+                  </Pressable>
+                </View>
+
+                <View style={styles.searchBar}>
+                  <Ionicons name="search" size={16} color={colors.muted} />
+                  <TextInput
+                    placeholder="Search specialist category..."
+                    placeholderTextColor={colors.muted}
+                    value={editDocSpecSearch}
+                    onChangeText={setEditDocSpecSearch}
+                    style={styles.searchInput}
+                  />
+                  {editDocSpecSearch ? (
+                    <Pressable onPress={() => setEditDocSpecSearch("")}>
+                      <Ionicons name="close-circle" size={16} color={colors.muted} />
+                    </Pressable>
+                  ) : null}
+                </View>
+
+                <ScrollView style={styles.specDropdownList} nestedScrollEnabled showsVerticalScrollIndicator>
+                  {editFilteredSpecialties.map((s) => {
+                    const active = ef.specialty === s;
+                    return (
+                      <Pressable
+                        key={s}
+                        onPress={() => setEditField("specialty", s)}
+                        style={[styles.specListItem, active && styles.specListItemActive]}
+                      >
+                        <Ionicons name={active ? "checkmark-circle" : "ellipse-outline"} size={16} color={active ? colors.brandPrimary : colors.muted} />
+                        <Text style={[styles.specListText, active && styles.specListTextActive]}>{s}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
+
+                <Text style={styles.subLabel}>Degree</Text>
+                <TextInput placeholder='Degree (e.g. "MBBS, MD")' placeholderTextColor={colors.muted} value={ef.degree} onChangeText={(v) => setEditField("degree", v)} style={styles.input} />
+                
+                <View style={{ flexDirection: "row", gap: spacing.sm }}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.subLabel}>Experience (yrs)</Text>
+                    <TextInput placeholder="Experience (yrs)" placeholderTextColor={colors.muted} value={ef.experience_years} onChangeText={(v) => setEditField("experience_years", v.replace(/[^0-9]/g, ""))} keyboardType="number-pad" style={styles.input} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.subLabel}>Fees (₹)*</Text>
+                    <TextInput placeholder="Fees ₹*" placeholderTextColor={colors.muted} value={ef.fees} onChangeText={(v) => setEditField("fees", v.replace(/[^0-9]/g, ""))} keyboardType="number-pad" style={styles.input} />
+                  </View>
+                </View>
+
+                <Text style={styles.subLabel}>Clinic Name*</Text>
+                <TextInput placeholder="Clinic / Hospital Name*" placeholderTextColor={colors.muted} value={ef.clinic_name} onChangeText={(v) => setEditField("clinic_name", v)} style={styles.input} />
+                
+                <Text style={styles.subLabel}>City*</Text>
+                <TextInput placeholder="City*" placeholderTextColor={colors.muted} value={ef.city} onChangeText={(v) => setEditField("city", v)} style={styles.input} />
+                
+                <Text style={styles.subLabel}>Timings*</Text>
+                <TextInput placeholder='Timings* (e.g. "10 AM - 4 PM")' placeholderTextColor={colors.muted} value={ef.timings} onChangeText={(v) => setEditField("timings", v)} style={styles.input} />
+                
+                <Text style={styles.subLabel}>Avg. Consult Time (min)</Text>
+                <TextInput placeholder="Avg. time per patient (min)" placeholderTextColor={colors.muted} value={ef.avg_consult_minutes} onChangeText={(v) => setEditField("avg_consult_minutes", v.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" style={styles.input} />
+                
+                <Text style={styles.subLabel}>Bio</Text>
+                <TextInput placeholder="Short bio" placeholderTextColor={colors.muted} value={ef.bio} onChangeText={(v) => setEditField("bio", v)} multiline style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]} />
+
+                <Text style={styles.groupLabel}>Documents (Max 5 MB each)</Text>
+                <View style={styles.imgRow}>
+                  <Pressable onPress={() => pickImage(setEditPhoto)} style={styles.imgPickBtn}>
+                    {editPhoto ? <Image source={{ uri: editPhoto }} style={styles.imgPreview} /> : <><Ionicons name="camera" size={20} color={colors.brandPrimary} /><Text style={styles.imgPickText}>Profile Photo</Text></>}
+                  </Pressable>
+                  <Pressable onPress={() => pickImage(setEditIdProof)} style={styles.imgPickBtn}>
+                    {editIdProof ? <Image source={{ uri: editIdProof }} style={styles.imgPreview} /> : <><Ionicons name="card" size={20} color={colors.brandPrimary} /><Text style={styles.imgPickText}>ID Proof</Text></>}
+                  </Pressable>
+                  <Pressable onPress={() => pickImage(setEditDegreePhoto)} style={styles.imgPickBtn}>
+                    {editDegreePhoto ? <Image source={{ uri: editDegreePhoto }} style={styles.imgPreview} /> : <><Ionicons name="document" size={20} color={colors.brandPrimary} /><Text style={styles.imgPickText}>Degree Certificate</Text></>}
+                  </Pressable>
+                </View>
+
+                {editDocError ? <Text style={styles.error}>{editDocError}</Text> : null}
+
+                <Pressable onPress={handleUpdateDoctor} disabled={editDocSaving} style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }]}>
+                  {editDocSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Save Doctor Changes</Text>}
                 </Pressable>
                 <View style={{ height: spacing.xxl }} />
               </ScrollView>
@@ -754,6 +1258,69 @@ export default function OwnerDashboard() {
         </Pressable>
       </Modal>
 
+      {/* ── Edit Receptionist Modal ── */}
+      <Modal transparent visible={editRecOpen} animationType="slide" onRequestClose={() => setEditRecOpen(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setEditRecOpen(false)}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+            <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <ScrollView keyboardShouldPersistTaps="handled">
+                <Text style={styles.sheetTitle}>Edit Receptionist</Text>
+                <Text style={styles.sheetSub}>Update receptionist credentials and hospital assignment.</Text>
+
+                <Text style={styles.groupLabel}>Hospital Assignment</Text>
+                <Text style={styles.subLabel}>Hospital ID*</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 6 }}>
+                  {hospitals.map((h) => {
+                    const active = (erf.hospital_id || "H00001") === h.hospital_id;
+                    return (
+                      <Pressable key={h.hospital_id} onPress={() => setErf((prev) => ({ ...prev, hospital_id: h.hospital_id }))} style={[styles.specChip, active && styles.specChipActive]}>
+                        <Text style={[styles.specChipText, active && { color: "#fff" }]}>{h.hospital_id} - {h.name}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
+
+                <Text style={styles.groupLabel}>Account Credentials</Text>
+                <Text style={styles.subLabel}>Full Name*</Text>
+                <TextInput placeholder="Full Name*" placeholderTextColor={colors.muted} value={erf.full_name} onChangeText={(v) => setErf((prev) => ({ ...prev, full_name: v }))} style={styles.input} />
+                
+                <Text style={styles.subLabel}>Login Email</Text>
+                <TextInput placeholder="Login Email*" placeholderTextColor={colors.muted} value={erf.email} onChangeText={(v) => setErf((prev) => ({ ...prev, email: v }))} keyboardType="email-address" autoCapitalize="none" style={styles.input} />
+                
+                <Text style={styles.subLabel}>Change Password (leave blank to keep existing)</Text>
+                <TextInput placeholder="New Password" placeholderTextColor={colors.muted} value={erf.password} onChangeText={(v) => setErf((prev) => ({ ...prev, password: v }))} secureTextEntry style={styles.input} />
+                
+                <Text style={styles.subLabel}>Phone / Mobile</Text>
+                <TextInput placeholder="Phone / Mobile" placeholderTextColor={colors.muted} value={erf.phone} onChangeText={(v) => setErf((prev) => ({ ...prev, phone: v.replace(/[^0-9+]/g, "") }))} keyboardType="phone-pad" style={styles.input} />
+
+                <Text style={styles.groupLabel}>Assign to Doctor (Optional)</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 6 }}>
+                  <Pressable onPress={() => setErf((prev) => ({ ...prev, doctor_id: "" }))} style={[styles.specChip, !erf.doctor_id && styles.specChipActive]}>
+                    <Text style={[styles.specChipText, !erf.doctor_id && { color: "#fff" }]}>All Doctors / General</Text>
+                  </Pressable>
+                  {doctors.map((d) => {
+                    const active = erf.doctor_id === d.id;
+                    return (
+                      <Pressable key={d.id} onPress={() => setErf((prev) => ({ ...prev, doctor_id: d.id }))} style={[styles.specChip, active && styles.specChipActive]}>
+                        <Text style={[styles.specChipText, active && { color: "#fff" }]}>Dr. {d.full_name}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
+
+                {editRecError ? <Text style={styles.error}>{editRecError}</Text> : null}
+
+                <Pressable onPress={handleUpdateReceptionist} disabled={editRecSaving} style={styles.submitBtn}>
+                  {editRecSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitBtnText}>Save Receptionist Changes</Text>}
+                </Pressable>
+                <View style={{ height: spacing.xxl }} />
+              </ScrollView>
+            </Pressable>
+          </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
+
       {/* ── View Doctor Modal ── */}
       <Modal transparent visible={!!viewDoc} animationType="slide" onRequestClose={() => setViewDoc(null)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setViewDoc(null)}>
@@ -782,7 +1349,7 @@ export default function OwnerDashboard() {
                 <DetailRow icon="time" label="Timings" value={viewDoc.timings || "—"} />
                 <DetailRow icon="hourglass" label="Avg. per patient" value={viewDoc.avg_consult_minutes ? `${viewDoc.avg_consult_minutes} minutes` : "15 minutes"} />
                 <DetailRow icon="mail" label="Email" value={viewDoc.email || "—"} />
-                <DetailRow icon="call" label="Phone" value={viewDoc.phone || "—"} />
+                <DetailRow icon="call" label="Phone" value={viewDoc.phone || viewDoc.mobile || "—"} />
                 <DetailRow icon="location" label="Address" value={viewDoc.address || "—"} />
                 {viewDoc.bio ? <DetailRow icon="document-text" label="Bio" value={viewDoc.bio} /> : null}
                 {viewDoc.id_proof_photo ? (
@@ -798,17 +1365,30 @@ export default function OwnerDashboard() {
                   </>
                 ) : null}
 
-                <Pressable 
-                  onPress={() => {
-                    const docToDelete = viewDoc;
-                    setViewDoc(null);
-                    if (docToDelete) onDelete(docToDelete);
-                  }} 
-                  style={[styles.submitBtn, { backgroundColor: colors.error, marginTop: spacing.lg, flexDirection: "row", justifyContent: "center", gap: 6 }]}
-                >
-                  <Ionicons name="trash-outline" size={18} color="#fff" />
-                  <Text style={styles.submitBtnText}>Delete Doctor from Database</Text>
-                </Pressable>
+                <View style={{ flexDirection: "row", gap: spacing.sm, marginTop: spacing.lg }}>
+                  <Pressable
+                    onPress={() => {
+                      const docToEdit = viewDoc;
+                      setViewDoc(null);
+                      if (docToEdit) openEditDoctor(docToEdit);
+                    }}
+                    style={[styles.submitBtn, { flex: 1, backgroundColor: colors.brandPrimary, flexDirection: "row", justifyContent: "center", gap: 6 }]}
+                  >
+                    <Ionicons name="create-outline" size={18} color="#fff" />
+                    <Text style={styles.submitBtnText}>Edit Doctor</Text>
+                  </Pressable>
+                  <Pressable 
+                    onPress={() => {
+                      const docToDelete = viewDoc;
+                      setViewDoc(null);
+                      if (docToDelete) onDelete(docToDelete);
+                    }} 
+                    style={[styles.submitBtn, { flex: 1, backgroundColor: colors.error, flexDirection: "row", justifyContent: "center", gap: 6 }]}
+                  >
+                    <Ionicons name="trash-outline" size={18} color="#fff" />
+                    <Text style={styles.submitBtnText}>Delete</Text>
+                  </Pressable>
+                </View>
 
                 <View style={{ height: spacing.xxl }} />
               </ScrollView>
@@ -863,7 +1443,7 @@ const styles = StyleSheet.create({
   chipsRow: { flexDirection: "row", flexWrap: "wrap", gap: 4, marginTop: 6 },
   chip: { backgroundColor: colors.surfaceSecondary, paddingHorizontal: 8, paddingVertical: 2, borderRadius: radius.pill },
   chipText: { fontSize: 10, color: colors.onSurfaceSecondary, fontWeight: "600" },
-  delBtn: { width: 36, height: 36, borderRadius: radius.pill, backgroundColor: colors.error + "18", alignItems: "center", justifyContent: "center" },
+  delBtn: { width: 34, height: 34, borderRadius: radius.md, backgroundColor: colors.error + "18", alignItems: "center", justifyContent: "center" },
   empty: { alignItems: "center", padding: spacing.xxl, gap: spacing.md },
   emptyText: { color: colors.muted, fontSize: font.base },
   modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
@@ -872,15 +1452,21 @@ const styles = StyleSheet.create({
   sheetTitle: { fontSize: font.xl, fontWeight: "700", color: colors.onSurface },
   sheetSub: { fontSize: font.base, color: colors.muted, marginBottom: spacing.md },
   groupLabel: { fontSize: font.sm, fontWeight: "700", color: colors.brandPrimary, marginTop: spacing.md, marginBottom: spacing.xs, letterSpacing: 0.5 },
-  subLabel: { fontSize: font.sm, color: colors.onSurfaceSecondary, marginTop: 4, marginBottom: 4 },
-  input: { borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, paddingHorizontal: spacing.md, paddingVertical: 12, fontSize: font.base, color: colors.onSurface, backgroundColor: colors.surface, marginTop: 6 },
-  specWrap: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 6 },
+  subLabel: { fontSize: font.sm, color: colors.onSurfaceSecondary, marginTop: 6, marginBottom: 2, fontWeight: "600" },
+  input: { borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, paddingHorizontal: spacing.md, paddingVertical: 12, fontSize: font.base, color: colors.onSurface, backgroundColor: colors.surface, marginTop: 4 },
+  searchBar: { flexDirection: "row", alignItems: "center", gap: 8, borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, paddingHorizontal: spacing.md, paddingVertical: 8, backgroundColor: colors.surface, marginTop: 4 },
+  searchInput: { flex: 1, fontSize: font.sm, color: colors.onSurface, padding: 0 },
+  specDropdownList: { maxHeight: 180, borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, marginTop: 6, backgroundColor: colors.surfaceSecondary },
+  specListItem: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: spacing.md, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: colors.border + "40" },
+  specListItemActive: { backgroundColor: colors.brandSecondary + "35" },
+  specListText: { fontSize: font.sm, color: colors.onSurface },
+  specListTextActive: { fontWeight: "700", color: colors.brandPrimary },
   specChip: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: radius.pill, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface },
   specChipActive: { backgroundColor: colors.brandPrimary, borderColor: colors.brandPrimary },
   specChipText: { fontSize: font.sm, color: colors.onSurface, fontWeight: "500" },
   imgRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.sm },
   imgPickBtn: { flex: 1, aspectRatio: 1, borderWidth: 1.5, borderColor: colors.border, borderStyle: "dashed", borderRadius: radius.md, alignItems: "center", justifyContent: "center", overflow: "hidden", backgroundColor: colors.surfaceSecondary },
-  imgPickText: { fontSize: 11, color: colors.brandPrimary, fontWeight: "600", marginTop: 4 },
+  imgPickText: { fontSize: 10, color: colors.brandPrimary, fontWeight: "600", marginTop: 4, textAlign: "center" },
   imgPreview: { width: "100%", height: "100%" },
   error: { color: colors.error, marginTop: spacing.sm, fontSize: font.sm, textAlign: "center" },
   primaryBtn: { backgroundColor: colors.brandPrimary, borderRadius: radius.md, padding: spacing.lg, alignItems: "center", marginTop: spacing.lg, minHeight: 52, justifyContent: "center" },
@@ -898,4 +1484,3 @@ const styles = StyleSheet.create({
   submitBtn: { backgroundColor: colors.brandPrimary, borderRadius: radius.md, padding: spacing.lg, alignItems: "center", marginTop: spacing.md },
   submitBtnText: { color: colors.onBrandPrimary, fontSize: font.lg, fontWeight: "700" },
 });
-

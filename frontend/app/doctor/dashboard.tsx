@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   View, Text, StyleSheet, ScrollView, ActivityIndicator, Pressable,
-  RefreshControl, Modal, TextInput, Alert,
+  RefreshControl, Modal, TextInput, Alert, Image,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
+import * as ImagePicker from "expo-image-picker";
 import { api, getBackendWebSocketBase } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import CalendarSummary from "@/src/components/CalendarSummary";
 
 const POLL_INTERVAL_MS = 20_000;
+const MAX_PHOTO_BYTES = 5 * 1024 * 1024; // 5 MB limit
 
 const modes = [
   { key: "active",    label: "Active",    icon: "play-circle"  as const, color: colors.success },
@@ -47,6 +49,9 @@ export default function DoctorDashboard() {
   const [editTimings, setEditTimings] = useState("");
   const [editBio, setEditBio]         = useState("");
   const [editAvgMin, setEditAvgMin]   = useState("");
+  const [editPhoto, setEditPhoto]     = useState<string | null>(null);
+  const [editPassword, setEditPassword] = useState("");
+  const [editError, setEditError]     = useState<string | null>(null);
   const [editSaving, setEditSaving]   = useState(false);
 
   // Receptionist add state
@@ -154,11 +159,56 @@ export default function DoctorDashboard() {
     setEditTimings(data?.doctor?.timings ?? "");
     setEditBio(data?.doctor?.bio ?? "");
     setEditAvgMin(String(data?.doctor?.avg_consult_minutes ?? 15));
+    setEditPhoto(data?.doctor?.photo || null);
+    setEditPassword("");
+    setEditError(null);
     setEditOpen(true);
+  };
+
+  const pickPhoto = async () => {
+    try {
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== "granted") {
+        Alert.alert("Permission required", "Camera roll permission is needed to upload photos.");
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.8,
+        base64: true,
+      });
+      if (!result.canceled && result.assets && result.assets[0]) {
+        const asset = result.assets[0];
+        if (asset.fileSize && asset.fileSize > MAX_PHOTO_BYTES) {
+          setEditError("Photo size exceeds maximum limit of 5 MB");
+          Alert.alert("File Too Large", "Photo size cannot exceed 5 MB. Please select a smaller image.");
+          return;
+        }
+        if (asset.base64) {
+          const approxBytes = asset.base64.length * 0.75;
+          if (approxBytes > MAX_PHOTO_BYTES) {
+            setEditError("Photo size exceeds maximum limit of 5 MB");
+            Alert.alert("File Too Large", "Photo size cannot exceed 5 MB.");
+            return;
+          }
+          const uri = `data:image/jpeg;base64,${asset.base64}`;
+          setEditPhoto(uri);
+          setEditError(null);
+        } else if (asset.uri) {
+          setEditPhoto(asset.uri);
+          setEditError(null);
+        }
+      }
+    } catch (e: any) {
+      Alert.alert("Error", e.message || "Failed to pick image");
+    }
   };
 
   const saveProfile = async () => {
     setEditSaving(true);
+    setEditError(null);
     try {
       const updates: any = {};
       if (editFees && parseInt(editFees, 10) !== data?.doctor?.fees) updates.fees = parseInt(editFees, 10);
@@ -168,11 +218,27 @@ export default function DoctorDashboard() {
       if (!isNaN(avgMinNum) && avgMinNum > 0 && avgMinNum !== (data?.doctor?.avg_consult_minutes ?? 15)) {
         updates.avg_consult_minutes = avgMinNum;
       }
-      if (Object.keys(updates).length > 0) await api.post("/doctor/update_profile", updates);
+      if (editPassword.trim()) {
+        if (editPassword.length < 6) {
+          setEditError("New password must be at least 6 characters");
+          setEditSaving(false);
+          return;
+        }
+        updates.password = editPassword.trim();
+      }
+      if (editPhoto !== (data?.doctor?.photo || null)) {
+        updates.photo = editPhoto || "";
+      }
+      if (Object.keys(updates).length > 0) {
+        await api.post("/doctor/update_profile", updates);
+      }
       setEditOpen(false);
       load(true);
-    } catch { /* ignore */ }
-    finally { setEditSaving(false); }
+    } catch (e: any) {
+      setEditError(e.message || "Failed to update profile");
+    } finally {
+      setEditSaving(false);
+    }
   };
 
   const handleAddReceptionist = async () => {
@@ -438,22 +504,65 @@ export default function DoctorDashboard() {
       {/* ── Edit Profile Modal ── */}
       <Modal transparent visible={editOpen} animationType="slide" onRequestClose={() => setEditOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setEditOpen(false)}>
-          <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+          <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
             <View style={styles.sheetHandle} />
             <Text style={styles.sheetTitle}>Update My Profile</Text>
-            <Text style={styles.sheetSub}>Update your consultation fees &amp; timings</Text>
-            <Text style={styles.editLabel}>Consultation Fees (₹)</Text>
-            <TextInput testID="edit-fees" value={editFees} onChangeText={(v) => setEditFees(v.replace(/[^0-9]/g, ""))} keyboardType="number-pad" placeholder="500" placeholderTextColor={colors.muted} style={styles.editInput} />
-            <Text style={styles.editLabel}>⏱ Avg. Time per Patient (minutes)</Text>
-            <TextInput testID="edit-avgmin" value={editAvgMin} onChangeText={(v) => setEditAvgMin(v.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" placeholder="15" placeholderTextColor={colors.muted} style={styles.editInput} />
-            <Text style={styles.hintTxt}>Patients ki live wait time is number × queue position se calculate hoti hai</Text>
-            <Text style={styles.editLabel}>Timings</Text>
-            <TextInput testID="edit-timings" value={editTimings} onChangeText={setEditTimings} placeholder="10:00 AM - 4:00 PM" placeholderTextColor={colors.muted} style={styles.editInput} />
-            <Text style={styles.editLabel}>Bio (optional)</Text>
-            <TextInput testID="edit-bio" value={editBio} onChangeText={setEditBio} multiline placeholder="Short bio" placeholderTextColor={colors.muted} style={[styles.editInput, { minHeight: 80, textAlignVertical: "top" }]} />
-            <Pressable testID="edit-save" onPress={saveProfile} disabled={editSaving} style={styles.saveBtn}>
-              {editSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveBtnText}>Save Changes</Text>}
-            </Pressable>
+            <Text style={styles.sheetSub}>Update your consultation fees, timings, photo &amp; password</Text>
+            
+            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ gap: spacing.xs, paddingBottom: 20 }}>
+              {/* Photo section */}
+              <Text style={styles.editLabel}>Profile Photo (Max 5 MB)</Text>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 14, marginVertical: 6 }}>
+                {editPhoto ? (
+                  <Image source={{ uri: editPhoto }} style={{ width: 64, height: 64, borderRadius: 32, backgroundColor: colors.border }} />
+                ) : (
+                  <View style={{ width: 64, height: 64, borderRadius: 32, backgroundColor: colors.surfaceSecondary, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.border }}>
+                    <Ionicons name="person-circle-outline" size={44} color={colors.muted} />
+                  </View>
+                )}
+                <View style={{ gap: 6, flex: 1 }}>
+                  <Pressable onPress={pickPhoto} style={{ flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: colors.brandSecondary, paddingVertical: 8, paddingHorizontal: 12, borderRadius: radius.md, alignSelf: "flex-start" }}>
+                    <Ionicons name="camera-outline" size={16} color={colors.brandPrimary} />
+                    <Text style={{ color: colors.brandPrimary, fontWeight: "600", fontSize: font.sm }}>Change Photo</Text>
+                  </Pressable>
+                  {editPhoto ? (
+                    <Pressable onPress={() => setEditPhoto(null)} style={{ alignSelf: "flex-start" }}>
+                      <Text style={{ color: colors.error, fontSize: font.xs, fontWeight: "600" }}>Remove Photo</Text>
+                    </Pressable>
+                  ) : null}
+                </View>
+              </View>
+
+              {/* Password section */}
+              <Text style={styles.editLabel}>Change Password (leave empty to keep current)</Text>
+              <TextInput
+                value={editPassword}
+                onChangeText={setEditPassword}
+                secureTextEntry
+                placeholder="New Password (min 6 chars)"
+                placeholderTextColor={colors.muted}
+                style={styles.editInput}
+              />
+
+              <Text style={styles.editLabel}>Consultation Fees (₹)</Text>
+              <TextInput testID="edit-fees" value={editFees} onChangeText={(v) => setEditFees(v.replace(/[^0-9]/g, ""))} keyboardType="number-pad" placeholder="500" placeholderTextColor={colors.muted} style={styles.editInput} />
+              
+              <Text style={styles.editLabel}>⏱ Avg. Time per Patient (minutes)</Text>
+              <TextInput testID="edit-avgmin" value={editAvgMin} onChangeText={(v) => setEditAvgMin(v.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" placeholder="15" placeholderTextColor={colors.muted} style={styles.editInput} />
+              <Text style={styles.hintTxt}>Patients ki live wait time is number × queue position se calculate hoti hai</Text>
+              
+              <Text style={styles.editLabel}>Timings</Text>
+              <TextInput testID="edit-timings" value={editTimings} onChangeText={setEditTimings} placeholder="10:00 AM - 4:00 PM" placeholderTextColor={colors.muted} style={styles.editInput} />
+              
+              <Text style={styles.editLabel}>Bio (optional)</Text>
+              <TextInput testID="edit-bio" value={editBio} onChangeText={setEditBio} multiline placeholder="Short bio" placeholderTextColor={colors.muted} style={[styles.editInput, { minHeight: 70, textAlignVertical: "top" }]} />
+              
+              {editError ? <Text style={{ color: colors.error, fontSize: font.sm, marginTop: 6, textAlign: "center" }}>{editError}</Text> : null}
+
+              <Pressable testID="edit-save" onPress={saveProfile} disabled={editSaving} style={styles.saveBtn}>
+                {editSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveBtnText}>Save Changes</Text>}
+              </Pressable>
+            </ScrollView>
           </Pressable>
         </Pressable>
       </Modal>

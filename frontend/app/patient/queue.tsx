@@ -150,6 +150,31 @@ export default function PatientQueue() {
         <Text style={styles.doctorName}>{appt.doctor_name}</Text>
         <Text style={styles.slotText}>Token #{appt.token_number} · {appt.slot}</Text>
 
+        {/* Doctor Break / Emergency Status Banner */}
+        {data.doctor_status === "break" && (
+          <View style={[styles.statusBanner, { backgroundColor: "#FEF3C7", borderColor: "#F59E0B" }]}>
+            <Ionicons name="cafe-outline" size={20} color="#D97706" />
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontWeight: "700", color: "#92400E", fontSize: font.sm }}>Doctor is on a short break</Text>
+              <Text style={{ color: "#B45309", fontSize: font.xs, marginTop: 2 }}>
+                Your place in queue is safely reserved. Wait time and expected turn have been updated.
+              </Text>
+            </View>
+          </View>
+        )}
+
+        {data.doctor_status === "emergency" && (
+          <View style={[styles.statusBanner, { backgroundColor: "#FEE2E2", borderColor: "#EF4444" }]}>
+            <Ionicons name="warning-outline" size={20} color="#DC2626" />
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontWeight: "700", color: "#991B1B", fontSize: font.sm }}>Doctor attending an emergency</Text>
+              <Text style={{ color: "#B91C1C", fontSize: font.xs, marginTop: 2 }}>
+                Doctor is attending an urgent emergency. Live queue will resume immediately afterwards.
+              </Text>
+            </View>
+          </View>
+        )}
+
         <View style={styles.hero}>
           <Text style={styles.heroLabel}>
             {isServing ? "IT'S YOUR TURN 🎉" : isDone ? "COMPLETED" : "YOU ARE NUMBER"}
@@ -157,13 +182,18 @@ export default function PatientQueue() {
           <Text style={styles.heroNumber} testID="queue-position">
             {isServing ? "NOW" : isDone ? "✓" : `#${data.my_position || 0}`}
           </Text>
-          <Text style={styles.heroSub}>
+          <Text style={styles.heroExpectedTime} testID="expected-turn-time">
             {isServing
               ? "Please head to the consultation room"
               : isDone
               ? "Consultation completed"
-              : `~${data.eta_minutes} minutes waiting time`}
+              : `Your expected turn: ${data.expected_turn_time || '~' + data.eta_minutes + ' min'}`}
           </Text>
+          {!isServing && !isDone && (
+            <Text style={styles.heroSub}>
+              ~{data.eta_minutes} mins waiting time ({data.my_position > 1 ? `${data.my_position - 1} patient${data.my_position > 2 ? 's' : ''} ahead` : 'Next in line'})
+            </Text>
+          )}
         </View>
 
         <View style={styles.statsRow}>
@@ -245,7 +275,9 @@ const styles = StyleSheet.create({
   hero: { backgroundColor: colors.brandPrimary, borderRadius: radius.lg, padding: spacing.xl, alignItems: "center", marginTop: spacing.md, gap: 4 },
   heroLabel: { color: colors.brandTertiary, fontSize: font.sm, fontWeight: "700", letterSpacing: 1 },
   heroNumber: { color: colors.onBrandPrimary, fontSize: 96, fontWeight: "800", lineHeight: 104, marginVertical: spacing.sm },
-  heroSub: { color: colors.brandTertiary, fontSize: font.base, textAlign: "center" },
+  heroExpectedTime: { color: colors.onBrandPrimary, fontSize: font.lg, fontWeight: "700", textAlign: "center" },
+  heroSub: { color: colors.brandTertiary, fontSize: font.sm, textAlign: "center", marginTop: 2 },
+  statusBanner: { flexDirection: "row", alignItems: "center", gap: spacing.md, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, marginTop: spacing.sm },
   statsRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.md },
   statCard: { flex: 1, backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border },
   statLabel: { fontSize: 11, color: colors.muted },

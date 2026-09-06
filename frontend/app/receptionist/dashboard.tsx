@@ -34,6 +34,14 @@ export default function ReceptionistDashboard() {
   const [emergencyOpen, setEmergencyOpen] = useState(false);
   const [emergencyName, setEmergencyName] = useState("");
 
+  // Refer patient state
+  const [referModalOpen, setReferModalOpen] = useState(false);
+  const [referAppt, setReferAppt]           = useState<any | null>(null);
+  const [targetDocId, setTargetDocId]       = useState<string>("");
+  const [referReason, setReferReason]       = useState<string>("");
+  const [referLoading, setReferLoading]     = useState(false);
+  const [referError, setReferError]         = useState<string | null>(null);
+
   // Add Patient sheet
   const [addOpen, setAddOpen]       = useState(false);
   const [pName, setPName]           = useState("");
@@ -151,6 +159,41 @@ export default function ReceptionistDashboard() {
     } catch { /* ignore */ }
   };
 
+  const openReferModal = (appt: any) => {
+    setReferAppt(appt);
+    const otherDocs = doctors.filter((d) => d.id !== selectedDoc);
+    setTargetDocId(otherDocs[0]?.id || "");
+    setReferReason("");
+    setReferError(null);
+    setReferModalOpen(true);
+  };
+
+  const handleReferSubmit = async () => {
+    if (!referAppt || !targetDocId) {
+      setReferError("Please select a target doctor");
+      return;
+    }
+    setReferLoading(true);
+    setReferError(null);
+    try {
+      const res = await api.post("/reception/refer", {
+        appointment_id: referAppt.id,
+        target_doctor_id: targetDocId,
+        reason: referReason.trim() || undefined,
+      });
+      const targetDoc = doctors.find((d) => d.id === targetDocId);
+      setAddToast(`Referred ${referAppt.patient_name} to ${targetDoc?.full_name || "Doctor"} · Token #${res.appointment?.token_number}`);
+      setReferModalOpen(false);
+      setReferAppt(null);
+      load(true);
+      setTimeout(() => setAddToast(null), 3500);
+    } catch (e: any) {
+      setReferError(e.message || "Failed to refer patient");
+    } finally {
+      setReferLoading(false);
+    }
+  };
+
   const resetAddForm = () => {
     setPName(""); setPMobile(""); setPAge(""); setPGender(null);
     setPSymptoms(""); setPAddress(""); setPSlot(""); setAddError(null);
@@ -261,6 +304,11 @@ export default function ReceptionistDashboard() {
                 {a.symptoms ? <Text style={styles.symptoms} numberOfLines={1}>💊 {a.symptoms}</Text> : null}
               </View>
               <View style={styles.actionsRow}>
+                {doctors.length > 1 && a.status !== "completed" && (
+                  <Pressable testID={`action-refer-${a.id}`} onPress={() => openReferModal(a)} style={[styles.actBtn, { backgroundColor: colors.surfaceSecondary, borderWidth: 1, borderColor: colors.border }]}>
+                    <Ionicons name="swap-horizontal" size={16} color={colors.brandPrimary} />
+                  </Pressable>
+                )}
                 {actions.map((act) => (
                   <Pressable key={act.label} testID={`action-${act.label.toLowerCase()}-${a.id}`} onPress={() => doAction(act.path, a.id)} style={[styles.actBtn, { backgroundColor: act.color + "22" }]}>
                     <Ionicons name={act.icon} size={16} color={act.color} />
@@ -351,6 +399,59 @@ export default function ReceptionistDashboard() {
             <TextInput testID="emergency-name-input" placeholder="Patient name" placeholderTextColor={colors.muted} value={emergencyName} onChangeText={setEmergencyName} style={styles.emergencyInput} />
             <Pressable testID="emergency-confirm" onPress={insertEmergency} style={styles.emergencyBtn}>
               <Text style={styles.emergencyBtnText}>Insert as Priority</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* ── Refer / Transfer Patient Modal ── */}
+      <Modal transparent visible={referModalOpen} animationType="slide" onRequestClose={() => setReferModalOpen(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setReferModalOpen(false)}>
+          <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+            <View style={styles.sheetHandle} />
+            <Text style={styles.sheetTitle}>Refer / Transfer Patient</Text>
+            <Text style={styles.sheetSub}>
+              Transfer {referAppt?.patient_name} (Token #{referAppt?.token_number}) to another doctor in the hospital.
+            </Text>
+
+            <Text style={styles.label}>Select Target Doctor*</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 8 }}>
+              {doctors
+                .filter((d) => d.id !== selectedDoc)
+                .map((d) => {
+                  const isTarget = targetDocId === d.id;
+                  return (
+                    <Pressable
+                      key={d.id}
+                      testID={`refer-target-${d.id}`}
+                      onPress={() => setTargetDocId(d.id)}
+                      style={[
+                        styles.docChip,
+                        isTarget && styles.docChipActive,
+                      ]}
+                    >
+                      <Text style={[styles.docChipText, isTarget && { color: colors.onBrandPrimary }]}>
+                        {d.full_name} ({d.specialty || "General"})
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+            </ScrollView>
+
+            <Text style={styles.label}>Reason for Transfer (Optional)</Text>
+            <TextInput
+              testID="refer-reason-input"
+              placeholder="e.g. Doctor on emergency / specialist consultation"
+              placeholderTextColor={colors.muted}
+              value={referReason}
+              onChangeText={setReferReason}
+              style={styles.input}
+            />
+
+            {referError ? <Text style={styles.error}>{referError}</Text> : null}
+
+            <Pressable testID="refer-confirm-btn" onPress={handleReferSubmit} disabled={referLoading} style={styles.primaryBtn}>
+              {referLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Confirm Transfer</Text>}
             </Pressable>
           </Pressable>
         </Pressable>

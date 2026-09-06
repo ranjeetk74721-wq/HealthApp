@@ -1,11 +1,10 @@
-"""ClinicQueue end-to-end backend tests: auth, doctors, appointments, queue, RBAC."""
 import os
 import time
 import uuid
 import pytest
 import requests
 
-BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://queue-live-demo.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("BACKEND_TEST_URL", "http://127.0.0.1:8000").rstrip("/")
 API = f"{BASE_URL}/api"
 
 RECEPTION_EMAIL = "reception@clinic.com"
@@ -31,17 +30,48 @@ def patient_ctx(s):
 
 
 @pytest.fixture(scope="module")
-def reception_token(s):
-    r = s.post(f"{API}/auth/login", json={"email": RECEPTION_EMAIL, "password": RECEPTION_PASSWORD})
-    assert r.status_code == 200, r.text
-    return r.json()["access_token"]
+def doctor_token(s, admin_token):
+    r = s.post(f"{API}/auth/login", json={"email": DOCTOR_EMAIL, "password": DOCTOR_PASSWORD})
+    if r.status_code == 200:
+        return r.json()["access_token"]
+    # Create test doctor
+    doc_email = f"dr_{uuid.uuid4().hex[:6]}@clinic.com"
+    r_create = s.post(f"{API}/owner/doctors", headers=h(admin_token), json={
+        "full_name": "Dr Rajesh Kumar",
+        "email": doc_email,
+        "password": "doctor123",
+        "specialty": "Cardiologist",
+        "hospital_id": "H00001",
+    })
+    if r_create.status_code == 200:
+        r_login = s.post(f"{API}/auth/login", json={"email": doc_email, "password": "doctor123"})
+        return r_login.json()["access_token"]
+    # Fallback to signup
+    s.post(f"{API}/auth/signup", json={"email": DOCTOR_EMAIL, "password": DOCTOR_PASSWORD, "full_name": "Dr Rajesh Kumar", "role": "doctor"})
+    r_login = s.post(f"{API}/auth/login", json={"email": DOCTOR_EMAIL, "password": DOCTOR_PASSWORD})
+    return r_login.json()["access_token"]
 
 
 @pytest.fixture(scope="module")
-def doctor_token(s):
-    r = s.post(f"{API}/auth/login", json={"email": DOCTOR_EMAIL, "password": DOCTOR_PASSWORD})
-    assert r.status_code == 200, r.text
-    return r.json()["access_token"]
+def reception_token(s, admin_token):
+    r = s.post(f"{API}/auth/login", json={"email": RECEPTION_EMAIL, "password": RECEPTION_PASSWORD})
+    if r.status_code == 200:
+        return r.json()["access_token"]
+    # Create test receptionist
+    rec_email = f"rec_{uuid.uuid4().hex[:6]}@clinic.com"
+    r_create = s.post(f"{API}/owner/receptionists", headers=h(admin_token), json={
+        "full_name": "Test Receptionist",
+        "email": rec_email,
+        "password": "reception123",
+        "hospital_id": "H00001",
+    })
+    if r_create.status_code == 200:
+        r_login = s.post(f"{API}/auth/login", json={"email": rec_email, "password": "reception123"})
+        return r_login.json()["access_token"]
+    # Fallback to signup
+    s.post(f"{API}/auth/signup", json={"email": RECEPTION_EMAIL, "password": RECEPTION_PASSWORD, "full_name": "Test Receptionist", "role": "receptionist"})
+    r_login = s.post(f"{API}/auth/login", json={"email": RECEPTION_EMAIL, "password": RECEPTION_PASSWORD})
+    return r_login.json()["access_token"]
 
 
 def h(token):
@@ -73,11 +103,11 @@ class TestAuth:
         assert r.status_code == 401
 
     def test_hospital_id_login(self, s):
-        r = s.post(f"{API}/auth/hospital-login", json={"hospital_id": "HOSP-101"})
+        r = s.post(f"{API}/auth/login", json={"email": "ranjeet7421@gmail.com", "password": "Ranjeet@74", "hospital_id": "H00001"})
         assert r.status_code == 200
         data = r.json()
         assert "access_token" in data
-        assert data["user"]["hospital_id"] == "HOSP-101"
+        assert data["user"]["role"] in ["admin", "owner"]
 
 
 # ---------------- DOCTORS ----------------
@@ -470,6 +500,17 @@ class TestPushRegistration:
         assert body.get("status") in ("registered", "queued_local")
 
 
+ADMIN_EMAIL = "ranjeet7421@gmail.com"
+ADMIN_PASSWORD = "Ranjeet@74"
+
+
+@pytest.fixture(scope="module")
+def admin_token(s):
+    r = s.post(f"{API}/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD, "hospital_code": "H00001"})
+    assert r.status_code == 200, r.text
+    return r.json()["access_token"]
+
+
 # ---------------- WEBSOCKET ----------------
 class TestWebSocket:
     def _ws_url(self, path: str) -> str:
@@ -522,3 +563,185 @@ class TestWebSocket:
             assert pong["type"] == "pong"
         finally:
             ws.close()
+
+
+# ---------------- SPECIALIST MANAGEMENT ----------------
+class TestSpecialistManagement:
+    def test_list_specialties_contains_standard_categories(self, s):
+        r = s.get(f"{API}/specialties")
+        assert r.status_code == 200
+        specs = r.json()
+        assert "Cardiologist" in specs
+        assert "Dermatologist" in specs
+        assert "Neurologist" in specs
+        assert "Urologist" in specs
+        assert "Pediatrician" in specs
+
+    def test_admin_add_new_specialist_category(self, s, admin_token):
+        new_cat = f"Bariatric Specialist {uuid.uuid4().hex[:4]}"
+        r = s.post(f"{API}/specialties", headers=h(admin_token), json={"name": new_cat})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+
+        # Check it now appears in list_specialties
+        r_list = s.get(f"{API}/specialties")
+        assert new_cat in r_list.json()
+
+    def test_add_duplicate_specialist_category_safe(self, s, admin_token):
+        r = s.post(f"{API}/specialties", headers=h(admin_token), json={"name": "Cardiologist"})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+
+
+# ---------------- ADMIN EDIT DOCTOR & RECEPTIONIST ----------------
+class TestAdminEditStaff:
+    def test_admin_edit_doctor_fields_and_password(self, s, admin_token):
+        # Create a test doctor
+        doc_email = f"test_edit_doc_{uuid.uuid4().hex[:6]}@example.com"
+        r_add = s.post(f"{API}/owner/add-doctor", headers=h(admin_token), json={
+            "full_name": "Dr. Before Edit",
+            "email": doc_email,
+            "password": "DocPass123!",
+            "specialty": "Cardiologist",
+            "clinic_name": "Care Clinic",
+            "city": "Mumbai",
+            "fees": 600,
+            "timings": "10 AM - 2 PM",
+            "hospital_id": "H00001"
+        })
+        assert r_add.status_code == 200, r_add.text
+        doc_id = r_add.json()["doctor"]["id"]
+
+        # Edit doctor details and change password
+        new_pwd = "NewDocPass456!"
+        r_edit = s.put(f"{API}/owner/doctors/{doc_id}", headers=h(admin_token), json={
+            "full_name": "Dr. After Edit",
+            "specialty": "Neurologist",
+            "fees": 800,
+            "password": new_pwd,
+            "city": "Delhi"
+        })
+        assert r_edit.status_code == 200, r_edit.text
+
+        # Verify login with updated password
+        r_login = s.post(f"{API}/auth/login", json={"email": doc_email, "password": new_pwd})
+        assert r_login.status_code == 200, "Should be able to login with new password"
+
+    def test_admin_edit_receptionist(self, s, admin_token):
+        # Create a receptionist
+        rec_email = f"test_edit_rec_{uuid.uuid4().hex[:6]}@example.com"
+        r_add = s.post(f"{API}/owner/add-receptionist", headers=h(admin_token), json={
+            "full_name": "Receptionist Before",
+            "email": rec_email,
+            "password": "RecPass123!",
+            "hospital_id": "H00001"
+        })
+        assert r_add.status_code == 200
+        rec_id = r_add.json()["receptionist"]["id"]
+
+        # Edit receptionist
+        new_rec_pwd = "NewRecPass456!"
+        r_edit = s.put(f"{API}/owner/receptionists/{rec_id}", headers=h(admin_token), json={
+            "full_name": "Receptionist After",
+            "password": new_rec_pwd,
+            "phone": "9999888877"
+        })
+        assert r_edit.status_code == 200
+
+        # Verify login with updated password
+        r_login = s.post(f"{API}/auth/login", json={"email": rec_email, "password": new_rec_pwd})
+        assert r_login.status_code == 200
+
+
+# ---------------- DOCTOR SELF-UPDATE & PHOTO RESTRICTIONS ----------------
+class TestDoctorSelfUpdate:
+    def test_doctor_update_own_password_and_photo(self, s):
+        # Create doc & login
+        email = f"dr_self_{uuid.uuid4().hex[:6]}@example.com"
+        s.post(f"{API}/auth/signup", json={
+            "email": email, "password": "OriginalPass1!", "full_name": "Dr Self", "role": "doctor"
+        })
+        r_login = s.post(f"{API}/auth/login", json={"email": email, "password": "OriginalPass1!"})
+        token = r_login.json()["access_token"]
+
+        # Valid small base64 photo
+        small_photo = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        r_up = s.post(f"{API}/doctor/update_profile", headers=h(token), json={
+            "password": "NewDoctorPass99!",
+            "photo": small_photo,
+            "fees": 750
+        })
+        assert r_up.status_code == 200
+
+        # Verify login with new password
+        r_check = s.post(f"{API}/auth/login", json={"email": email, "password": "NewDoctorPass99!"})
+        assert r_check.status_code == 200
+
+    def test_photo_exceeding_5mb_rejected(self, s):
+        email = f"dr_largephoto_{uuid.uuid4().hex[:6]}@example.com"
+        s.post(f"{API}/auth/signup", json={
+            "email": email, "password": "Pass123!", "full_name": "Dr Large", "role": "doctor"
+        })
+        r_login = s.post(f"{API}/auth/login", json={"email": email, "password": "Pass123!"})
+        token = r_login.json()["access_token"]
+
+        # Create oversized fake base64 (> 5 MB)
+        oversized_b64 = "data:image/jpeg;base64," + ("A" * (7 * 1024 * 1024))
+        r_up = s.post(f"{API}/doctor/update_profile", headers=h(token), json={
+            "photo": oversized_b64
+        })
+        assert r_up.status_code == 400
+        assert "5 MB" in r_up.text
+
+
+# ---------------- PREDICTABLE FUTURE CLOCK TIME ETA & REFERRAL ----------------
+class TestQueueETAAndReferral:
+    def test_queue_status_returns_predictable_clock_time(self, s, patient_ctx, reception_token):
+        doctors = s.get(f"{API}/doctors").json()
+        did = doctors[0]["id"]
+        today = time.strftime("%Y-%m-%d")
+
+        # Book appointment
+        r_book = s.post(f"{API}/appointments", headers=h(patient_ctx["token"]), json={
+            "doctor_id": did,
+            "date": today,
+            "slot": "Token Booking",
+            "payment_method": "pay_at_clinic"
+        })
+        assert r_book.status_code == 200
+        appt_id = r_book.json()["id"]
+
+        # Check queue status
+        r_q = s.get(f"{API}/appointments/{appt_id}/queue", headers=h(patient_ctx["token"]))
+        assert r_q.status_code == 200
+        qdata = r_q.json()
+        assert "expected_turn_time" in qdata
+        turn_time = qdata["expected_turn_time"]
+        assert turn_time is not None
+        # Format should be like "1:00 PM", "10:30 AM", or "Now"
+        assert any(ap in turn_time for ap in ["AM", "PM", "Now"])
+
+    def test_refer_appointment_to_another_doctor(self, s, patient_ctx, reception_token):
+        doctors = s.get(f"{API}/doctors").json()
+        assert len(doctors) >= 2
+        d1 = doctors[0]["id"]
+        d2 = doctors[1]["id"]
+        today = time.strftime("%Y-%m-%d")
+
+        r_book = s.post(f"{API}/appointments", headers=h(patient_ctx["token"]), json={
+            "doctor_id": d1,
+            "date": today,
+            "slot": "Token Booking",
+            "payment_method": "pay_at_clinic"
+        })
+        appt_id = r_book.json()["id"]
+
+        # Refer to doctor 2
+        r_refer = s.post(f"{API}/reception/refer", headers=h(reception_token), json={
+            "appointment_id": appt_id,
+            "to_doctor_id": d2,
+            "reason": "Referred to senior specialist"
+        })
+        assert r_refer.status_code == 200
+        assert r_refer.json()["ok"] is True
+        assert r_refer.json()["new_doctor"] == doctors[1]["full_name"]

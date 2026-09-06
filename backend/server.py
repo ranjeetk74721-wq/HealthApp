@@ -292,7 +292,10 @@ class OwnerAddReceptionistBody(BaseModel):
 
 class OwnerUpdateDoctorBody(BaseModel):
     full_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    password: Optional[str] = None
     phone: Optional[str] = None
+    mobile: Optional[str] = None
     address: Optional[str] = None
     specialty: Optional[str] = None
     degree: Optional[str] = None
@@ -307,20 +310,77 @@ class OwnerUpdateDoctorBody(BaseModel):
     degree_photo: Optional[str] = None
     status: Optional[str] = None
     avg_consult_minutes: Optional[int] = None
+    hospital_id: Optional[str] = None
+    gender: Optional[str] = None
+
+
+class OwnerUpdateReceptionistBody(BaseModel):
+    full_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    password: Optional[str] = None
+    hospital_id: Optional[str] = None
+    phone: Optional[str] = None
+    mobile: Optional[str] = None
+    doctor_id: Optional[str] = None
+    doctor_name: Optional[str] = None
+    photo: Optional[str] = None
 
 
 class DoctorSelfUpdateBody(BaseModel):
-    """Doctor updates own profile — limited fields."""
+    """Doctor updates own profile."""
     fees: Optional[int] = None
     timings: Optional[str] = None
     bio: Optional[str] = None
     address: Optional[str] = None
     phone: Optional[str] = None
+    mobile: Optional[str] = None
     photo: Optional[str] = None
+    password: Optional[str] = None
     avg_consult_minutes: Optional[int] = None
 
 
+class AddSpecialtyBody(BaseModel):
+    name: str
+
+
+class ReferAppointmentBody(BaseModel):
+    appointment_id: Optional[str] = None
+    to_doctor_id: str
+    reason: Optional[str] = "Referred to specialist"
+
+
+class AutoReferBody(BaseModel):
+    from_doctor_id: str
+    reason: Optional[str] = "Doctor unavailable / Auto-referred"
+
+
 # ============ HELPERS ============
+MAX_PHOTO_BYTES = 5 * 1024 * 1024  # 5 MB limit
+
+def validate_photo_size(photo_str: Optional[str]) -> None:
+    if not photo_str:
+        return
+    if photo_str.startswith("data:") and "," in photo_str:
+        raw_b64 = photo_str.split(",", 1)[1]
+        approx_bytes = (len(raw_b64) * 3) / 4
+        if approx_bytes > MAX_PHOTO_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Photo size ({approx_bytes / (1024*1024):.1f} MB) exceeds maximum allowed limit of 5 MB."
+            )
+    elif len(photo_str.encode('utf-8')) > MAX_PHOTO_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail="Photo size exceeds maximum allowed limit of 5 MB."
+        )
+
+
+def format_clock_time(dt: datetime) -> str:
+    """Format datetime into 12-hour clock format with AM/PM (e.g. 1:00 PM, 10:30 AM)."""
+    hour = dt.strftime("%I").lstrip("0") or "12"
+    minute = dt.strftime("%M")
+    ampm = dt.strftime("%p")
+    return f"{hour}:{minute} {ampm}"
 def hash_password(pw: str) -> str:
     return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
 
@@ -1148,54 +1208,146 @@ async def verify_otp(body: VerifyOTPBody):
     }
 
 
-# ============ DOCTORS ============
-ALL_SPECIALTIES = [
-    "General Physician / Internal Medicine",
+# ============ DOCTORS & SPECIALISTS ============
+STANDARD_SPECIALTIES = [
     "Cardiologist",
+    "Dermatologist",
+    "Endocrinologist",
+    "Gastroenterologist",
+    "General Physician",
+    "General Surgeon",
+    "Gynecologist",
+    "Obstetrician",
     "Neurologist",
     "Neurosurgeon",
-    "Orthopedic",
-    "Gastroenterologist",
     "Nephrologist",
-    "Urologist",
-    "Pulmonologist / Chest Specialist",
-    "Endocrinologist",
-    "Dermatologist / Skin Specialist",
+    "Oncologist",
+    "Ophthalmologist",
+    "Orthopedic Surgeon / Orthopedist",
+    "Otolaryngologist (ENT Specialist)",
+    "Pediatrician",
     "Psychiatrist",
-    "Psychologist",
-    "Pediatrician / Child Specialist",
-    "Gynecologist & Obstetrician",
-    "ENT Specialist",
-    "Ophthalmologist / Eye Specialist",
+    "Pulmonologist",
+    "Radiologist",
+    "Urologist",
+    "Rheumatologist",
+    "Anesthesiologist",
+    "Pathologist",
     "Dentist",
-    "Oncologist / Cancer Specialist",
-    "General Surgeon",
-    "Laparoscopic Surgeon",
-    "Plastic & Reconstructive Surgeon",
+    "Diabetologist",
     "Cardiothoracic Surgeon",
+    "Plastic Surgeon",
     "Vascular Surgeon",
     "Pediatric Surgeon",
-    "Gastrointestinal Surgeon",
-    "Anesthesiologist",
-    "Radiologist",
-    "Pathologist",
-    "Physiotherapist",
-    "Rheumatologist",
-    "Diabetologist",
-    "Hepatologist / Liver Specialist",
+    "Surgical Oncologist",
+    "Medical Oncologist",
+    "Interventional Cardiologist",
+    "Interventional Radiologist",
+    "Critical Care Specialist",
+    "Emergency Medicine Specialist",
+    "Family Medicine Specialist",
     "Infectious Disease Specialist",
+    "Pain Medicine Specialist",
+    "Physical Medicine & Rehabilitation Specialist",
     "Allergy & Immunology Specialist",
-    "Pain Management Specialist",
-    "Fertility / IVF Specialist",
+    "Geriatrician",
     "Neonatologist",
-    "Geriatrician / Elderly Care Specialist",
-    "Emergency Medicine Specialist"
+    "Maternal-Fetal Medicine Specialist",
+    "Reproductive Medicine Specialist",
+    "Fertility Specialist",
+    "Sports Medicine Specialist",
+    "Other"
 ]
+
+ALL_SPECIALTIES = STANDARD_SPECIALTIES
+
+TERMINOLOGY_MAP = {
+    "urology": "Urologist",
+    "cardiology": "Cardiologist",
+    "neurology": "Neurologist",
+    "dermatology": "Dermatologist",
+    "gastroenterology": "Gastroenterologist",
+    "nephrology": "Nephrologist",
+    "oncology": "Oncologist",
+    "ophthalmology": "Ophthalmologist",
+    "pediatrics": "Pediatrician",
+    "psychiatry": "Psychiatrist",
+    "pulmonology": "Pulmonologist",
+    "radiology": "Radiologist",
+    "rheumatology": "Rheumatologist",
+    "orthopedics": "Orthopedic Surgeon / Orthopedist",
+    "orthopedic": "Orthopedic Surgeon / Orthopedist",
+    "ent": "Otolaryngologist (ENT Specialist)",
+    "ent specialist": "Otolaryngologist (ENT Specialist)",
+    "dental": "Dentist",
+    "gynecology": "Gynecologist",
+    "obstetrics": "Obstetrician",
+    "endocrinology": "Endocrinologist",
+    "anesthesiology": "Anesthesiologist",
+    "pathology": "Pathologist",
+    "geriatrics": "Geriatrician",
+    "neonatology": "Neonatologist",
+    "general physician / internal medicine": "General Physician",
+    "dermatologist / skin specialist": "Dermatologist",
+    "pulmonologist / chest specialist": "Pulmonologist",
+    "pediatrician / child specialist": "Pediatrician",
+    "gynecologist & obstetrician": "Gynecologist",
+    "ophthalmologist / eye specialist": "Ophthalmologist",
+    "oncologist / cancer specialist": "Oncologist",
+    "plastic & reconstructive surgeon": "Plastic Surgeon",
+    "pain management specialist": "Pain Medicine Specialist",
+    "fertility / ivf specialist": "Fertility Specialist",
+    "geriatrician / elderly care specialist": "Geriatrician",
+}
+
+
+async def migrate_doctor_specialty_terminology():
+    """Normalize legacy department names to proper specialist terminology."""
+    try:
+        doctors = await db.doctors.find({}, {"id": 1, "specialty": 1}).to_list(1000)
+        for d in doctors:
+            spec = d.get("specialty", "").strip()
+            norm = spec.lower()
+            if norm in TERMINOLOGY_MAP:
+                new_spec = TERMINOLOGY_MAP[norm]
+                await db.doctors.update_one({"id": d["id"]}, {"$set": {"specialty": new_spec}})
+    except Exception as exc:
+        logger.warning("Specialty terminology migration check: %s", exc)
 
 
 @api_router.get("/specialties")
 async def list_specialties():
-    return ALL_SPECIALTIES
+    custom_docs = await db.specialties.find({}, {"_id": 0, "name": 1}).to_list(500)
+    custom_names = [c["name"] for c in custom_docs if c.get("name")]
+    
+    seen = set()
+    result = []
+    for s in STANDARD_SPECIALTIES + custom_names:
+        norm = s.strip().lower()
+        if norm and norm not in seen:
+            seen.add(norm)
+            result.append(s.strip())
+    return result
+
+
+@api_router.post("/specialties")
+@api_router.post("/owner/specialties")
+async def add_specialty(body: AddSpecialtyBody, user: dict = Depends(require_role("owner", "admin"))):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Specialist category name is required")
+    
+    existing_all = await list_specialties()
+    if any(s.lower() == name.lower() for s in existing_all):
+        match = next(s for s in existing_all if s.lower() == name.lower())
+        return {"ok": True, "specialty": match, "message": "Specialist category already exists"}
+    
+    await db.specialties.update_one(
+        {"name": {"$regex": f"^{name}$", "$options": "i"}},
+        {"$setOnInsert": {"id": str(uuid.uuid4()), "name": name, "created_at": now_iso()}},
+        upsert=True
+    )
+    return {"ok": True, "specialty": name, "message": "Specialist category added successfully"}
 
 
 @api_router.get("/doctors")
@@ -1217,14 +1369,13 @@ async def list_doctors(
             {"hospital_id": {"$regex": search, "$options": "i"}},
         ]
     if specialty:
+        # Match specialty or legacy department term
         query["specialty"] = {"$regex": specialty, "$options": "i"}
     if city:
         query["city"] = {"$regex": city, "$options": "i"}
     docs = await db.doctors.find(query, {"_id": 0}).to_list(200)
     if not docs:
         return docs
-    # Batch-fetch pending appointment counts for ALL doctors in one aggregation query
-    # instead of N individual count_documents calls (fixes N+1 problem)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     doctor_ids = [d["id"] for d in docs]
     pipeline = [
@@ -1237,7 +1388,6 @@ async def list_doctors(
     ]
     agg = await db.appointments.aggregate(pipeline).to_list(len(doctor_ids))
     pending_map: Dict[str, int] = {row["_id"]: row["count"] for row in agg}
-    # Attach estimated wait time using each doctor's own avg_consult_minutes (already in docs)
     for d in docs:
         per = int(d.get("avg_consult_minutes") or 15)
         d["est_wait_minutes"] = pending_map.get(d["id"], 0) * per
@@ -1264,20 +1414,6 @@ async def get_doctor(doctor_id: str):
         raise HTTPException(status_code=404, detail="Doctor not found")
     d["est_wait_minutes"] = await estimate_wait_for_doctor(doctor_id)
     return d
-
-
-@api_router.get("/specialties")
-async def specialties():
-    return [
-        {"name": "Cardiology", "icon": "heart"},
-        {"name": "Dental", "icon": "tooth"},
-        {"name": "Dermatology", "icon": "hand"},
-        {"name": "Pediatrics", "icon": "baby"},
-        {"name": "General Physician", "icon": "stethoscope"},
-        {"name": "Orthopedics", "icon": "bone"},
-        {"name": "ENT", "icon": "ear"},
-        {"name": "Ophthalmology", "icon": "eye"},
-    ]
 
 
 # ============ APPOINTMENTS ============
@@ -1341,20 +1477,32 @@ async def queue_status(appt_id: str, user: dict = Depends(get_current_user)):
     else:
         my_position = -1  # done / cancelled
 
+    # Fetch doctor details (avg_consult_minutes, status, full_name)
+    doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "avg_consult_minutes": 1, "status": 1, "full_name": 1})
+    doc_status = (doctor or {}).get("status", "active")
+    per = int((doctor or {}).get("avg_consult_minutes") or 15)
+
     eta_minutes = 0
-    if my_position > 0:
-        # Fetch doctor's avg consult time
-        doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "avg_consult_minutes": 1})
-        per = int((doctor or {}).get("avg_consult_minutes") or 15)
+    expected_turn_time = None
+
+    if my_position == 0 and appt["status"] == "in_consultation":
+        expected_turn_time = "Now"
+    elif my_position > 0:
         eta_minutes = max(0, (my_position - (1 if current else 0))) * per
+        # Local clinic / Indian Standard Time (UTC+5:30)
+        ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+        future_dt = ist_now + timedelta(minutes=eta_minutes)
+        expected_turn_time = format_clock_time(future_dt)
 
     return {
         "appointment": appt,
         "my_position": my_position,
         "eta_minutes": eta_minutes,
+        "expected_turn_time": expected_turn_time,
         "currently_serving": current["token_number"] if current else None,
         "completed_count": completed_count,
         "total_in_queue": len(active),
+        "doctor_status": doc_status,
     }
 
 
@@ -1503,6 +1651,9 @@ async def set_doctor_status(body: DoctorStatusBody, user: dict = Depends(require
     if body.status not in ("active", "paused", "break", "emergency"):
         raise HTTPException(status_code=400, detail="Invalid status")
     await db.doctors.update_one({"user_id": user["id"]}, {"$set": {"status": body.status}})
+    d = await db.doctors.find_one({"user_id": user["id"]}, {"_id": 0, "id": 1})
+    if d:
+        await broadcast_doctor_update(d["id"], "doctor_status_changed")
     return {"ok": True, "status": body.status}
 
 
@@ -1510,6 +1661,116 @@ async def set_doctor_status(body: DoctorStatusBody, user: dict = Depends(require
 async def set_prescription(body: PrescriptionBody, user: dict = Depends(require_role("doctor"))):
     await db.appointments.update_one({"id": body.appointment_id}, {"$set": {"prescription": body.prescription}})
     return {"ok": True}
+
+
+# ============ REFERRAL & QUEUE MANAGEMENT ============
+@api_router.post("/reception/refer")
+@api_router.post("/appointments/{appt_id}/refer")
+async def refer_appointment(
+    body: ReferAppointmentBody,
+    appt_id: Optional[str] = None,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner"))
+):
+    aid = appt_id or body.appointment_id
+    if not aid:
+        raise HTTPException(status_code=400, detail="appointment_id is required")
+    
+    appt = await db.appointments.find_one({"id": aid})
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    
+    to_doctor = await db.doctors.find_one({"id": body.to_doctor_id})
+    if not to_doctor:
+        raise HTTPException(status_code=404, detail="Target doctor not found")
+    
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    new_token = await db.appointments.count_documents({"doctor_id": body.to_doctor_id, "date": today}) + 1
+    
+    old_doctor_id = appt["doctor_id"]
+    updates = {
+        "doctor_id": body.to_doctor_id,
+        "doctor_name": to_doctor["full_name"],
+        "token_number": new_token,
+        "referred_from_doctor_id": old_doctor_id,
+        "referred_reason": body.reason,
+        "status": "arrived",  # Patient is at the clinic ready in new queue
+        "updated_at": now_iso(),
+    }
+    await db.appointments.update_one({"id": aid}, {"$set": updates})
+    
+    await broadcast_doctor_update(old_doctor_id, "referred_out")
+    await broadcast_doctor_update(body.to_doctor_id, "referred_in")
+    await manager.broadcast(f"appt:{aid}", {"type": "referred", "appointment_id": aid, "to_doctor_name": to_doctor["full_name"]})
+    
+    return {"ok": True, "appointment_id": aid, "new_doctor": to_doctor["full_name"], "new_token": new_token}
+
+
+@api_router.post("/reception/auto-refer")
+@api_router.post("/doctor/auto-refer")
+async def auto_refer_queue(body: AutoReferBody, user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner"))):
+    from_doc = await db.doctors.find_one({"id": body.from_doctor_id})
+    if not from_doc:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+    
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    pending_appts = await db.appointments.find({
+        "doctor_id": body.from_doctor_id,
+        "date": today,
+        "status": {"$in": ["booked", "arrived"]}
+    }).to_list(200)
+    
+    if not pending_appts:
+        return {"ok": True, "count": 0, "message": "No pending patients to refer"}
+    
+    # Find alternative active doctors with matching hospital or specialty
+    candidates = await db.doctors.find({
+        "id": {"$ne": body.from_doctor_id},
+        "status": "active",
+        "$or": [
+            {"hospital_id": from_doc.get("hospital_id")},
+            {"specialty": from_doc.get("specialty")}
+        ]
+    }).to_list(100)
+    
+    if not candidates:
+        raise HTTPException(status_code=400, detail="No active alternative doctors available for auto-referment")
+    
+    # Pick doctor with shortest queue
+    doc_counts = []
+    for c in candidates:
+        cnt = await db.appointments.count_documents({
+            "doctor_id": c["id"],
+            "date": today,
+            "status": {"$in": ["booked", "arrived", "in_consultation"]}
+        })
+        doc_counts.append((cnt, c))
+    
+    doc_counts.sort(key=lambda x: x[0])
+    target_doctor = doc_counts[0][1]
+    
+    referred_count = 0
+    for appt in pending_appts:
+        new_token = await db.appointments.count_documents({"doctor_id": target_doctor["id"], "date": today}) + 1
+        await db.appointments.update_one({"id": appt["id"]}, {"$set": {
+            "doctor_id": target_doctor["id"],
+            "doctor_name": target_doctor["full_name"],
+            "token_number": new_token,
+            "referred_from_doctor_id": body.from_doctor_id,
+            "referred_reason": body.reason,
+            "updated_at": now_iso(),
+        }})
+        await manager.broadcast(f"appt:{appt['id']}", {"type": "referred", "appointment_id": appt["id"], "to_doctor_name": target_doctor["full_name"]})
+        referred_count += 1
+    
+    await broadcast_doctor_update(body.from_doctor_id, "auto_referred")
+    await broadcast_doctor_update(target_doctor["id"], "auto_referred")
+    
+    return {
+        "ok": True,
+        "count": referred_count,
+        "target_doctor": target_doctor["full_name"],
+        "message": f"Successfully auto-referred {referred_count} patients to Dr. {target_doctor['full_name']}"
+    }
 
 
 # ============ RECEPTIONIST endpoints ============
@@ -1756,13 +2017,23 @@ async def doctor_update_profile(body: DoctorSelfUpdateBody, user: dict = Depends
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
         return {"ok": True, "message": "No changes"}
-    await db.doctors.update_one({"user_id": user["id"]}, {"$set": updates})
+    
+    if "photo" in updates and updates["photo"]:
+        validate_photo_size(updates["photo"])
+    
+    password_val = updates.pop("password", None)
+    if password_val and password_val.strip():
+        await db.users.update_one({"id": user["id"]}, {"$set": {"password_hash": hash_password(password_val.strip())}})
+    
+    if updates:
+        await db.doctors.update_one({"user_id": user["id"]}, {"$set": updates})
+    
     # If wait-time-affecting fields changed, broadcast to patients so their ETA refreshes live
     if "avg_consult_minutes" in updates or "timings" in updates or "fees" in updates:
         d = await db.doctors.find_one({"user_id": user["id"]}, {"_id": 0, "id": 1})
         if d:
             await broadcast_doctor_update(d["id"], "doctor_profile_updated")
-    return {"ok": True, "updated": list(updates.keys())}
+    return {"ok": True, "updated": list(updates.keys()) + (["password"] if password_val else [])}
 
 
 # ============ OWNER ENDPOINTS ============
@@ -1822,6 +2093,13 @@ async def owner_add_doctor(body: OwnerAddDoctorBody, user: dict = Depends(requir
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
+    if body.photo:
+        validate_photo_size(body.photo)
+    if body.id_proof_photo:
+        validate_photo_size(body.id_proof_photo)
+    if body.degree_photo:
+        validate_photo_size(body.degree_photo)
+
     hid = (body.hospital_id or "H00001").strip().upper()
     user_id = str(uuid.uuid4())
     await db.users.insert_one({
@@ -1875,19 +2153,54 @@ async def owner_add_doctor(body: OwnerAddDoctorBody, user: dict = Depends(requir
 
 @api_router.put("/owner/doctors/{doctor_id}")
 async def owner_update_doctor(doctor_id: str, body: OwnerUpdateDoctorBody, user: dict = Depends(require_role("owner", "admin"))):
+    doc_id = doctor_id.strip()
+    d = await db.doctors.find_one({"$or": [{"id": doc_id}, {"user_id": doc_id}]})
+    if not d:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
         return {"ok": True}
-    await db.doctors.update_one({"id": doctor_id}, {"$set": updates})
-    # Also sync full_name to user record
+
+    if "photo" in updates and updates["photo"]:
+        validate_photo_size(updates["photo"])
+    if "id_proof_photo" in updates and updates["id_proof_photo"]:
+        validate_photo_size(updates["id_proof_photo"])
+    if "degree_photo" in updates and updates["degree_photo"]:
+        validate_photo_size(updates["degree_photo"])
+
+    password_val = updates.pop("password", None)
+    user_updates = {}
+    if password_val and password_val.strip():
+        user_updates["password_hash"] = hash_password(password_val.strip())
     if "full_name" in updates:
-        d = await db.doctors.find_one({"id": doctor_id})
-        if d:
-            await db.users.update_one({"id": d["user_id"]}, {"$set": {"full_name": updates["full_name"]}})
+        user_updates["full_name"] = updates["full_name"]
+    if "email" in updates and updates["email"]:
+        user_updates["email"] = updates["email"].lower()
+    if "hospital_id" in updates and updates["hospital_id"]:
+        updates["hospital_id"] = updates["hospital_id"].strip().upper()
+        user_updates["hospital_id"] = updates["hospital_id"]
+    if "gender" in updates and updates["gender"]:
+        user_updates["gender"] = updates["gender"]
+    if "phone" in updates:
+        user_updates["phone"] = updates["phone"]
+        user_updates["mobile"] = updates["phone"]
+    if "mobile" in updates:
+        user_updates["mobile"] = updates["mobile"]
+        user_updates["phone"] = updates["mobile"]
+
+    if user_updates:
+        await db.users.update_one({"id": d["user_id"]}, {"$set": user_updates})
+
+    if updates:
+        await db.doctors.update_one({"id": d["id"]}, {"$set": updates})
+
     # Broadcast if wait-time-affecting field changed
     if "avg_consult_minutes" in updates or "timings" in updates or "fees" in updates or "status" in updates:
-        await broadcast_doctor_update(doctor_id, "doctor_profile_updated")
-    return {"ok": True, "updated": list(updates.keys())}
+        await broadcast_doctor_update(d["id"], "doctor_profile_updated")
+
+    await audit(user["id"], "owner.update_doctor", target=d["id"])
+    return {"ok": True, "updated": list(updates.keys()) + (["password"] if password_val else [])}
 
 
 @api_router.delete("/owner/doctors/{doctor_id}")
@@ -2052,6 +2365,47 @@ async def owner_list_receptionists(user: dict = Depends(require_role("owner", "a
     return recs
 
 
+@api_router.put("/owner/receptionists/{receptionist_id}")
+@api_router.put("/api/owner/receptionists/{receptionist_id}")
+async def owner_update_receptionist(receptionist_id: str, body: OwnerUpdateReceptionistBody, user: dict = Depends(require_role("owner", "admin"))):
+    rec_id = receptionist_id.strip()
+    r = await db.users.find_one({"$or": [{"id": rec_id}, {"email": rec_id.lower()}], "role": "receptionist"})
+    if not r:
+        raise HTTPException(status_code=404, detail="Receptionist not found")
+
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        return {"ok": True}
+
+    if "photo" in updates and updates["photo"]:
+        validate_photo_size(updates["photo"])
+
+    password_val = updates.pop("password", None)
+    if password_val and password_val.strip():
+        updates["password_hash"] = hash_password(password_val.strip())
+
+    if "email" in updates and updates["email"]:
+        updates["email"] = updates["email"].lower()
+    if "hospital_id" in updates and updates["hospital_id"]:
+        updates["hospital_id"] = updates["hospital_id"].strip().upper()
+    if "phone" in updates:
+        updates["mobile"] = updates["phone"]
+    if "mobile" in updates:
+        updates["phone"] = updates["mobile"]
+
+    if "doctor_id" in updates:
+        if updates["doctor_id"]:
+            doc = await db.doctors.find_one({"id": updates["doctor_id"]})
+            updates["doctor_name"] = doc.get("full_name") if doc else None
+        else:
+            updates["doctor_id"] = None
+            updates["doctor_name"] = None
+
+    await db.users.update_one({"id": r["id"]}, {"$set": updates})
+    await audit(user["id"], "owner.update_receptionist", target=r["id"])
+    return {"ok": True, "updated": list(updates.keys()) + (["password"] if password_val else [])}
+
+
 @api_router.delete("/owner/receptionists/{receptionist_id}")
 @api_router.delete("/api/owner/receptionists/{receptionist_id}")
 async def owner_delete_receptionist(receptionist_id: str, user: dict = Depends(require_role("owner", "admin"))):
@@ -2148,12 +2502,15 @@ async def doctor_delete_receptionist(receptionist_id: str, user: dict = Depends(
 # ============ SEED ============
 @app.on_event("startup")
 async def seed_data():
-    logger.info("Initializing Admin user...")
+    logger.info("Initializing Admin user & database migrations...")
     try:
         await client.admin.command("ping")
     except Exception as exc:
         logger.warning("Skipping admin setup because MongoDB is unavailable: %s", exc)
         return
+
+    # Run doctor specialist terminology normalization
+    await migrate_doctor_specialty_terminology()
 
     # Seed Admin User (ranjeet7421@gmail.com, H00001)
     admin_email = "ranjeet7421@gmail.com"
@@ -2184,7 +2541,7 @@ async def seed_data():
             }}
         )
 
-    logger.info("Admin user verified.")
+    logger.info("Admin user verified and specialties terminology migrated.")
 
 
 app.include_router(api_router)
