@@ -68,7 +68,7 @@ export default function BookAppointment() {
             <Text style={styles.successMeta}>Date: {success.date} · Token #{success.token_number}</Text>
           </View>
           <Pressable testID="view-queue-btn" onPress={() => router.replace("/patient/queue")} style={styles.primaryBtn}>
-            <Text style={styles.primaryBtnText}>View Live Queue</Text>
+            <Text style={styles.primaryBtnText}>अपनी बारी देखे</Text>
           </Pressable>
           <Pressable onPress={() => router.replace("/patient/home")} style={styles.linkBtn}>
             <Text style={{ color: colors.muted }}>Back to home</Text>
