@@ -120,7 +120,7 @@ export default function PatientHome() {
       >
         <View style={styles.header}>
           <View style={{ flex: 1 }}>
-            <Text style={styles.hello}>Namaste 👋</Text>
+            <Text style={styles.hello}>Namaste!</Text>
             <Text style={styles.name} testID="patient-name">{user?.full_name}</Text>
           </View>
           <Pressable onPress={async () => { await signOut(); router.replace("/login"); }} testID="logout-button" style={styles.iconBtn}>
@@ -154,7 +154,7 @@ export default function PatientHome() {
               <Text style={styles.upcomingName}>{upcoming.doctor_name}</Text>
               <Text style={styles.upcomingMeta}>Token #{upcoming.token_number} · {upcoming.slot}</Text>
               <View style={styles.upcomingCta}>
-                <Text style={styles.upcomingCtaText}>View live queue</Text>
+                <Text style={styles.upcomingCtaText}>अपनी बारी देखे</Text>
                 <Ionicons name="arrow-forward" size={16} color={colors.onBrandPrimary} />
               </View>
             </LinearGradient>
