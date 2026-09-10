@@ -3,6 +3,7 @@ import { View, Text, TextInput, Pressable, StyleSheet, KeyboardAvoidingView, Pla
 import { useRouter, useLocalSearchParams } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { api } from "@/src/api/client";
+import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { isFirebaseConfigured, sendFirebasePhoneOtp } from "@/src/firebase";
@@ -10,6 +11,7 @@ import { isFirebaseConfigured, sendFirebasePhoneOtp } from "@/src/firebase";
 export default function Login() {
   const router = useRouter();
   const params = useLocalSearchParams<{ redirect?: string }>();
+  const { signIn } = useAuth();
 
   const [mobile, setMobile] = useState("");
   const [sendingOtp, setSendingOtp] = useState(false);
@@ -34,18 +36,35 @@ export default function Login() {
         otpParams.redirect = params.redirect;
       }
 
+      // Check with backend for direct login or OTP dispatch
+      const res = await api.post("/auth/send-otp", { mobile: clean });
+
+      // Returning User Direct Login:
+      // If the number was previously verified with OTP and the account exists,
+      // log in directly and navigate straight to the dashboard.
+      if (res.direct_login && res.access_token && res.user) {
+        await signIn(res.access_token, res.user);
+        if (params.redirect) {
+          router.replace(params.redirect as any);
+        } else {
+          router.replace("/patient/home" as any);
+        }
+        return;
+      }
+
+      // First-time user / unverified: route to OTP screen
       if (isFirebaseConfigured()) {
         await sendFirebasePhoneOtp(fullNumber);
+        otpParams.use_firebase = "1";
         router.push({ pathname: "/otp", params: otpParams } as any);
       } else {
-        const res = await api.post("/auth/send-otp", { mobile: clean });
         otpParams.mobile = res.mobile;
         otpParams.is_registered = res.is_registered ? "1" : "0";
         otpParams.use_firebase = "0";
         router.push({ pathname: "/otp", params: otpParams } as any);
       }
     } catch (e: any) {
-      setError(e.message || "Failed to send OTP");
+      setError(e.message || "Failed to log in");
     } finally {
       setSendingOtp(false);
     }
@@ -64,7 +83,7 @@ export default function Login() {
 
           <View style={styles.card}>
             <Text style={styles.title}>Login with Mobile</Text>
-            <Text style={styles.subtitle}>We&apos;ll send an OTP to verify your number</Text>
+            <Text style={styles.subtitle}>Direct login for registered patients · OTP for new users</Text>
 
             <Text style={styles.label}>Mobile Number</Text>
             <View style={styles.mobileWrap}>
@@ -84,12 +103,12 @@ export default function Login() {
             {error ? <Text testID="login-error" style={styles.error}>{error}</Text> : null}
 
             <Pressable testID="send-otp-btn" onPress={onSendOtp} disabled={sendingOtp} style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }]}>
-              {sendingOtp ? <ActivityIndicator color={colors.onBrandPrimary} /> : <Text style={styles.primaryBtnText}>Send OTP</Text>}
+              {sendingOtp ? <ActivityIndicator color={colors.onBrandPrimary} /> : <Text style={styles.primaryBtnText}>Continue</Text>}
             </Pressable>
 
             <View style={styles.hintBox}>
               <Ionicons name="information-circle" size={16} color={colors.brandPrimary} />
-              <Text style={styles.hintText}>New here? Just enter your mobile — we&apos;ll set up your profile after OTP.</Text>
+              <Text style={styles.hintText}>New here? Enter your mobile — we&apos;ll verify via OTP. Registered patients log in instantly!</Text>
             </View>
           </View>
 

@@ -66,7 +66,37 @@ client = AsyncIOMotorClient(
     serverSelectionTimeoutMS=2000,
     connectTimeoutMS=2000,
 )
-db = client[os.environ["DB_NAME"]]
+
+def get_database():
+    global client
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    try:
+        motor_loop = client.get_io_loop()
+        if motor_loop.is_closed() or (current_loop and motor_loop != current_loop):
+            client = AsyncIOMotorClient(
+                mongo_url,
+                serverSelectionTimeoutMS=2000,
+                connectTimeoutMS=2000,
+            )
+    except Exception:
+        client = AsyncIOMotorClient(
+            mongo_url,
+            serverSelectionTimeoutMS=2000,
+            connectTimeoutMS=2000,
+        )
+    return client[os.environ["DB_NAME"]]
+
+class _DatabaseProxy:
+    def __getattr__(self, name: str):
+        return getattr(get_database(), name)
+    def __getitem__(self, name: str):
+        return get_database()[name]
+
+db = _DatabaseProxy()
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "clinicqueue-secret-key-change-in-prod")
 JWT_ALGORITHM = "HS256"
@@ -309,6 +339,7 @@ class PrescriptionBody(BaseModel):
 # ---- Mobile OTP Auth models ----
 class SendOTPBody(BaseModel):
     mobile: str
+    force_otp: Optional[bool] = False
 
 
 class VerifyOTPBody(BaseModel):
@@ -1255,15 +1286,49 @@ async def send_otp(request: Request, body: SendOTPBody):
     mobile = normalize_mobile(body.mobile)
     if not mobile or len(mobile) < 10:
         raise HTTPException(status_code=400, detail="Enter a valid mobile number")
+
+    existing = await db.users.find_one({"mobile": mobile, "deleted": {"$ne": True}})
+
+    # Returning Patient Direct Login:
+    # If the user previously verified their phone with OTP and their account is created,
+    # allow direct login without verification unless force_otp is explicitly requested.
+    if existing and existing.get("phone_verified") is True and not body.force_otp:
+        token = create_token(existing["id"], existing.get("role", "patient"))
+        await audit(existing["id"], "user.login", target=existing["id"], meta={"role": existing.get("role", "patient"), "method": "direct_mobile"})
+
+        # Also generate in-memory OTP to keep secondary test verifications or legacy flows non-breaking
+        otp = f"{secrets.randbelow(900000) + 100000}"
+        save_memory_otp(mobile, otp, OTP_EXP_SECONDS)
+
+        return {
+            "ok": True,
+            "mobile": mobile,
+            "is_registered": True,
+            "direct_login": True,
+            "access_token": token,
+            "user": {
+                "id": existing["id"],
+                "email": existing.get("email"),
+                "mobile": existing.get("mobile"),
+                "full_name": existing.get("full_name", "Patient"),
+                "role": existing.get("role", "patient"),
+                "phone": existing.get("phone", existing.get("mobile")),
+                "phone_verified": True,
+                "age": existing.get("age"),
+                "gender": existing.get("gender"),
+                "address": existing.get("address"),
+            },
+            "privacy_notice_version": PRIVACY_NOTICE_VERSION,
+            "message": "Welcome back! Logged in directly.",
+        }
+
+    # First-Time User or Forced OTP Resend:
     # Rate limit: safe sliding-window IP and Phone protection
     enforce_send_otp_rate_limit(request, mobile)
     await enforce_otp_rate_limit(mobile)
     
     # Generate 6-digit secure cryptographic OTP
     otp = f"{secrets.randbelow(900000) + 100000}"
-    otp_hash = hash_otp(otp, mobile)
-    
-    # Store OTP in-memory only (never in MongoDB)
     save_memory_otp(mobile, otp, OTP_EXP_SECONDS)
     
     # Deliver OTP via Renflair Transactional SMS V1
@@ -1275,11 +1340,11 @@ async def send_otp(request: Request, body: SendOTPBody):
         logger.warning(f"OTP SMS delivery error (non-blocking): {e}")
     
     # Plaintext OTP is NEVER logged or exposed in API response
-    existing = await db.users.find_one({"mobile": mobile})
     return {
         "ok": True,
         "mobile": mobile,
         "is_registered": bool(existing),
+        "direct_login": False,
         "privacy_notice_version": PRIVACY_NOTICE_VERSION,
         "message": f"OTP sent to {mobile} via SMS.",
     }
@@ -3004,4 +3069,5 @@ app.add_middleware(
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    if "pytest" not in sys.modules and os.environ.get("TESTING") != "1":
+        client.close()

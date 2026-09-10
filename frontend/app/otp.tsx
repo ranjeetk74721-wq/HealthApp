@@ -120,7 +120,7 @@ export default function OtpScreen() {
         await sendFirebasePhoneOtp(mobile);
       } else {
         const normalizedMobile = mobile.replace(/[^0-9+]/g, "");
-        await api.post("/auth/send-otp", { mobile: normalizedMobile });
+        await api.post("/auth/send-otp", { mobile: normalizedMobile, force_otp: true });
       }
     } catch (e: any) {
       setError(e.message);
