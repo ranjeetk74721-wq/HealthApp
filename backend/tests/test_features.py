@@ -6,6 +6,13 @@ import pytest
 import pymongo
 from datetime import datetime, timezone, timedelta
 from starlette.testclient import TestClient
+import sys
+from pathlib import Path
+
+# Ensure backend directory is in sys.path
+_backend_dir = str(Path(__file__).resolve().parent.parent)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
 
 from server import app, hash_otp, normalize_mobile, create_token, save_memory_otp
 from rate_limiter import rate_limiter

@@ -19,15 +19,36 @@ from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
 import json
-from sms_service import send_appointment_sms, send_otp_sms, get_app_public_url
-from rate_limiter import (
-    enforce_booking_rate_limit,
-    enforce_send_otp_rate_limit,
-    enforce_verify_otp_rate_limit,
-    enforce_send_sms_cooldown,
-    enforce_general_ip_rate_limit,
-    get_client_ip,
-)
+import sys
+
+# Ensure backend directory is in sys.path for local and external module resolution
+_backend_dir = str(Path(__file__).resolve().parent)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+
+try:
+    from sms_service import send_appointment_sms, send_otp_sms, get_app_public_url, format_renflair_hour
+except ImportError:
+    from backend.sms_service import send_appointment_sms, send_otp_sms, get_app_public_url, format_renflair_hour
+
+try:
+    from rate_limiter import (
+        enforce_booking_rate_limit,
+        enforce_send_otp_rate_limit,
+        enforce_verify_otp_rate_limit,
+        enforce_send_sms_cooldown,
+        enforce_general_ip_rate_limit,
+        get_client_ip,
+    )
+except ImportError:
+    from backend.rate_limiter import (
+        enforce_booking_rate_limit,
+        enforce_send_otp_rate_limit,
+        enforce_verify_otp_rate_limit,
+        enforce_send_sms_cooldown,
+        enforce_general_ip_rate_limit,
+        get_client_ip,
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1169,9 +1190,11 @@ async def send_otp(request: Request, body: SendOTPBody):
     # Store OTP in-memory only (never in MongoDB)
     save_memory_otp(mobile, otp, OTP_EXP_SECONDS)
     
-    # Deliver OTP via Brevo Transactional SMS
+    # Deliver OTP via Renflair Transactional SMS V1
     try:
-        await send_otp_sms(mobile, otp)
+        sms_res = await send_otp_sms(mobile, otp)
+        if not sms_res.get("ok"):
+            logger.warning(f"Renflair OTP SMS failed (non-blocking): {sms_res.get('error')}")
     except Exception as e:
         logger.warning(f"OTP SMS delivery error (non-blocking): {e}")
     
@@ -1620,13 +1643,16 @@ async def create_appointment(
             detail="You already have an active appointment for this doctor/session."
         )
 
-    # Calculate latest ETA and trigger Brevo transactional SMS
+    # Calculate latest ETA and trigger Renflair V7 transactional SMS
     if patient_mobile:
         eta_data = await calculate_appointment_eta(doc)
         dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
+        hour_val = format_renflair_hour(eta_data.get("expected_turn_time") or doc.get("slot"), default="2")
         try:
             sms_res = await send_appointment_sms(
                 phone=patient_mobile,
+                oid=token_number,
+                hour=hour_val,
                 patient_name=user["full_name"],
                 doctor_name=doctor["full_name"],
                 token_number=token_number,
@@ -2176,12 +2202,15 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
                 detail="This patient already has an active appointment for today."
             )
 
-        # Trigger Brevo Transactional SMS
+        # Trigger Renflair Transactional SMS V7
         eta_data = await calculate_appointment_eta(appt)
         dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
+        hour_val = format_renflair_hour(eta_data.get("expected_turn_time") or appt.get("slot"), default="2")
         try:
             sms_res = await send_appointment_sms(
                 phone=mobile,
+                oid=appt["token_number"],
+                hour=hour_val,
                 patient_name=patient_name,
                 doctor_name=doctor["full_name"],
                 token_number=appt["token_number"],
@@ -2238,9 +2267,12 @@ async def reception_send_appointment_link(
     # Fetch latest ETA using existing queue logic
     eta_data = await calculate_appointment_eta(appt)
     dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
+    hour_val = format_renflair_hour(eta_data.get("expected_turn_time") or appt.get("slot"), default="2")
 
     sms_res = await send_appointment_sms(
         phone=mobile,
+        oid=appt.get("token_number", 1),
+        hour=hour_val,
         patient_name=appt.get("patient_name", "Patient"),
         doctor_name=appt.get("doctor_name", "Doctor"),
         token_number=appt.get("token_number", 1),
