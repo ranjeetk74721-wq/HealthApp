@@ -148,6 +148,17 @@ export default function ReceptionistDashboard() {
     try { await api.post(path, { appointment_id: appt_id }); load(true); } catch { /* ignore */ }
   };
 
+  const sendAppointmentLink = async (appt: any) => {
+    try {
+      await api.post(`/reception/appointments/${appt.id}/send-link`, {});
+      setAddToast(`Link sent to ${appt.patient_mobile || "patient"}`);
+      setTimeout(() => setAddToast(null), 3500);
+    } catch (err: any) {
+      setAddToast(err.message || "Could not send link");
+      setTimeout(() => setAddToast(null), 3500);
+    }
+  };
+
   const insertEmergency = async () => {
     if (!selectedDoc) return;
     try {
@@ -304,6 +315,15 @@ export default function ReceptionistDashboard() {
                 {a.symptoms ? <Text style={styles.symptoms} numberOfLines={1}>💊 {a.symptoms}</Text> : null}
               </View>
               <View style={styles.actionsRow}>
+                {a.patient_mobile ? (
+                  <Pressable
+                    testID={`action-send-link-${a.id}`}
+                    onPress={() => sendAppointmentLink(a)}
+                    style={[styles.actBtn, { backgroundColor: colors.brandSecondary }]}
+                  >
+                    <Ionicons name="send" size={15} color={colors.brandPrimary} />
+                  </Pressable>
+                ) : null}
                 {doctors.length > 1 && a.status !== "completed" && (
                   <Pressable testID={`action-refer-${a.id}`} onPress={() => openReferModal(a)} style={[styles.actBtn, { backgroundColor: colors.surfaceSecondary, borderWidth: 1, borderColor: colors.border }]}>
                     <Ionicons name="swap-horizontal" size={16} color={colors.brandPrimary} />

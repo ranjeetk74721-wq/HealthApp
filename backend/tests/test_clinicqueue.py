@@ -1,8 +1,11 @@
 import os
 import time
 import uuid
+from datetime import datetime, timezone, timedelta
 import pytest
 import requests
+import pymongo
+from server import hash_otp, normalize_mobile
 
 BASE_URL = os.environ.get("BACKEND_TEST_URL", "http://127.0.0.1:8000").rstrip("/")
 API = f"{BASE_URL}/api"
@@ -11,6 +14,24 @@ RECEPTION_EMAIL = "reception@clinic.com"
 RECEPTION_PASSWORD = "reception123"
 DOCTOR_EMAIL = "drrajeshkumar@clinic.com"
 DOCTOR_PASSWORD = "doctor123"
+
+sync_client = pymongo.MongoClient(os.environ.get("MONGO_URL", "mongodb://localhost:27017"))
+sync_db = sync_client[os.environ.get("DB_NAME", "clinicqueue")]
+
+def set_test_otp(mobile: str, otp: str = "654321", expires_in_sec: int = 300):
+    norm = normalize_mobile(mobile)
+    exp = (datetime.now(timezone.utc) + timedelta(seconds=expires_in_sec)).isoformat()
+    sync_db.otps.update_one(
+        {"mobile": norm},
+        {"$set": {
+            "mobile": norm,
+            "otp_hash": hash_otp(otp, norm),
+            "expires_at": exp,
+            "attempts": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }},
+        upsert=True
+    )
 
 
 @pytest.fixture(scope="module")
@@ -187,11 +208,14 @@ class TestAppointmentFlow:
         self._shared["appt"] = appt
         self._shared["doctor_id"] = doc["id"]
 
-    def test_online_payment_marks_paid(self, s, patient_ctx):
+    def test_online_payment_marks_paid(self, s):
+        p = s.post(f"{API}/auth/signup", json={
+            "email": f"TEST_online_{uuid.uuid4().hex[:6]}@example.com", "password": "pass123", "full_name": "Online Payee", "role": "patient"
+        }).json()
         doctors = s.get(f"{API}/doctors").json()
         doc = doctors[1]
         today = time.strftime("%Y-%m-%d")
-        r = s.post(f"{API}/appointments", headers=h(patient_ctx["token"]), json={
+        r = s.post(f"{API}/appointments", headers=h(p["access_token"]), json={
             "doctor_id": doc["id"], "date": today, "slot": "11:00 AM", "payment_method": "online"
         })
         assert r.status_code == 200
@@ -234,14 +258,17 @@ class TestAppointmentFlow:
         assert q2["completed_count"] >= 1
         assert q2["my_position"] == -1
 
-    def test_cancel_appointment(self, s, patient_ctx):
+    def test_cancel_appointment(self, s):
+        p = s.post(f"{API}/auth/signup", json={
+            "email": f"TEST_cancel_{uuid.uuid4().hex[:6]}@example.com", "password": "pass123", "full_name": "Cancel User", "role": "patient"
+        }).json()
         doctors = s.get(f"{API}/doctors").json()
         today = time.strftime("%Y-%m-%d")
-        r = s.post(f"{API}/appointments", headers=h(patient_ctx["token"]), json={
+        r = s.post(f"{API}/appointments", headers=h(p["access_token"]), json={
             "doctor_id": doctors[2]["id"], "date": today, "slot": "2:00 PM", "payment_method": "pay_at_clinic"
         })
         aid = r.json()["id"]
-        r = s.post(f"{API}/appointments/{aid}/cancel", headers=h(patient_ctx["token"]))
+        r = s.post(f"{API}/appointments/{aid}/cancel", headers=h(p["access_token"]))
         assert r.status_code == 200
 
 
@@ -329,7 +356,7 @@ class TestQueueUpdatesOtherPatients:
 class TestMobileOTP:
     _shared = {}
 
-    def test_send_otp_normalizes_and_returns_dev_otp(self, s):
+    def test_send_otp_success_no_plaintext_otp_exposure(self, s):
         mobile_raw = f"98765{str(uuid.uuid4().int)[:5]}"[:10]  # random 10-digit
         r = s.post(f"{API}/auth/send-otp", json={"mobile": mobile_raw})
         assert r.status_code == 200, r.text
@@ -337,10 +364,11 @@ class TestMobileOTP:
         assert data["ok"] is True
         assert data["mobile"].startswith("+91"), f"expected +91 prefix, got {data['mobile']}"
         assert data["mobile"].endswith(mobile_raw)
-        assert "dev_otp" in data and len(data["dev_otp"]) == 6
+        # CRITICAL: OTP must never be returned in plaintext through the API
+        assert "otp" not in data
+        assert "dev_otp" not in data
         assert data["is_registered"] is False
         self.__class__._shared["mobile_new"] = mobile_raw
-        self.__class__._shared["dev_otp_new"] = data["dev_otp"]
 
     def test_send_otp_bad_mobile(self, s):
         r = s.post(f"{API}/auth/send-otp", json={"mobile": "123"})
@@ -353,16 +381,37 @@ class TestMobileOTP:
         assert r.status_code == 200
         assert r.json()["mobile"] == f"+91{num}"
 
+    def test_verify_otp_invalid_format(self, s):
+        mobile = self._shared["mobile_new"]
+        r = s.post(f"{API}/auth/verify-otp", json={"mobile": mobile, "otp": "12"})
+        assert r.status_code == 400
+
+    def test_verify_otp_wrong_otp(self, s):
+        mobile = self._shared["mobile_new"]
+        s.post(f"{API}/auth/send-otp", json={"mobile": mobile})
+        r = s.post(f"{API}/auth/verify-otp", json={"mobile": mobile, "otp": "000000"})
+        assert r.status_code == 401
+        assert "Invalid OTP" in r.json()["detail"]
+
+    def test_verify_otp_expired_otp(self, s):
+        mobile = f"98765{str(uuid.uuid4().int)[:5]}"[:10]
+        set_test_otp(mobile, otp="999888", expires_in_sec=-10)  # expired 10s ago
+        r = s.post(f"{API}/auth/verify-otp", json={"mobile": mobile, "otp": "999888", "full_name": "Expired Test"})
+        assert r.status_code == 401
+        assert "expired" in r.json()["detail"].lower()
+
     def test_verify_otp_new_patient_requires_name(self, s):
         mobile = self._shared["mobile_new"]
-        r = s.post(f"{API}/auth/verify-otp", json={"mobile": mobile, "otp": "123456"})
+        set_test_otp(mobile, otp="654321")
+        r = s.post(f"{API}/auth/verify-otp", json={"mobile": mobile, "otp": "654321"})
         assert r.status_code == 400
         assert "name" in r.json()["detail"].lower()
 
-    def test_verify_otp_universal_creates_patient(self, s):
+    def test_verify_otp_valid_creates_patient(self, s):
         mobile = self._shared["mobile_new"]
+        set_test_otp(mobile, otp="654321")
         r = s.post(f"{API}/auth/verify-otp", json={
-            "mobile": mobile, "otp": "123456",
+            "mobile": mobile, "otp": "654321",
             "full_name": "TEST OTP User", "age": 28, "gender": "Male", "address": "TEST addr",
         })
         assert r.status_code == 200, r.text
@@ -377,28 +426,13 @@ class TestMobileOTP:
 
     def test_verify_otp_second_login_existing_no_name_needed(self, s):
         mobile = self._shared["mobile_new"]
-        # existing user should now come back
+        # existing user should now come back as registered
         r = s.post(f"{API}/auth/send-otp", json={"mobile": mobile})
         assert r.json()["is_registered"] is True
-        r2 = s.post(f"{API}/auth/verify-otp", json={"mobile": mobile, "otp": "123456"})
+        set_test_otp(mobile, otp="112233")
+        r2 = s.post(f"{API}/auth/verify-otp", json={"mobile": mobile, "otp": "112233"})
         assert r2.status_code == 200
         assert r2.json()["user"]["full_name"] == "TEST OTP User"
-
-    def test_verify_otp_wrong_otp(self, s):
-        mobile = self._shared["mobile_new"]
-        s.post(f"{API}/auth/send-otp", json={"mobile": mobile})
-        r = s.post(f"{API}/auth/verify-otp", json={"mobile": mobile, "otp": "000000"})
-        assert r.status_code == 401
-
-    def test_verify_otp_stored_dev_otp_works(self, s):
-        # Fresh mobile so stored otp is fresh
-        num = f"98765{str(uuid.uuid4().int)[:5]}"[:10]
-        r = s.post(f"{API}/auth/send-otp", json={"mobile": num})
-        stored = r.json()["dev_otp"]
-        r2 = s.post(f"{API}/auth/verify-otp", json={
-            "mobile": num, "otp": stored, "full_name": "TEST OTP Stored"
-        })
-        assert r2.status_code == 200
 
 
 # ---------------- RECEPTION Add Patient ----------------
@@ -461,6 +495,7 @@ class TestReceptionAddPatient:
         r = s.post(f"{API}/auth/send-otp", json={"mobile": num})
         assert r.status_code == 200
         assert r.json()["is_registered"] is True, "receptionist-added patient should be marked registered"
+        set_test_otp(num, otp="123456")
         r2 = s.post(f"{API}/auth/verify-otp", json={"mobile": num, "otp": "123456"})
         assert r2.status_code == 200
         user = r2.json()["user"]
@@ -696,13 +731,16 @@ class TestDoctorSelfUpdate:
 
 # ---------------- PREDICTABLE FUTURE CLOCK TIME ETA & REFERRAL ----------------
 class TestQueueETAAndReferral:
-    def test_queue_status_returns_predictable_clock_time(self, s, patient_ctx, reception_token):
+    def test_queue_status_returns_predictable_clock_time(self, s, reception_token):
+        p = s.post(f"{API}/auth/signup", json={
+            "email": f"TEST_eta_{uuid.uuid4().hex[:6]}@example.com", "password": "pass123", "full_name": "ETA User", "role": "patient"
+        }).json()
         doctors = s.get(f"{API}/doctors").json()
         did = doctors[0]["id"]
         today = time.strftime("%Y-%m-%d")
 
         # Book appointment
-        r_book = s.post(f"{API}/appointments", headers=h(patient_ctx["token"]), json={
+        r_book = s.post(f"{API}/appointments", headers=h(p["access_token"]), json={
             "doctor_id": did,
             "date": today,
             "slot": "Token Booking",
@@ -712,7 +750,7 @@ class TestQueueETAAndReferral:
         appt_id = r_book.json()["id"]
 
         # Check queue status
-        r_q = s.get(f"{API}/appointments/{appt_id}/queue", headers=h(patient_ctx["token"]))
+        r_q = s.get(f"{API}/appointments/{appt_id}/queue", headers=h(p["access_token"]))
         assert r_q.status_code == 200
         qdata = r_q.json()
         assert "expected_turn_time" in qdata
@@ -721,14 +759,17 @@ class TestQueueETAAndReferral:
         # Format should be like "1:00 PM", "10:30 AM", or "Now"
         assert any(ap in turn_time for ap in ["AM", "PM", "Now"])
 
-    def test_refer_appointment_to_another_doctor(self, s, patient_ctx, reception_token):
+    def test_refer_appointment_to_another_doctor(self, s, reception_token):
+        p = s.post(f"{API}/auth/signup", json={
+            "email": f"TEST_refer_{uuid.uuid4().hex[:6]}@example.com", "password": "pass123", "full_name": "Refer User", "role": "patient"
+        }).json()
         doctors = s.get(f"{API}/doctors").json()
         assert len(doctors) >= 2
         d1 = doctors[0]["id"]
         d2 = doctors[1]["id"]
         today = time.strftime("%Y-%m-%d")
 
-        r_book = s.post(f"{API}/appointments", headers=h(patient_ctx["token"]), json={
+        r_book = s.post(f"{API}/appointments", headers=h(p["access_token"]), json={
             "doctor_id": d1,
             "date": today,
             "slot": "Token Booking",
@@ -745,3 +786,143 @@ class TestQueueETAAndReferral:
         assert r_refer.status_code == 200
         assert r_refer.json()["ok"] is True
         assert r_refer.json()["new_doctor"] == doctors[1]["full_name"]
+
+
+# ---------------- ONE APPOINTMENT PER VERIFIED MOBILE PER DAY ----------------
+class TestDailyAppointmentRestriction:
+    def _create_otp_verified_patient(self, s, mobile: str = None):
+        if not mobile:
+            mobile = f"98765{str(uuid.uuid4().int)[:5]}"[:10]
+        set_test_otp(mobile, otp="123456")
+        r = s.post(f"{API}/auth/verify-otp", json={
+            "mobile": mobile,
+            "otp": "123456",
+            "full_name": f"Daily Patient {mobile[-4:]}",
+            "age": 30,
+            "gender": "Other"
+        })
+        assert r.status_code == 200, r.text
+        return r.json()["access_token"], mobile
+
+    def test_single_appointment_per_mobile_per_day_allowed(self, s):
+        token, mobile = self._create_otp_verified_patient(s)
+        doctors = s.get(f"{API}/doctors").json()
+        doc = doctors[0]
+        today = time.strftime("%Y-%m-%d")
+
+        r = s.post(f"{API}/appointments", headers=h(token), json={
+            "doctor_id": doc["id"],
+            "date": today,
+            "slot": "10:00 AM",
+            "payment_method": "pay_at_clinic"
+        })
+        assert r.status_code == 200, r.text
+        appt = r.json()
+        assert appt["patient_mobile"] == f"+91{mobile}"
+        assert appt["status"] == "booked"
+
+    def test_second_appointment_same_day_rejected_with_exact_message(self, s):
+        token, mobile = self._create_otp_verified_patient(s)
+        doctors = s.get(f"{API}/doctors").json()
+        doc = doctors[0]
+        today = time.strftime("%Y-%m-%d")
+
+        # 1st booking
+        r1 = s.post(f"{API}/appointments", headers=h(token), json={
+            "doctor_id": doc["id"],
+            "date": today,
+            "slot": "10:00 AM",
+            "payment_method": "pay_at_clinic"
+        })
+        assert r1.status_code == 200
+
+        # 2nd booking attempt with same doctor on same day
+        r2 = s.post(f"{API}/appointments", headers=h(token), json={
+            "doctor_id": doc["id"],
+            "date": today,
+            "slot": "11:00 AM",
+            "payment_method": "pay_at_clinic"
+        })
+        assert r2.status_code == 400
+        assert r2.json()["detail"] == "You have already booked an appointment for today."
+
+    def test_second_appointment_different_doctor_same_day_rejected(self, s):
+        token, mobile = self._create_otp_verified_patient(s)
+        doctors = s.get(f"{API}/doctors").json()
+        assert len(doctors) >= 2
+        d1, d2 = doctors[0], doctors[1]
+        today = time.strftime("%Y-%m-%d")
+
+        # 1st booking with Doctor 1
+        r1 = s.post(f"{API}/appointments", headers=h(token), json={
+            "doctor_id": d1["id"],
+            "date": today,
+            "slot": "10:00 AM",
+            "payment_method": "pay_at_clinic"
+        })
+        assert r1.status_code == 200
+
+        # 2nd booking attempt with Doctor 2 on same day
+        r2 = s.post(f"{API}/appointments", headers=h(token), json={
+            "doctor_id": d2["id"],
+            "date": today,
+            "slot": "2:00 PM",
+            "payment_method": "pay_at_clinic"
+        })
+        assert r2.status_code == 400
+        assert r2.json()["detail"] == "You have already booked an appointment for today."
+
+    def test_appointment_for_tomorrow_allowed(self, s):
+        token, mobile = self._create_otp_verified_patient(s)
+        doctors = s.get(f"{API}/doctors").json()
+        doc = doctors[0]
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # Booking for today
+        r_today = s.post(f"{API}/appointments", headers=h(token), json={
+            "doctor_id": doc["id"],
+            "date": today,
+            "slot": "10:00 AM",
+            "payment_method": "pay_at_clinic"
+        })
+        assert r_today.status_code == 200
+
+        # Booking for tomorrow with same verified mobile
+        r_tomorrow = s.post(f"{API}/appointments", headers=h(token), json={
+            "doctor_id": doc["id"],
+            "date": tomorrow,
+            "slot": "10:00 AM",
+            "payment_method": "pay_at_clinic"
+        })
+        assert r_tomorrow.status_code == 200
+        assert r_tomorrow.json()["date"] == tomorrow
+
+    def test_concurrent_same_day_bookings_prevented_by_unique_constraint(self, s):
+        import concurrent.futures
+        token, mobile = self._create_otp_verified_patient(s)
+        doctors = s.get(f"{API}/doctors").json()
+        doc = doctors[0]
+        today = time.strftime("%Y-%m-%d")
+
+        def attempt_booking(slot_name):
+            session = requests.Session()
+            return session.post(f"{API}/appointments", headers=h(token), json={
+                "doctor_id": doc["id"],
+                "date": today,
+                "slot": slot_name,
+                "payment_method": "pay_at_clinic"
+            })
+
+        slots = ["10:00 AM", "10:15 AM", "10:30 AM", "10:45 AM"]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(attempt_booking, slot) for slot in slots]
+            results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+        status_codes = [r.status_code for r in results]
+        assert status_codes.count(200) == 1, f"Expected exactly 1 success, got {status_codes}"
+        assert status_codes.count(400) == 3, f"Expected 3 rejections, got {status_codes}"
+        for r in results:
+            if r.status_code == 400:
+                assert r.json()["detail"] == "You have already booked an appointment for today."
+

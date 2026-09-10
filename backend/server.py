@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -8,6 +8,9 @@ import logging
 import random
 import asyncio
 import httpx
+import secrets
+import hashlib
+import pymongo
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Literal, Dict
@@ -16,6 +19,15 @@ from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
 import json
+from sms_service import send_appointment_sms, send_otp_sms, get_app_public_url
+from rate_limiter import (
+    enforce_booking_rate_limit,
+    enforce_send_otp_rate_limit,
+    enforce_verify_otp_rate_limit,
+    enforce_send_sms_cooldown,
+    enforce_general_ip_rate_limit,
+    get_client_ip,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,10 +51,6 @@ JWT_ALGORITHM = "HS256"
 JWT_EXP_SECONDS = 60 * 60 * 24 * 7  # 7 days (default for patient/doctor)
 JWT_EXP_SECONDS_RECEPTION = 60 * 60 * 24 * 90  # 90 days for receptionist (login-once)
 OTP_EXP_SECONDS = 300  # OTP valid for 5 minutes
-UNIVERSAL_DEV_OTP = "123456"  # Always accepted OTP in mock mode
-# When True, /auth/send-otp returns dev_otp in response body (dev-only convenience).
-# MUST be False in production — set env DPDP_STRIP_DEV_OTP=1 to hide it.
-STRIP_DEV_OTP = os.environ.get("DPDP_STRIP_DEV_OTP", "0") == "1"
 
 # Minimum patient age accepted for self-registration. Below this a guardian is required.
 MIN_PATIENT_AGE = 18
@@ -64,8 +72,48 @@ _push_client = httpx.AsyncClient(
 )
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # TODO: Restrict this to the production frontend URL before launch
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer(auto_error=False)
+
+@app.middleware("http")
+async def general_rate_limit_middleware(request: Request, call_next):
+    # Only enforce on /api routes, skip websockets and health checks
+    path = request.url.path
+    if path.startswith("/api/") and not path.startswith("/api/ws/") and not path == "/health":
+        enforce_general_ip_rate_limit(request)
+    response = await call_next(request)
+    return response
+
+
+def hash_otp(otp: str, mobile: str) -> str:
+    """Securely hash OTP with normalized mobile as salt using SHA-256."""
+    return hashlib.sha256(f"{otp.strip()}:{mobile.strip()}:{JWT_SECRET}".encode()).hexdigest()
+
+
+# In-memory OTP storage (OTPs are NEVER persisted to MongoDB)
+_otp_store: Dict[str, dict] = {}
+
+
+def save_memory_otp(mobile: str, otp: str, expires_in_sec: int = OTP_EXP_SECONDS):
+    """Save OTP hash securely in-memory only (never persisted to MongoDB)."""
+    norm = normalize_mobile(mobile)
+    exp = (datetime.now(timezone.utc) + timedelta(seconds=expires_in_sec)).isoformat()
+    _otp_store[norm] = {
+        "mobile": norm,
+        "otp_hash": hash_otp(otp, norm),
+        "expires_at": exp,
+        "attempts": 0,
+        "created_at": now_iso(),
+    }
 
 
 @app.on_event("startup")
@@ -84,13 +132,21 @@ async def ensure_db_indexes():
             db.appointments.create_index([("doctor_id", 1), ("date", 1), ("status", 1)]),
             db.appointments.create_index([("patient_id", 1), ("created_at", -1)]),
             db.appointments.create_index([("id", 1)], unique=True),
+            db.appointments.create_index([("secure_token", 1)], unique=True, sparse=True),
+            # Atomic concurrency protection: 1 active appointment per verified mobile per calendar day
+            db.appointments.create_index(
+                [("patient_mobile", 1), ("date", 1)],
+                unique=True,
+                partialFilterExpression={
+                    "status": {"$in": ["booked", "arrived", "in_consultation", "completed", "skipped"]},
+                    "patient_mobile": {"$type": "string", "$gt": ""}
+                }
+            ),
             # doctors
             db.doctors.create_index([("id", 1)], unique=True),
             db.doctors.create_index([("user_id", 1)]),
             db.doctors.create_index([("specialty", 1)]),
             db.doctors.create_index([("city", 1)]),
-            # OTPs — TTL cleanup handled by periodic delete_many in enforce_otp_rate_limit
-            db.otps.create_index([("mobile", 1)]),
         )
     except Exception:
         pass
@@ -199,6 +255,7 @@ class Appointment(BaseModel):
     doctor_name: str
     patient_id: str
     patient_name: str
+    patient_mobile: Optional[str] = None
     date: str
     slot: str
     token_number: int
@@ -253,6 +310,7 @@ class AddPatientBody(BaseModel):
     address: Optional[str] = None
     doctor_id: Optional[str] = None  # if provided, auto-book appointment
     slot: Optional[str] = None
+    date: Optional[str] = None  # YYYY-MM-DD, defaults to today
     payment_method: Optional[str] = "pay_at_clinic"
 
 
@@ -502,11 +560,21 @@ def init_firebase_admin_if_available():
     project_id = os.environ.get("FIREBASE_PROJECT_ID")
     # If the service account JSON was pasted raw into the .env file (common mistake),
     # try to extract a JSON object from the file and use it.
+    # If not in env var, check for json file directly in backend directory
+    if not svc_json:
+        for sa_filename in ["firebase-service-account.json", "firebase-credentials.json", "serviceAccountKey.json", "firebase_service_account.json"]:
+            sa_path = ROOT_DIR / sa_filename
+            if sa_path.exists():
+                try:
+                    svc_json = sa_path.read_text(encoding="utf-8")
+                    break
+                except Exception:
+                    pass
     if not svc_json:
         try:
             env_path = ROOT_DIR / ".env"
             if env_path.exists():
-                txt = env_path.read_text()
+                txt = env_path.read_text(encoding="utf-8")
                 # Find a JSON object in the .env file content
                 start = txt.find('{')
                 end = txt.rfind('}')
@@ -1086,41 +1154,36 @@ async def user_delete_me(body: DeleteMeBody, user: dict = Depends(get_current_us
 
 # ============ MOBILE OTP AUTH (Patient) ============
 @api_router.post("/auth/send-otp")
-async def send_otp(body: SendOTPBody):
+async def send_otp(request: Request, body: SendOTPBody):
     mobile = normalize_mobile(body.mobile)
     if not mobile or len(mobile) < 10:
         raise HTTPException(status_code=400, detail="Enter a valid mobile number")
-    # DPDP: rate limit to prevent SMS abuse / enumeration
+    # Rate limit: safe sliding-window IP and Phone protection
+    enforce_send_otp_rate_limit(request, mobile)
     await enforce_otp_rate_limit(mobile)
-    # Generate 6-digit OTP (MOCK: universal 123456 also accepted)
-    otp = f"{random.randint(100000, 999999)}"
-    await db.otps.update_one(
-        {"mobile": mobile},
-        {"$set": {
-            "mobile": mobile,
-            "otp": otp,
-            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=OTP_EXP_SECONDS)).isoformat(),
-            "attempts": 0,
-            "created_at": now_iso(),
-        }},
-        upsert=True,
-    )
-    # Consider any existing user with this mobile (not just patients)
+    
+    # Generate 6-digit secure cryptographic OTP
+    otp = f"{secrets.randbelow(900000) + 100000}"
+    otp_hash = hash_otp(otp, mobile)
+    
+    # Store OTP in-memory only (never in MongoDB)
+    save_memory_otp(mobile, otp, OTP_EXP_SECONDS)
+    
+    # Deliver OTP via Brevo Transactional SMS
+    try:
+        await send_otp_sms(mobile, otp)
+    except Exception as e:
+        logger.warning(f"OTP SMS delivery error (non-blocking): {e}")
+    
+    # Plaintext OTP is NEVER logged or exposed in API response
     existing = await db.users.find_one({"mobile": mobile})
-    resp = {
+    return {
         "ok": True,
         "mobile": mobile,
         "is_registered": bool(existing),
         "privacy_notice_version": PRIVACY_NOTICE_VERSION,
+        "message": f"OTP sent to {mobile} via SMS.",
     }
-    if not STRIP_DEV_OTP:
-        # DEV-ONLY: return the generated OTP so the UI can autofill for demos.
-        # Set env DPDP_STRIP_DEV_OTP=1 in production to omit.
-        resp["dev_otp"] = otp
-        resp["message"] = f"OTP sent to {mobile}. (Dev mode: any OTP works or use {UNIVERSAL_DEV_OTP})"
-    else:
-        resp["message"] = f"OTP sent to {mobile}."
-    return resp
 
 
 @api_router.post("/auth/verify-otp")
@@ -1128,35 +1191,52 @@ async def verify_otp(body: VerifyOTPBody):
     mobile = normalize_mobile(body.mobile)
     if not mobile:
         raise HTTPException(status_code=400, detail="Invalid mobile")
-    rec = await db.otps.find_one({"mobile": mobile})
-    stored_otp = rec.get("otp") if rec else None
-    if body.otp not in (UNIVERSAL_DEV_OTP, stored_otp or ""):
-        if rec:
-            await db.otps.update_one({"mobile": mobile}, {"$inc": {"attempts": 1}})
+    
+    # Enforce verify attempt limit
+    enforce_verify_otp_rate_limit(mobile)
+
+    entered_otp = (body.otp or "").strip()
+    if not entered_otp or len(entered_otp) != 6:
+        raise HTTPException(status_code=400, detail="Invalid OTP format. Must be 6 digits.")
+    
+    # Fetch OTP from in-memory store (not MongoDB)
+    rec = _otp_store.get(mobile)
+    if not rec:
+        raise HTTPException(status_code=401, detail="Invalid OTP or request expired")
+    
+    # Check expiry
+    try:
+        exp = datetime.fromisoformat(rec["expires_at"])
+        if datetime.now(timezone.utc) > exp:
+            _otp_store.pop(mobile, None)
+            raise HTTPException(status_code=401, detail="OTP expired. Request a new one.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    
+    # Verify cryptographic hash of OTP
+    expected_hash = rec.get("otp_hash")
+    entered_hash = hash_otp(entered_otp, mobile)
+    legacy_match = rec.get("otp") and rec.get("otp") == entered_otp
+    is_match = (expected_hash and secrets.compare_digest(entered_hash, expected_hash)) or legacy_match
+    
+    if not is_match:
+        attempts = int(rec.get("attempts", 0)) + 1
+        if attempts >= 5:
+            _otp_store.pop(mobile, None)
+            raise HTTPException(status_code=401, detail="Maximum attempts exceeded. Request a new OTP.")
+        rec["attempts"] = attempts
         raise HTTPException(status_code=401, detail="Invalid OTP")
-    if body.otp != UNIVERSAL_DEV_OTP and rec:
-        try:
-            exp = datetime.fromisoformat(rec["expires_at"])
-            if datetime.now(timezone.utc) > exp:
-                raise HTTPException(status_code=401, detail="OTP expired. Request a new one.")
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-    if rec:
-        await db.otps.delete_one({"mobile": mobile})
+    
+    # Successful verification - delete OTP record immediately from memory
+    _otp_store.pop(mobile, None)
 
     # Match any existing user by mobile regardless of role; if none, we'll create a new patient account
     user = await db.users.find_one({"mobile": mobile})
     if not user:
-        # New user — DPDP requires explicit consent + age gate
         if not body.full_name:
             raise HTTPException(status_code=400, detail="Name is required for new patient signup")
-        # In development convenience modes we allow bypassing explicit consent when
-        # using the universal dev OTP or when the server is in dev mode (dev_otp returned).
-        dev_mode_bypass = (body.otp == UNIVERSAL_DEV_OTP) or (not STRIP_DEV_OTP)
-        if body.consent_privacy is not True and not dev_mode_bypass:
-            raise HTTPException(status_code=400, detail="Please accept the privacy notice to continue")
         if body.age is not None and body.age < MIN_PATIENT_AGE:
             raise HTTPException(
                 status_code=400,
@@ -1176,10 +1256,11 @@ async def verify_otp(body: VerifyOTPBody):
             "password_hash": None,
             "full_name": body.full_name.strip(),
             "role": "patient",
+            "phone_verified": True,
             "age": body.age,
             "gender": body.gender,
             "address": body.address,
-            "consent_privacy": True,
+            "consent_privacy": True if body.consent_privacy is not False else False,
             "consent_history": [consent_snapshot],
             "created_at": now_iso(),
         }
@@ -1189,6 +1270,10 @@ async def verify_otp(body: VerifyOTPBody):
     else:
         if user.get("deleted"):
             raise HTTPException(status_code=403, detail="This account has been deleted. Contact support to restore.")
+        # Mark phone as verified on account
+        if not user.get("phone_verified"):
+            await db.users.update_one({"id": user["id"]}, {"$set": {"phone_verified": True}})
+            user["phone_verified"] = True
         await audit(user["id"], "user.login", target=user["id"], meta={"role": user.get("role", "patient"), "method": "otp"})
     # Issue token with the user's actual role (new users default to 'patient')
     token = create_token(user["id"], user.get("role", "patient"))
@@ -1201,6 +1286,7 @@ async def verify_otp(body: VerifyOTPBody):
             "full_name": user["full_name"],
             "role": user["role"],
             "phone": user.get("phone"),
+            "phone_verified": user.get("phone_verified", True),
             "age": user.get("age"),
             "gender": user.get("gender"),
             "address": user.get("address"),
@@ -1416,22 +1502,105 @@ async def get_doctor(doctor_id: str):
     return d
 
 
+async def calculate_appointment_eta(appt: dict) -> dict:
+    """Calculate live queue metrics and latest estimated turn time for an appointment."""
+    all_appts = await db.appointments.find(
+        {"doctor_id": appt["doctor_id"], "date": appt["date"], "status": {"$ne": "cancelled"}},
+        {"_id": 0},
+    ).sort("token_number", 1).to_list(500)
+
+    active = [a for a in all_appts if a["status"] in ("booked", "arrived", "in_consultation")]
+    current = next((a for a in all_appts if a["status"] == "in_consultation"), None)
+    completed_count = len([a for a in all_appts if a["status"] == "completed"])
+
+    # My position = number of active appts with token <= mine
+    my_position = 0
+    if appt.get("status") in ("booked", "arrived"):
+        my_position = sum(1 for a in active if a["token_number"] <= appt["token_number"])
+    elif appt.get("status") == "in_consultation":
+        my_position = 0
+    else:
+        my_position = -1  # done / cancelled
+
+    # Fetch doctor details
+    doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "avg_consult_minutes": 1, "status": 1, "full_name": 1})
+    doc_status = (doctor or {}).get("status", "active")
+    per = int((doctor or {}).get("avg_consult_minutes") or 15)
+
+    eta_minutes = 0
+    expected_turn_time = None
+
+    if my_position == 0 and appt.get("status") == "in_consultation":
+        expected_turn_time = "Now"
+    elif my_position > 0:
+        eta_minutes = max(0, (my_position - (1 if current else 0))) * per
+        # Local clinic / Indian Standard Time (UTC+5:30)
+        ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+        future_dt = ist_now + timedelta(minutes=eta_minutes)
+        expected_turn_time = format_clock_time(future_dt)
+
+    return {
+        "my_position": my_position,
+        "eta_minutes": eta_minutes,
+        "expected_turn_time": expected_turn_time,
+        "currently_serving": current["token_number"] if current else None,
+        "completed_count": completed_count,
+        "total_in_queue": len(active),
+        "doctor_status": doc_status,
+    }
+
+
 # ============ APPOINTMENTS ============
 @api_router.post("/appointments")
-async def create_appointment(body: AppointmentCreate, user: dict = Depends(require_role("patient"))):
+async def create_appointment(
+    request: Request,
+    body: AppointmentCreate,
+    user: dict = Depends(require_role("patient")),
+):
     doctor = await db.doctors.find_one({"id": body.doctor_id}, {"_id": 0})
     if not doctor:
         raise HTTPException(status_code=404, detail="Doctor not found")
+    
+    # Extract verified patient mobile number
+    patient_mobile = normalize_mobile(user.get("mobile") or user.get("phone") or "")
+    if not patient_mobile:
+        u_rec = await db.users.find_one({"id": user["id"]})
+        if u_rec:
+            patient_mobile = normalize_mobile(u_rec.get("mobile") or u_rec.get("phone") or "")
+
+    # Server-side rate limiting (IP and mobile separately)
+    enforce_booking_rate_limit(request, patient_mobile)
+
+    # Server-side restriction: A single verified patient mobile number can book only ONE appointment within the same calendar day
+    or_clauses = [{"patient_id": user["id"]}]
+    if patient_mobile:
+        or_clauses.append({"patient_mobile": patient_mobile})
+        or_clauses.append({"patient_phone": patient_mobile})
+    
+    existing_appointment = await db.appointments.find_one({
+        "$or": or_clauses,
+        "date": body.date,
+        "status": {"$in": ["booked", "arrived", "in_consultation", "completed", "skipped"]}
+    })
+    if existing_appointment:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="You already have an active appointment for this doctor/session."
+        )
+
     # Compute next token number for this doctor on this date
     count = await db.appointments.count_documents({"doctor_id": body.doctor_id, "date": body.date})
     token_number = count + 1
     appt_id = str(uuid.uuid4())
+    secure_token = secrets.token_urlsafe(16)
     doc = {
         "id": appt_id,
+        "secure_token": secure_token,
         "doctor_id": body.doctor_id,
         "doctor_name": doctor["full_name"],
         "patient_id": user["id"],
         "patient_name": user["full_name"],
+        "patient_mobile": patient_mobile or None,
         "date": body.date,
         "slot": body.slot,
         "token_number": token_number,
@@ -1439,9 +1608,37 @@ async def create_appointment(body: AppointmentCreate, user: dict = Depends(requi
         "payment_method": body.payment_method,
         "payment_status": "paid" if body.payment_method == "online" else "pending",
         "prescription": None,
+        "sms_status": "pending",
+        "sms_last_sent_at": now_iso(),
         "created_at": now_iso(),
     }
-    await db.appointments.insert_one(doc)
+    try:
+        await db.appointments.insert_one(doc)
+    except pymongo.errors.DuplicateKeyError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="You already have an active appointment for this doctor/session."
+        )
+
+    # Calculate latest ETA and trigger Brevo transactional SMS
+    if patient_mobile:
+        eta_data = await calculate_appointment_eta(doc)
+        dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
+        try:
+            sms_res = await send_appointment_sms(
+                phone=patient_mobile,
+                patient_name=user["full_name"],
+                doctor_name=doctor["full_name"],
+                token_number=token_number,
+                estimated_time=eta_data.get("expected_turn_time") or "As per live queue",
+                appointment_link=dynamic_link,
+            )
+            sms_status = "sent" if sms_res.get("ok") else "failed"
+            await db.appointments.update_one({"id": appt_id}, {"$set": {"sms_status": sms_status}})
+            doc["sms_status"] = sms_status
+        except Exception as e:
+            logger.warning(f"SMS sending failed (non-blocking): {e}")
+
     doc.pop("_id", None)
     await broadcast_doctor_update(body.doctor_id, "booked")
     return doc
@@ -1453,56 +1650,49 @@ async def my_appointments(user: dict = Depends(require_role("patient"))):
     return appts
 
 
+@api_router.get("/appointments/by-token/{token}")
+async def get_appointment_by_token(token: str, user: dict = Depends(get_current_user)):
+    """Fetch appointment details and latest queue stats by secure random token.
+    Validates server-side that the authenticated patient owns the appointment.
+    """
+    appt = await db.appointments.find_one({"secure_token": token}, {"_id": 0})
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    # Authorize: if patient, must match user id or normalized mobile
+    if user.get("role") == "patient":
+        user_phone = normalize_mobile(user.get("mobile") or user.get("phone") or "")
+        appt_phone = normalize_mobile(appt.get("patient_mobile") or "")
+        is_owner = (appt.get("patient_id") == user["id"]) or (user_phone and user_phone == appt_phone)
+        if not is_owner:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to view this appointment.")
+
+    eta_data = await calculate_appointment_eta(appt)
+    return {
+        "ok": True,
+        "appointment": appt,
+        "queue": eta_data,
+    }
+
+
 @api_router.get("/appointments/{appt_id}/queue")
 async def queue_status(appt_id: str, user: dict = Depends(get_current_user)):
     appt = await db.appointments.find_one({"id": appt_id}, {"_id": 0})
     if not appt:
         raise HTTPException(status_code=404, detail="Appointment not found")
-    # Find all appointments for that doctor on that date
-    all_appts = await db.appointments.find(
-        {"doctor_id": appt["doctor_id"], "date": appt["date"], "status": {"$ne": "cancelled"}},
-        {"_id": 0},
-    ).sort("token_number", 1).to_list(500)
 
-    active = [a for a in all_appts if a["status"] in ("booked", "arrived", "in_consultation")]
-    current = next((a for a in all_appts if a["status"] == "in_consultation"), None)
-    completed_count = len([a for a in all_appts if a["status"] == "completed"])
+    # Authorize: patient can only inspect their own queue status
+    if user.get("role") == "patient":
+        user_phone = normalize_mobile(user.get("mobile") or user.get("phone") or "")
+        appt_phone = normalize_mobile(appt.get("patient_mobile") or "")
+        is_owner = (appt.get("patient_id") == user["id"]) or (user_phone and user_phone == appt_phone)
+        if not is_owner:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to view this appointment.")
 
-    # My position = number of active appts with token <= mine (excluding completed/skipped/cancelled)
-    my_position = 0
-    if appt["status"] in ("booked", "arrived"):
-        my_position = sum(1 for a in active if a["token_number"] <= appt["token_number"])
-    elif appt["status"] == "in_consultation":
-        my_position = 0
-    else:
-        my_position = -1  # done / cancelled
-
-    # Fetch doctor details (avg_consult_minutes, status, full_name)
-    doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "avg_consult_minutes": 1, "status": 1, "full_name": 1})
-    doc_status = (doctor or {}).get("status", "active")
-    per = int((doctor or {}).get("avg_consult_minutes") or 15)
-
-    eta_minutes = 0
-    expected_turn_time = None
-
-    if my_position == 0 and appt["status"] == "in_consultation":
-        expected_turn_time = "Now"
-    elif my_position > 0:
-        eta_minutes = max(0, (my_position - (1 if current else 0))) * per
-        # Local clinic / Indian Standard Time (UTC+5:30)
-        ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
-        future_dt = ist_now + timedelta(minutes=eta_minutes)
-        expected_turn_time = format_clock_time(future_dt)
-
+    eta_data = await calculate_appointment_eta(appt)
     return {
         "appointment": appt,
-        "my_position": my_position,
-        "eta_minutes": eta_minutes,
-        "expected_turn_time": expected_turn_time,
-        "currently_serving": current["token_number"] if current else None,
-        "completed_count": completed_count,
-        "total_in_queue": len(active),
-        "doctor_status": doc_status,
+        **eta_data,
     }
 
 
@@ -1889,7 +2079,7 @@ async def emergency_insert(body: dict, user: dict = Depends(require_role("recept
 
 
 @api_router.post("/reception/add-patient")
-async def reception_add_patient(body: AddPatientBody, user: dict = Depends(require_role("receptionist"))):
+async def reception_add_patient(body: AddPatientBody, user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner"))):
     """Receptionist adds a patient (with all details) and optionally books an appointment."""
     mobile = normalize_mobile(body.mobile)
     if not mobile or len(mobile) < 10:
@@ -1898,7 +2088,7 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
         raise HTTPException(status_code=400, detail="Full name is required")
 
     # Find or create patient user
-    existing = await db.users.find_one({"mobile": mobile, "role": "patient"})
+    existing = await db.users.find_one({"mobile": mobile})
     if existing:
         # Update details if missing
         updates = {}
@@ -1922,6 +2112,7 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
             "password_hash": None,
             "full_name": body.full_name.strip(),
             "role": "patient",
+            "phone_verified": False,
             "age": body.age,
             "gender": body.gender,
             "address": body.address,
@@ -1936,16 +2127,36 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
         doctor = await db.doctors.find_one({"id": body.doctor_id})
         if not doctor:
             raise HTTPException(status_code=404, detail="Doctor not found")
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        count = await db.appointments.count_documents({"doctor_id": body.doctor_id, "date": today})
+        
+        appt_date = getattr(body, "date", None) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # Atomic duplicate check
+        existing_appointment = await db.appointments.find_one({
+            "$or": [
+                {"patient_id": patient_id},
+                {"patient_mobile": mobile},
+            ],
+            "date": appt_date,
+            "status": {"$in": ["booked", "arrived", "in_consultation", "completed", "skipped"]},
+        })
+        if existing_appointment:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This patient already has an active appointment for today."
+            )
+
+        count = await db.appointments.count_documents({"doctor_id": body.doctor_id, "date": appt_date})
         appt_id = str(uuid.uuid4())
+        secure_token = secrets.token_urlsafe(16)
         appt = {
             "id": appt_id,
+            "secure_token": secure_token,
             "doctor_id": body.doctor_id,
             "doctor_name": doctor["full_name"],
             "patient_id": patient_id,
             "patient_name": patient_name,
-            "date": today,
+            "patient_mobile": mobile,
+            "date": appt_date,
             "slot": body.slot or "Walk-in",
             "token_number": count + 1,
             "status": "arrived",  # walk-in patient is already at clinic
@@ -1953,9 +2164,36 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
             "payment_status": "pending",
             "prescription": None,
             "symptoms": body.symptoms,
+            "sms_status": "pending",
+            "sms_last_sent_at": now_iso(),
             "created_at": now_iso(),
         }
-        await db.appointments.insert_one(appt)
+        try:
+            await db.appointments.insert_one(appt)
+        except pymongo.errors.DuplicateKeyError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This patient already has an active appointment for today."
+            )
+
+        # Trigger Brevo Transactional SMS
+        eta_data = await calculate_appointment_eta(appt)
+        dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
+        try:
+            sms_res = await send_appointment_sms(
+                phone=mobile,
+                patient_name=patient_name,
+                doctor_name=doctor["full_name"],
+                token_number=appt["token_number"],
+                estimated_time=eta_data.get("expected_turn_time") or "As per live queue",
+                appointment_link=dynamic_link,
+            )
+            sms_status = "sent" if sms_res.get("ok") else "failed"
+            await db.appointments.update_one({"id": appt_id}, {"$set": {"sms_status": sms_status}})
+            appt["sms_status"] = sms_status
+        except Exception as e:
+            logger.warning(f"SMS sending failed (non-blocking): {e}")
+
         appt.pop("_id", None)
         await broadcast_doctor_update(body.doctor_id, "patient_added")
 
@@ -1970,6 +2208,56 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
             "address": body.address,
         },
         "appointment": appt,
+    }
+
+
+@api_router.post("/reception/appointments/{appt_id}/send-link")
+async def reception_send_appointment_link(
+    appt_id: str,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner")),
+):
+    """Receptionist sends dynamic appointment link SMS to patient's phone with cooldown protection."""
+    appt = await db.appointments.find_one({"id": appt_id})
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    # Prevent accidental rapid duplicate SMS sends using cooldown mechanism
+    enforce_send_sms_cooldown(appt_id)
+
+    # Ensure secure_token is generated/reused
+    secure_token = appt.get("secure_token")
+    if not secure_token:
+        secure_token = secrets.token_urlsafe(16)
+        await db.appointments.update_one({"id": appt_id}, {"$set": {"secure_token": secure_token}})
+        appt["secure_token"] = secure_token
+
+    mobile = appt.get("patient_mobile")
+    if not mobile:
+        raise HTTPException(status_code=400, detail="Patient has no registered mobile number")
+
+    # Fetch latest ETA using existing queue logic
+    eta_data = await calculate_appointment_eta(appt)
+    dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
+
+    sms_res = await send_appointment_sms(
+        phone=mobile,
+        patient_name=appt.get("patient_name", "Patient"),
+        doctor_name=appt.get("doctor_name", "Doctor"),
+        token_number=appt.get("token_number", 1),
+        estimated_time=eta_data.get("expected_turn_time") or "As per live queue",
+        appointment_link=dynamic_link,
+    )
+    sms_status = "sent" if sms_res.get("ok") else "failed"
+    await db.appointments.update_one(
+        {"id": appt_id},
+        {"$set": {"sms_status": sms_status, "sms_last_sent_at": now_iso()}}
+    )
+
+    return {
+        "ok": True,
+        "message": f"Link sent to {mobile}",
+        "sms_status": sms_status,
+        "appointment_link": dynamic_link,
     }
 
 

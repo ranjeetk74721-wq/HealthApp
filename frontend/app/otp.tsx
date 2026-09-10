@@ -6,15 +6,17 @@ import { useAuth } from "@/src/context/AuthContext";
 import { api } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { confirmFirebasePhoneOtp, sendFirebasePhoneOtp, clearFirebaseConfirmation } from "@/src/firebase";
 
 const GENDERS = ["Male", "Female", "Other"];
 
 export default function OtpScreen() {
   const router = useRouter();
-  const params = useLocalSearchParams<{ mobile: string; is_registered: string; dev_otp: string }>();
+  const params = useLocalSearchParams<{ mobile: string; is_registered: string; dev_otp: string; use_firebase: string; redirect?: string }>();
   const { signIn } = useAuth();
   const mobile = params.mobile as string;
   const isRegistered = params.is_registered === "1";
+  const useFirebase = params.use_firebase === "1";
 
   const [otp, setOtp] = useState<string[]>(["", "", "", "", "", ""]);
   const inputs = useRef<(TextInput | null)[]>([]);
@@ -27,7 +29,7 @@ export default function OtpScreen() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [resendCount, setResendCount] = useState(30);
-  const [devOtp, setDevOtp] = useState<string>((params.dev_otp as string) || "");
+
   useEffect(() => {
     if (resendCount <= 0) return;
     const t = setTimeout(() => setResendCount((c) => c - 1), 1000);
@@ -48,12 +50,6 @@ export default function OtpScreen() {
 
   const otpString = otp.join("");
 
-  const autofillDevOtp = () => {
-    const code = devOtp || "123456";
-    setOtp(code.split(""));
-    setTimeout(() => inputs.current[5]?.focus(), 50);
-  };
-
   const onVerify = async () => {
     setError(null);
     if (otpString.length !== 6) {
@@ -67,10 +63,11 @@ export default function OtpScreen() {
     }
     setLoading(true);
     try {
-      // Ensure mobile is sent in normalized form the server expects
-      const normalizedMobile = mobile.replace(/[^0-9+]/g, "");
-      const body: any = { mobile: normalizedMobile, otp: otpString };
-      if (!isRegistered) {
+      let res: any;
+      if (useFirebase) {
+        const idToken = await confirmFirebasePhoneOtp(otpString);
+        const body: any = { id_token: idToken };
+        if (!isRegistered) {
           if (!name.trim()) throw new Error("Full name is required");
           if (!consent) throw new Error("Please accept the privacy notice to continue");
           body.full_name = name.trim();
@@ -79,8 +76,28 @@ export default function OtpScreen() {
           body.address = address || undefined;
           body.consent_privacy = true;
         }
-      const res = await api.post("/auth/verify-otp", body);
+        res = await api.post("/auth/firebase-login", body);
+        clearFirebaseConfirmation();
+      } else {
+        // Ensure mobile is sent in normalized form the server expects
+        const normalizedMobile = mobile.replace(/[^0-9+]/g, "");
+        const body: any = { mobile: normalizedMobile, otp: otpString };
+        if (!isRegistered) {
+          if (!name.trim()) throw new Error("Full name is required");
+          if (!consent) throw new Error("Please accept the privacy notice to continue");
+          body.full_name = name.trim();
+          body.age = age ? parseInt(age, 10) : undefined;
+          body.gender = gender;
+          body.address = address || undefined;
+          body.consent_privacy = true;
+        }
+        res = await api.post("/auth/verify-otp", body);
+      }
       await signIn(res.access_token, res.user);
+      if (params.redirect) {
+        router.replace(params.redirect as any);
+        return;
+      }
       const role = res.user.role;
       router.replace(
         role === "doctor" ? "/doctor/dashboard"
@@ -99,9 +116,12 @@ export default function OtpScreen() {
     setError(null);
     setResendCount(30);
     try {
-      const normalizedMobile = mobile.replace(/[^0-9+]/g, "");
-      const res = await api.post("/auth/send-otp", { mobile: normalizedMobile });
-      setDevOtp(res.dev_otp || "");
+      if (useFirebase) {
+        await sendFirebasePhoneOtp(mobile);
+      } else {
+        const normalizedMobile = mobile.replace(/[^0-9+]/g, "");
+        await api.post("/auth/send-otp", { mobile: normalizedMobile });
+      }
     } catch (e: any) {
       setError(e.message);
     }
@@ -140,13 +160,6 @@ export default function OtpScreen() {
                   />
                 ))}
               </View>
-
-              {devOtp ? (
-                <Pressable testID="autofill-otp" onPress={autofillDevOtp} style={styles.devHint}>
-                  <Ionicons name="flash" size={14} color={colors.warning} />
-                  <Text style={styles.devHintText}>Dev OTP: {devOtp} (tap to autofill)</Text>
-                </Pressable>
-              ) : null}
 
               {error ? <Text style={styles.error}>{error}</Text> : null}
 

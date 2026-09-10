@@ -47,7 +47,8 @@ export default function BookAppointment() {
       setShowPay(false);
       setSuccess(res);
     } catch (e: any) {
-      setError(e.message);
+      setShowPay(false);
+      setError(e.message || "Booking failed");
     } finally {
       setBooking(false);
     }
@@ -114,7 +115,12 @@ export default function BookAppointment() {
           </Text>
         </View>
 
-        {error ? <Text testID="book-error" style={{ color: colors.error, marginTop: spacing.md }}>{error}</Text> : null}
+        {error ? (
+          <View style={{ backgroundColor: "#FEE2E2", borderColor: "#EF4444", borderWidth: 1, borderRadius: radius.md, padding: spacing.md, flexDirection: "row", alignItems: "center", gap: 10, marginTop: spacing.md }}>
+            <Ionicons name="alert-circle" size={22} color="#DC2626" />
+            <Text testID="book-error" style={{ color: "#B91C1C", fontWeight: "600", flex: 1, fontSize: font.sm }}>{error}</Text>
+          </View>
+        ) : null}
       </ScrollView>
 
       <SafeAreaView edges={["bottom"]} style={styles.stickyCta}>

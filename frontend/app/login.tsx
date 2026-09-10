@@ -1,13 +1,15 @@
 import { useState } from "react";
 import { View, Text, TextInput, Pressable, StyleSheet, KeyboardAvoidingView, Platform, ScrollView, ActivityIndicator, Image } from "react-native";
-import { useRouter } from "expo-router";
+import { useRouter, useLocalSearchParams } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { api } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { isFirebaseConfigured, sendFirebasePhoneOtp } from "@/src/firebase";
 
 export default function Login() {
   const router = useRouter();
+  const params = useLocalSearchParams<{ redirect?: string }>();
 
   const [mobile, setMobile] = useState("");
   const [sendingOtp, setSendingOtp] = useState(false);
@@ -22,8 +24,26 @@ export default function Login() {
     }
     setSendingOtp(true);
     try {
-      const res = await api.post("/auth/send-otp", { mobile: clean });
-      router.push({ pathname: "/otp", params: { mobile: res.mobile, is_registered: res.is_registered ? "1" : "0", dev_otp: res.dev_otp || "" } } as any);
+      const fullNumber = `+91${clean}`;
+      const otpParams: any = {
+        mobile: fullNumber,
+        is_registered: "0",
+        use_firebase: "1",
+      };
+      if (params.redirect) {
+        otpParams.redirect = params.redirect;
+      }
+
+      if (isFirebaseConfigured()) {
+        await sendFirebasePhoneOtp(fullNumber);
+        router.push({ pathname: "/otp", params: otpParams } as any);
+      } else {
+        const res = await api.post("/auth/send-otp", { mobile: clean });
+        otpParams.mobile = res.mobile;
+        otpParams.is_registered = res.is_registered ? "1" : "0";
+        otpParams.use_firebase = "0";
+        router.push({ pathname: "/otp", params: otpParams } as any);
+      }
     } catch (e: any) {
       setError(e.message || "Failed to send OTP");
     } finally {
@@ -77,12 +97,6 @@ export default function Login() {
             <Ionicons name="briefcase-outline" size={20} color={colors.brandPrimary} />
             <Text style={styles.staffBtnText}>Hospital Staff Login</Text>
           </Pressable>
-
-          <View style={styles.demoBox} testID="demo-credentials">
-            <Text style={styles.demoTitle}>Demo accounts</Text>
-            <Text style={styles.demoText}>Enter any 10-digit mobile</Text>
-            <Text style={styles.demoText}>Use OTP: 123456 (dev mode)</Text>
-          </View>
 
         </ScrollView>
       </KeyboardAvoidingView>
