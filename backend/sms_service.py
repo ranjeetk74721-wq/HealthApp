@@ -123,6 +123,44 @@ def format_renflair_hour(hour_val: Any, default: str = "2") -> str:
 format_brevo_recipient = format_renflair_phone
 
 
+# Hindi instruction line for queue tracking
+HINDI_QUEUE_INSTRUCTION = "आपका नंबर कब आएगा देखने के लिए लिंक पर क्लिक करें:"
+
+
+def format_appointment_sms_text(
+    hospital_name: str,
+    doctor_name: str,
+    token_number: Any,
+    expected_time: str,
+    live_queue_link: str,
+) -> str:
+    """Format appointment confirmation SMS message in plain text according to template:
+    {HOSPITAL_NAME}
+    आपका नंबर कब आएगा देखने के लिए लिंक पर क्लिक करें:
+    {LIVE_QUEUE_LINK}
+    Dr. {DOCTOR_NAME}
+    Token: {TOKEN} | Time: {EXPECTED_TIME}
+    Thank you
+    -MeriBaari
+    """
+    hosp = (hospital_name or "MeriBaari Clinic").strip()
+    doc = (doctor_name or "Doctor").strip()
+    clean_doc = doc if not doc.lower().startswith("dr.") else doc[3:].strip()
+    clean_token = str(token_number or "1").strip()
+    clean_time = str(expected_time or "As per live queue").strip()
+    clean_link = str(live_queue_link or "https://health-pkt0cdyis-mariya12.vercel.app/login").strip()
+
+    return (
+        f"{hosp}\n"
+        f"{HINDI_QUEUE_INSTRUCTION}\n"
+        f"{clean_link}\n"
+        f"Dr. {clean_doc}\n"
+        f"Token: {clean_token} | Time: {clean_time}\n"
+        f"Thank you\n"
+        f"-MeriBaari"
+    )
+
+
 def _parse_provider_response(resp: httpx.Response) -> Dict[str, Any]:
     """Defensively parse Renflair HTTP response (JSON or plain text).
     Never leaks sensitive details.
@@ -274,32 +312,10 @@ async def send_appointment_sms(
     - OID: Booking/order/token identifier (derived from oid or token_number or appointment id).
     - HOUR: Hour/time value (derived from hour or estimated_time or slot).
 
-    Backward Compatibility:
-    Accepts legacy arguments (patient_name, doctor_name, token_number, estimated_time, appointment_link)
-    so existing callers and tests remain fully functional without regressions.
-
-    Provider Limitation Note:
-    Renflair V7 currently does not expose a parameter for the dynamic appointment URL in the provided API specification.
-    Only API, PHONE, OID, and HOUR are sent.
+    Backward Compatibility & SMS Message Text:
+    Accepts arguments (hospital_name, doctor_name, token_number, expected_time, live_queue_link)
+    Generates exact plain-text confirmation SMS following Hindi + English structure.
     """
-    formatted_phone = format_renflair_phone(phone)
-    if not formatted_phone:
-        logger.warning("Renflair Appointment SMS rejected: Invalid Indian phone format")
-        return {
-            "ok": False,
-            "error": "Invalid Indian mobile number format.",
-            "error_code": "INVALID_PHONE",
-        }
-    
-    api_key = get_renflair_api_key()
-    if not api_key:
-        logger.warning("Renflair Appointment SMS blocked: RENFLAIR_API_KEY not configured")
-        return {
-            "ok": False,
-            "error": "Renflair API key is not configured.",
-            "error_code": "MISSING_API_KEY",
-        }
-    
     # Resolve OID
     resolved_oid = oid
     if resolved_oid is None:
@@ -309,8 +325,43 @@ async def send_appointment_sms(
     # Resolve HOUR
     resolved_hour = hour
     if resolved_hour is None:
-        resolved_hour = kwargs.get("estimated_time") or kwargs.get("slot") or "2"
+        resolved_hour = kwargs.get("expected_time") or kwargs.get("estimated_time") or kwargs.get("slot") or "2"
     formatted_hour = format_renflair_hour(resolved_hour, default="2")
+
+    # Resolve message fields
+    hospital_name = kwargs.get("hospital_name") or kwargs.get("clinic_name") or "MeriBaari Clinic"
+    doctor_name = kwargs.get("doctor_name") or "Doctor"
+    token_number = kwargs.get("token_number") or formatted_oid
+    expected_time = kwargs.get("expected_time") or kwargs.get("estimated_time") or "As per live queue"
+    live_queue_link = kwargs.get("live_queue_link") or kwargs.get("appointment_link") or ""
+
+    sms_text = format_appointment_sms_text(
+        hospital_name=hospital_name,
+        doctor_name=doctor_name,
+        token_number=token_number,
+        expected_time=expected_time,
+        live_queue_link=live_queue_link,
+    )
+
+    formatted_phone = format_renflair_phone(phone)
+    if not formatted_phone:
+        logger.warning("Renflair Appointment SMS rejected: Invalid Indian phone format")
+        return {
+            "ok": False,
+            "error": "Invalid Indian mobile number format.",
+            "error_code": "INVALID_PHONE",
+            "sms_text": sms_text,
+        }
+    
+    api_key = get_renflair_api_key()
+    if not api_key:
+        logger.warning("Renflair Appointment SMS blocked: RENFLAIR_API_KEY not configured")
+        return {
+            "ok": False,
+            "error": "Renflair API key is not configured.",
+            "error_code": "MISSING_API_KEY",
+            "sms_text": sms_text,
+        }
     
     params = {
         "API": api_key,
@@ -334,6 +385,7 @@ async def send_appointment_sms(
                         "phone": formatted_phone,
                         "oid": formatted_oid,
                         "hour": formatted_hour,
+                        "sms_text": sms_text,
                     }
                 else:
                     logger.warning(f"Renflair Appointment SMS error for {masked_phone}: {parsed.get('error')}")
@@ -342,6 +394,7 @@ async def send_appointment_sms(
                         "provider": "renflair",
                         "error": parsed.get("error", "Renflair provider error"),
                         "error_code": "PROVIDER_ERROR",
+                        "sms_text": sms_text,
                     }
             else:
                 logger.error(f"Renflair Appointment HTTP {resp.status_code} for {masked_phone}")
@@ -351,6 +404,7 @@ async def send_appointment_sms(
                     "error": f"Renflair gateway HTTP {resp.status_code}",
                     "error_code": "GATEWAY_ERROR",
                     "status_code": resp.status_code,
+                    "sms_text": sms_text,
                 }
     except httpx.TimeoutException:
         logger.error(f"Renflair Appointment request timed out after {REQUEST_TIMEOUT_SECONDS}s for {masked_phone}")
@@ -359,6 +413,7 @@ async def send_appointment_sms(
             "provider": "renflair",
             "error": "SMS gateway request timed out.",
             "error_code": "TIMEOUT",
+            "sms_text": sms_text,
         }
     except Exception as e:
         logger.error(f"Renflair Appointment communication failure for {masked_phone}: {type(e).__name__}")
@@ -367,4 +422,5 @@ async def send_appointment_sms(
             "provider": "renflair",
             "error": "SMS gateway connection failed.",
             "error_code": "CONNECTION_ERROR",
+            "sms_text": sms_text,
         }

@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import re
 import logging
 import random
 import asyncio
@@ -13,7 +14,7 @@ import hashlib
 import pymongo
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
-from typing import List, Optional, Literal, Dict
+from typing import List, Optional, Literal, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta
 import bcrypt
@@ -454,12 +455,87 @@ def validate_photo_size(photo_str: Optional[str]) -> None:
         )
 
 
+def format_12hr_time(val: Any) -> str:
+    """Format datetime or time string into standard 12-hour AM/PM format (e.g. 2:00 PM, 11:30 AM).
+    Guarantees:
+    - 12-hour clock with AM/PM
+    - Minutes always two digits
+    - No 24-hour format
+    - No minutes/hours wording like '120 min'
+    - Accurate conversions:
+      00:30 -> 12:30 AM
+      12:00 -> 12:00 PM
+      13:00 -> 1:00 PM
+      14:30 -> 2:30 PM
+      23:30 -> 11:30 PM
+    """
+    if val is None:
+        return ""
+    if isinstance(val, datetime):
+        hr = val.strftime("%I").lstrip("0") or "12"
+        return f"{hr}:{val.strftime('%M')} {val.strftime('%p')}"
+
+    val_str = str(val).strip()
+    if not val_str:
+        return ""
+    if val_str.lower() in ("now", "consultation completed", "completed"):
+        return val_str
+
+    # 12hr format: e.g. "2:30 PM" or "02:30 PM"
+    m_12 = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)$", val_str, re.IGNORECASE)
+    if m_12:
+        hr = str(int(m_12.group(1)))
+        return f"{hr}:{m_12.group(2)} {m_12.group(3).upper()}"
+
+    # 24hr format: e.g. "14:30" or "00:30" or "13:00:00"
+    m_24 = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", val_str)
+    if m_24:
+        hr_24 = int(m_24.group(1))
+        minute = m_24.group(2)
+        ampm = "PM" if hr_24 >= 12 else "AM"
+        hr_12 = hr_24 % 12
+        if hr_12 == 0:
+            hr_12 = 12
+        return f"{hr_12}:{minute} {ampm}"
+
+    return val_str
+
+
+def format_expected_time_range(start: Any, end: Optional[Any] = None) -> str:
+    """Format start and end times into standard 12-hour AM/PM time range:
+    '2:00 PM – 2:30 PM'
+    Rule: If start and end are identical, returns '2:00 PM' without duplicate.
+    Also handles single string range inputs like '14:00 - 14:30' or '10:00 – 10:45'.
+    """
+    if start is None and end is None:
+        return ""
+
+    if isinstance(start, str) and not end:
+        sep = " – " if " – " in start else (" - " if " - " in start else None)
+        if sep:
+            parts = start.split(sep, 1)
+            s_part = format_12hr_time(parts[0].strip())
+            e_part = format_12hr_time(parts[1].strip())
+            if not e_part or s_part == e_part:
+                return s_part
+            return f"{s_part} – {e_part}"
+
+    start_str = format_12hr_time(start)
+    if not end:
+        return start_str
+    end_str = format_12hr_time(end)
+
+    if not start_str:
+        return end_str
+    if not end_str or start_str == end_str:
+        return start_str
+
+    return f"{start_str} – {end_str}"
+
+
 def format_clock_time(dt: datetime) -> str:
     """Format datetime into 12-hour clock format with AM/PM (e.g. 1:00 PM, 10:30 AM)."""
-    hour = dt.strftime("%I").lstrip("0") or "12"
-    minute = dt.strftime("%M")
-    ampm = dt.strftime("%p")
-    return f"{hour}:{minute} {ampm}"
+    return format_12hr_time(dt)
 def hash_password(pw: str) -> str:
     return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
 
@@ -1560,7 +1636,28 @@ async def calculate_appointment_eta(appt: dict) -> dict:
         # Local clinic / Indian Standard Time (UTC+5:30)
         ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
         future_dt = ist_now + timedelta(minutes=eta_minutes)
-        expected_turn_time = format_clock_time(future_dt)
+        window_minutes = max(per, 30)
+        end_dt = future_dt + timedelta(minutes=window_minutes)
+        expected_turn_time = format_expected_time_range(future_dt, end_dt)
+    elif appt.get("slot") and appt.get("slot") != "Walk-in":
+        slot_str = appt.get("slot", "")
+        m_slot = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)?", slot_str, re.IGNORECASE)
+        if m_slot:
+            start_fmt = format_12hr_time(slot_str)
+            hr_p = int(m_slot.group(1))
+            min_p = int(m_slot.group(2))
+            meridiem = (m_slot.group(3) or "AM").upper()
+            if meridiem == "PM" and hr_p < 12:
+                hr_p += 12
+            elif meridiem == "AM" and hr_p == 12:
+                hr_p = 0
+            end_min = min_p + 30
+            end_hr = (hr_p + end_min // 60) % 24
+            end_min = end_min % 60
+            end_time_str = format_12hr_time(f"{end_hr:02d}:{end_min:02d}")
+            expected_turn_time = format_expected_time_range(start_fmt, end_time_str)
+        else:
+            expected_turn_time = format_12hr_time(slot_str) or None
 
     return {
         "my_position": my_position,
@@ -1648,19 +1745,28 @@ async def create_appointment(
         eta_data = await calculate_appointment_eta(doc)
         dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
         hour_val = format_renflair_hour(eta_data.get("expected_turn_time") or doc.get("slot"), default="2")
+        hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
+        expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
         try:
             sms_res = await send_appointment_sms(
                 phone=patient_mobile,
                 oid=token_number,
                 hour=hour_val,
+                hospital_name=hospital_name,
                 patient_name=user["full_name"],
                 doctor_name=doctor["full_name"],
                 token_number=token_number,
-                estimated_time=eta_data.get("expected_turn_time") or "As per live queue",
+                expected_time=expected_time_val,
+                estimated_time=expected_time_val,
+                live_queue_link=dynamic_link,
                 appointment_link=dynamic_link,
             )
             sms_status = "sent" if sms_res.get("ok") else "failed"
-            await db.appointments.update_one({"id": appt_id}, {"$set": {"sms_status": sms_status}})
+            sms_updates = {"sms_status": sms_status}
+            if sms_res.get("sms_text"):
+                sms_updates["sms_text"] = sms_res["sms_text"]
+                doc["sms_text"] = sms_res["sms_text"]
+            await db.appointments.update_one({"id": appt_id}, {"$set": sms_updates})
             doc["sms_status"] = sms_status
         except Exception as e:
             logger.warning(f"SMS sending failed (non-blocking): {e}")
@@ -2206,19 +2312,28 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
         eta_data = await calculate_appointment_eta(appt)
         dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
         hour_val = format_renflair_hour(eta_data.get("expected_turn_time") or appt.get("slot"), default="2")
+        hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
+        expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
         try:
             sms_res = await send_appointment_sms(
                 phone=mobile,
                 oid=appt["token_number"],
                 hour=hour_val,
+                hospital_name=hospital_name,
                 patient_name=patient_name,
                 doctor_name=doctor["full_name"],
                 token_number=appt["token_number"],
-                estimated_time=eta_data.get("expected_turn_time") or "As per live queue",
+                expected_time=expected_time_val,
+                estimated_time=expected_time_val,
+                live_queue_link=dynamic_link,
                 appointment_link=dynamic_link,
             )
             sms_status = "sent" if sms_res.get("ok") else "failed"
-            await db.appointments.update_one({"id": appt_id}, {"$set": {"sms_status": sms_status}})
+            sms_updates = {"sms_status": sms_status}
+            if sms_res.get("sms_text"):
+                sms_updates["sms_text"] = sms_res["sms_text"]
+                appt["sms_text"] = sms_res["sms_text"]
+            await db.appointments.update_one({"id": appt_id}, {"$set": sms_updates})
             appt["sms_status"] = sms_status
         except Exception as e:
             logger.warning(f"SMS sending failed (non-blocking): {e}")
@@ -2268,27 +2383,37 @@ async def reception_send_appointment_link(
     eta_data = await calculate_appointment_eta(appt)
     dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
     hour_val = format_renflair_hour(eta_data.get("expected_turn_time") or appt.get("slot"), default="2")
+    doctor = await db.doctors.find_one({"id": appt.get("doctor_id")}) if appt.get("doctor_id") else None
+    hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
+    expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
 
     sms_res = await send_appointment_sms(
         phone=mobile,
         oid=appt.get("token_number", 1),
         hour=hour_val,
+        hospital_name=hospital_name,
         patient_name=appt.get("patient_name", "Patient"),
         doctor_name=appt.get("doctor_name", "Doctor"),
         token_number=appt.get("token_number", 1),
-        estimated_time=eta_data.get("expected_turn_time") or "As per live queue",
+        expected_time=expected_time_val,
+        estimated_time=expected_time_val,
+        live_queue_link=dynamic_link,
         appointment_link=dynamic_link,
     )
     sms_status = "sent" if sms_res.get("ok") else "failed"
+    sms_updates = {"sms_status": sms_status, "sms_last_sent_at": now_iso()}
+    if sms_res.get("sms_text"):
+        sms_updates["sms_text"] = sms_res["sms_text"]
     await db.appointments.update_one(
         {"id": appt_id},
-        {"$set": {"sms_status": sms_status, "sms_last_sent_at": now_iso()}}
+        {"$set": sms_updates}
     )
 
     return {
         "ok": True,
         "message": f"Link sent to {mobile}",
         "sms_status": sms_status,
+        "sms_text": sms_res.get("sms_text"),
         "appointment_link": dynamic_link,
     }
 

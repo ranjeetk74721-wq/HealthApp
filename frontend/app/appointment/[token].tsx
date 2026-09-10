@@ -14,6 +14,7 @@ import { useRouter, useLocalSearchParams } from "expo-router";
 import { api, getBackendWebSocketBase } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
+import { formatExpectedTimeRange } from "@/src/utils/timeFormat";
 
 const POLL_INTERVAL_MS = 15_000;
 
@@ -219,7 +220,10 @@ export default function DynamicAppointmentScreen() {
 
   const tokenNumber = apptData?.token_number;
   const currentServing = queueData?.currently_serving;
-  const expectedTurnTime = queueData?.expected_turn_time || "Calculating...";
+  const rawExpectedTurnTime = queueData?.expected_turn_time;
+  const expectedTurnTime = rawExpectedTurnTime
+    ? formatExpectedTimeRange(rawExpectedTurnTime)
+    : "Calculating...";
   const myPosition = queueData?.my_position ?? -1;
   const status = apptData?.status || "booked";
 
@@ -258,7 +262,7 @@ export default function DynamicAppointmentScreen() {
             <View style={{ flex: 1 }}>
               <Text style={styles.doctorName}>{apptData?.doctor_name}</Text>
               <Text style={styles.metaSub}>
-                {apptData?.date} · {apptData?.slot || "Walk-in"}
+                {apptData?.date} · {apptData?.slot ? formatExpectedTimeRange(apptData.slot) : "Walk-in"}
               </Text>
             </View>
             <View
@@ -294,8 +298,8 @@ export default function DynamicAppointmentScreen() {
               </Text>
             </View>
             <View style={styles.kpiItem}>
-              <Text style={styles.kpiCaption}>Estimated Turn</Text>
-              <Text style={[styles.kpiValue, { color: colors.brandPrimary }]}>
+              <Text style={styles.kpiCaption}>Expected Time</Text>
+              <Text style={[styles.kpiValue, { color: colors.brandPrimary }]} testID="expected-turn-time">
                 {expectedTurnTime}
               </Text>
             </View>

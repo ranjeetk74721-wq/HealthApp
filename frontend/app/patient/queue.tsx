@@ -6,6 +6,7 @@ import { useRouter, useFocusEffect } from "expo-router";
 import { api, getBackendWebSocketBase } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
+import { formatExpectedTimeRange } from "@/src/utils/timeFormat";
 
 // Polling interval when WebSocket is NOT connected (fallback)
 const POLL_INTERVAL_MS = 20_000;
@@ -187,11 +188,11 @@ export default function PatientQueue() {
               ? "Please head to the consultation room"
               : isDone
               ? "Consultation completed"
-              : `Your expected turn: ${data.expected_turn_time || '~' + data.eta_minutes + ' min'}`}
+              : `Expected Time: ${data.expected_turn_time ? formatExpectedTimeRange(data.expected_turn_time) : "Calculating..."}`}
           </Text>
           {!isServing && !isDone && (
             <Text style={styles.heroSub}>
-              ~{data.eta_minutes} mins waiting time ({data.my_position > 1 ? `${data.my_position - 1} patient${data.my_position > 2 ? 's' : ''} ahead` : 'Next in line'})
+              {data.my_position > 1 ? `${data.my_position - 1} patient${data.my_position > 2 ? 's' : ''} ahead` : 'Next in line'}
             </Text>
           )}
         </View>
