@@ -9,7 +9,7 @@ if str(_backend_dir) not in sys.path:
 import pytest
 import httpx
 from server import format_12hr_time, format_expected_time_range, calculate_appointment_eta
-from sms_service import format_appointment_sms_text, send_appointment_sms, HINDI_QUEUE_INSTRUCTION
+from sms_service import format_appointment_sms_text, send_appointment_sms, HINDI_QUEUE_INSTRUCTION, format_renflair_hour
 
 
 class Test12HourTimeFormat:
@@ -204,3 +204,24 @@ class TestInternalQueueLogicPreservation:
         if "–" in turn_time:
             parts = turn_time.split("–")
             assert parts[0].strip() != parts[1].strip()
+
+    def test_minute_duration_to_range_conversion(self):
+        """Passing minute numbers or '15 min' converts cleanly into 12-hour AM/PM range, not raw minutes."""
+        res1 = format_expected_time_range(15)
+        assert "–" in res1
+        assert ("AM" in res1 or "PM" in res1)
+        assert "min" not in res1
+
+        res2 = format_expected_time_range("120 min")
+        assert "–" in res2
+        assert ("AM" in res2 or "PM" in res2)
+        assert "min" not in res2
+
+    def test_format_renflair_hour_preserves_12hr_range(self):
+        """format_renflair_hour preserves full 12-hour AM/PM range instead of collapsing to an integer."""
+        res = format_renflair_hour("2:00 PM – 2:30 PM")
+        assert res == "2:00 PM – 2:30 PM"
+
+        res2 = format_renflair_hour("14:00 - 14:30")
+        assert res2 == "2:00 PM – 2:30 PM"
+

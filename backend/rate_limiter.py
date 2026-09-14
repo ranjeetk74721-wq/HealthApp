@@ -296,3 +296,22 @@ def enforce_send_sms_cooldown(appt_id: str):
             detail=f"Please wait {retry}s before resending the appointment link.",
             headers={"Retry-After": str(retry)},
         )
+
+
+def enforce_dev_test_sms_rate_limit(request: Request, user_id: str = ""):
+    """Enforce rate limiting for dev test SMS (3 requests / 10 minutes per user/IP)."""
+    ip = get_client_ip(request)
+    key = f"dev_sms:{user_id or ip}"
+    allowed, retry, msg = rate_limiter.check_rate_limit(
+        key=key,
+        max_requests=3,
+        window_seconds=600,
+        key_type="user",
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Test SMS rate limit exceeded (maximum 3 requests per 10 minutes). Retry after {retry}s.",
+            headers={"Retry-After": str(retry)},
+        )
+

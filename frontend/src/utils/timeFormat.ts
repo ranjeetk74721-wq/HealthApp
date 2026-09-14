@@ -61,13 +61,38 @@ export function format12HourTime(val: string | Date | null | undefined): string 
 }
 
 /**
+ * Converts a wait time in minutes (or duration string like "15m", "15 min")
+ * into a 12-hour AM/PM expected consultation window (e.g. "2:00 PM – 2:30 PM").
+ */
+export function formatExpectedWait(minutesVal: number | string | null | undefined): string {
+  if (minutesVal === null || minutesVal === undefined) return "Available Now";
+  const numStr = String(minutesVal).replace(/[^0-9]/g, "");
+  const mins = parseInt(numStr, 10);
+  if (isNaN(mins) || mins <= 0) return "Available Now";
+  const now = new Date();
+  const start = new Date(now.getTime() + mins * 60 * 1000);
+  const end = new Date(start.getTime() + 30 * 60 * 1000);
+  return formatExpectedTimeRange(start, end);
+}
+
+/**
  * Formats a time range ensuring 12-hour AM/PM and preventing duplicate ranges (e.g. "2:00 PM – 2:00 PM" -> "2:00 PM").
  */
 export function formatExpectedTimeRange(
-  startVal: string | Date | null | undefined,
+  startVal: string | Date | number | null | undefined,
   endVal?: string | Date | null | undefined
 ): string {
-  if (!startVal) return endVal ? format12HourTime(endVal) : "";
+  if (startVal === null || startVal === undefined || startVal === "") {
+    return endVal ? format12HourTime(endVal) : "";
+  }
+
+  // If startVal is a number of minutes or minute string like 15, "15m", "15 min", or "~15m wait"
+  if (typeof startVal === "number") {
+    return formatExpectedWait(startVal);
+  }
+  if (typeof startVal === "string" && /^~?\s*\d+\s*(?:m|min|mins|minute|minutes)?(?:\s*wait)?$/i.test(startVal.trim())) {
+    return formatExpectedWait(startVal);
+  }
 
   // If startVal contains a range separator already like "14:00 - 14:30" or "2:00 PM – 2:30 PM"
   if (typeof startVal === "string" && (startVal.includes(" - ") || startVal.includes(" – "))) {

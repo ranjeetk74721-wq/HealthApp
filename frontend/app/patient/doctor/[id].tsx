@@ -5,6 +5,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
+import { formatExpectedWait } from "@/src/utils/timeFormat";
 
 export default function DoctorProfile() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -65,8 +66,10 @@ export default function DoctorProfile() {
               <Text style={styles.infoValue}>₹{doctor.fees}</Text>
             </View>
             <View style={styles.infoCard}>
-              <Text style={styles.infoLabel}>Wait time</Text>
-              <Text style={styles.infoValue}>~{doctor.est_wait_minutes}m</Text>
+              <Text style={styles.infoLabel}>Expected Time</Text>
+              <Text style={[styles.infoValue, { fontSize: font.sm }]} testID="doctor-expected-time">
+                {formatExpectedWait(doctor.est_wait_minutes)}
+              </Text>
             </View>
             <View style={styles.infoCard}>
               <Text style={styles.infoLabel}>Status</Text>

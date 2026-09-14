@@ -5,6 +5,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
+import { formatExpectedTimeRange } from "@/src/utils/timeFormat";
 
 function getDates(count: number) {
   const arr = [];
@@ -67,6 +68,11 @@ export default function BookAppointment() {
           <View style={styles.successCard}>
             <Text style={styles.successRow}>{success.doctor_name}</Text>
             <Text style={styles.successMeta}>Date: {success.date} · Token #{success.token_number}</Text>
+            {success.expected_turn_time || success.expected_time ? (
+              <Text style={styles.successTime} testID="success-expected-time">
+                Expected Time: {formatExpectedTimeRange(success.expected_turn_time || success.expected_time)}
+              </Text>
+            ) : null}
           </View>
           <Pressable testID="view-queue-btn" onPress={() => router.replace("/patient/queue")} style={styles.primaryBtn}>
             <Text style={styles.primaryBtnText}>अपनी बारी देखे</Text>
@@ -204,6 +210,7 @@ const styles = StyleSheet.create({
   successCard: { backgroundColor: colors.surfaceSecondary, padding: spacing.lg, borderRadius: radius.md, alignItems: "center", width: "100%" },
   successRow: { fontSize: font.lg, fontWeight: "600", color: colors.onSurface },
   successMeta: { fontSize: font.base, color: colors.muted, marginTop: 4 },
+  successTime: { fontSize: font.base, fontWeight: "700", color: colors.brandPrimary, marginTop: 6 },
   primaryBtn: { backgroundColor: colors.brandPrimary, borderRadius: radius.md, padding: spacing.lg, alignItems: "center", width: "100%", marginTop: spacing.md },
   primaryBtnText: { color: colors.onBrandPrimary, fontSize: font.lg, fontWeight: "700" },
   linkBtn: { padding: spacing.sm },

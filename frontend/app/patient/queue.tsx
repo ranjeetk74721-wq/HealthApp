@@ -188,7 +188,7 @@ export default function PatientQueue() {
               ? "Please head to the consultation room"
               : isDone
               ? "Consultation completed"
-              : `Expected Time: ${data.expected_turn_time ? formatExpectedTimeRange(data.expected_turn_time) : "Calculating..."}`}
+              : `Expected Time: ${formatExpectedTimeRange(data.expected_turn_time || data.eta_minutes || "Calculating...")}`}
           </Text>
           {!isServing && !isDone && (
             <Text style={styles.heroSub}>

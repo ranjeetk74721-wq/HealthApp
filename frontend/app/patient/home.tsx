@@ -7,6 +7,7 @@ import { LinearGradient } from "expo-linear-gradient";
 import { useAuth } from "@/src/context/AuthContext";
 import { api } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
+import { formatExpectedTimeRange, formatExpectedWait } from "@/src/utils/timeFormat";
 
 interface Doctor {
   id: string;
@@ -152,7 +153,9 @@ export default function PatientHome() {
             <LinearGradient colors={["rgba(3, 105, 161, 0.85)", "rgba(3, 105, 161, 0.95)"]} style={styles.upcomingOverlay}>
               <Text style={styles.upcomingLabel}>UPCOMING APPOINTMENT</Text>
               <Text style={styles.upcomingName}>{upcoming.doctor_name}</Text>
-              <Text style={styles.upcomingMeta}>Token #{upcoming.token_number} · {upcoming.slot}</Text>
+              <Text style={styles.upcomingMeta}>
+                Token #{upcoming.token_number} · Expected: {formatExpectedTimeRange(upcoming.expected_turn_time || upcoming.slot || "As per live queue")}
+              </Text>
               <View style={styles.upcomingCta}>
                 <Text style={styles.upcomingCtaText}>अपनी बारी देखे</Text>
                 <Ionicons name="arrow-forward" size={16} color={colors.onBrandPrimary} />
@@ -218,7 +221,7 @@ export default function PatientHome() {
                   </View>
                   <View style={styles.metaPill}>
                     <Ionicons name="time-outline" size={12} color={colors.brandPrimary} />
-                    <Text style={styles.metaPillText}>~{d.est_wait_minutes}m wait</Text>
+                    <Text style={styles.metaPillText}>{formatExpectedWait(d.est_wait_minutes)}</Text>
                   </View>
                   <Text style={styles.fees}>₹{d.fees}</Text>
                 </View>

@@ -28,9 +28,9 @@ if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
 try:
-    from sms_service import send_appointment_sms, send_otp_sms, get_app_public_url, format_renflair_hour
+    from sms_service import send_appointment_sms, send_otp_sms, get_app_public_url, format_renflair_hour, get_sms_provider
 except ImportError:
-    from backend.sms_service import send_appointment_sms, send_otp_sms, get_app_public_url, format_renflair_hour
+    from backend.sms_service import send_appointment_sms, send_otp_sms, get_app_public_url, format_renflair_hour, get_sms_provider
 
 try:
     from rate_limiter import (
@@ -39,6 +39,7 @@ try:
         enforce_verify_otp_rate_limit,
         enforce_send_sms_cooldown,
         enforce_general_ip_rate_limit,
+        enforce_dev_test_sms_rate_limit,
         get_client_ip,
     )
 except ImportError:
@@ -48,6 +49,7 @@ except ImportError:
         enforce_verify_otp_rate_limit,
         enforce_send_sms_cooldown,
         enforce_general_ip_rate_limit,
+        enforce_dev_test_sms_rate_limit,
         get_client_ip,
     )
 
@@ -465,6 +467,11 @@ class AutoReferBody(BaseModel):
     reason: Optional[str] = "Doctor unavailable / Auto-referred"
 
 
+class DevTestSMSBody(BaseModel):
+    phone: str
+
+
+
 # ============ HELPERS ============
 MAX_PHOTO_BYTES = 5 * 1024 * 1024  # 5 MB limit
 
@@ -537,9 +544,20 @@ def format_expected_time_range(start: Any, end: Optional[Any] = None) -> str:
     '2:00 PM – 2:30 PM'
     Rule: If start and end are identical, returns '2:00 PM' without duplicate.
     Also handles single string range inputs like '14:00 - 14:30' or '10:00 – 10:45'.
+    If start is a minute duration (e.g. 15, '15m', '15 min'), computes clock window from current IST time.
     """
     if start is None and end is None:
         return ""
+
+    # If start is a minute number or duration string like 15 or '15 min' or '~15m'
+    if isinstance(start, (int, float)) or (isinstance(start, str) and re.match(r"^~?\d+\s*(?:m|min|mins|minute|minutes)?$", str(start).strip(), re.I)):
+        m_val = int(re.sub(r"\D", "", str(start)) or 0)
+        if m_val <= 0:
+            return "Available Now"
+        ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+        f_dt = ist_now + timedelta(minutes=m_val)
+        e_dt = f_dt + timedelta(minutes=30)
+        return f"{format_12hr_time(f_dt)} – {format_12hr_time(e_dt)}"
 
     if isinstance(start, str) and not end:
         sep = " – " if " – " in start else (" - " if " - " in start else None)
@@ -1806,12 +1824,16 @@ async def create_appointment(
         )
 
     # Calculate latest ETA and trigger Renflair V7 transactional SMS
+    eta_data = await calculate_appointment_eta(doc)
+    expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
+    doc["expected_turn_time"] = expected_time_val
+    doc["expected_time"] = expected_time_val
+    doc["eta_minutes"] = eta_data.get("eta_minutes", 0)
+
     if patient_mobile:
-        eta_data = await calculate_appointment_eta(doc)
         dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
-        hour_val = format_renflair_hour(eta_data.get("expected_turn_time") or doc.get("slot"), default="2")
+        hour_val = expected_time_val if (" – " in expected_time_val or " - " in expected_time_val) else format_renflair_hour(expected_time_val, default="2")
         hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
-        expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
         try:
             sms_res = await send_appointment_sms(
                 phone=patient_mobile,
@@ -1828,6 +1850,9 @@ async def create_appointment(
             )
             sms_status = "sent" if sms_res.get("ok") else "failed"
             sms_updates = {"sms_status": sms_status}
+            if sms_res.get("message_id"):
+                sms_updates["sms_provider_message_id"] = sms_res["message_id"]
+                doc["sms_provider_message_id"] = sms_res["message_id"]
             if sms_res.get("sms_text"):
                 sms_updates["sms_text"] = sms_res["sms_text"]
                 doc["sms_text"] = sms_res["sms_text"]
@@ -1844,6 +1869,11 @@ async def create_appointment(
 @api_router.get("/appointments/me")
 async def my_appointments(user: dict = Depends(require_role("patient"))):
     appts = await db.appointments.find({"patient_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    for a in appts:
+        if a.get("status") in ("booked", "arrived", "in_consultation"):
+            eta = await calculate_appointment_eta(a)
+            a["expected_turn_time"] = eta.get("expected_turn_time")
+            a["eta_minutes"] = eta.get("eta_minutes")
     return appts
 
 
@@ -2376,9 +2406,12 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
         # Trigger Renflair Transactional SMS V7
         eta_data = await calculate_appointment_eta(appt)
         dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
-        hour_val = format_renflair_hour(eta_data.get("expected_turn_time") or appt.get("slot"), default="2")
-        hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
         expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
+        hour_val = expected_time_val if (" – " in expected_time_val or " - " in expected_time_val) else format_renflair_hour(expected_time_val, default="2")
+        appt["expected_turn_time"] = expected_time_val
+        appt["expected_time"] = expected_time_val
+        appt["eta_minutes"] = eta_data.get("eta_minutes", 0)
+        hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
         try:
             sms_res = await send_appointment_sms(
                 phone=mobile,
@@ -2395,6 +2428,9 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
             )
             sms_status = "sent" if sms_res.get("ok") else "failed"
             sms_updates = {"sms_status": sms_status}
+            if sms_res.get("message_id"):
+                sms_updates["sms_provider_message_id"] = sms_res["message_id"]
+                appt["sms_provider_message_id"] = sms_res["message_id"]
             if sms_res.get("sms_text"):
                 sms_updates["sms_text"] = sms_res["sms_text"]
                 appt["sms_text"] = sms_res["sms_text"]
@@ -2447,10 +2483,10 @@ async def reception_send_appointment_link(
     # Fetch latest ETA using existing queue logic
     eta_data = await calculate_appointment_eta(appt)
     dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
-    hour_val = format_renflair_hour(eta_data.get("expected_turn_time") or appt.get("slot"), default="2")
+    expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
+    hour_val = expected_time_val if (" – " in expected_time_val or " - " in expected_time_val) else format_renflair_hour(expected_time_val, default="2")
     doctor = await db.doctors.find_one({"id": appt.get("doctor_id")}) if appt.get("doctor_id") else None
     hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
-    expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
 
     sms_res = await send_appointment_sms(
         phone=mobile,
@@ -2467,6 +2503,8 @@ async def reception_send_appointment_link(
     )
     sms_status = "sent" if sms_res.get("ok") else "failed"
     sms_updates = {"sms_status": sms_status, "sms_last_sent_at": now_iso()}
+    if sms_res.get("message_id"):
+        sms_updates["sms_provider_message_id"] = sms_res["message_id"]
     if sms_res.get("sms_text"):
         sms_updates["sms_text"] = sms_res["sms_text"]
     await db.appointments.update_one(
@@ -2478,9 +2516,132 @@ async def reception_send_appointment_link(
         "ok": True,
         "message": f"Link sent to {mobile}",
         "sms_status": sms_status,
+        "provider_message_id": sms_res.get("message_id"),
         "sms_text": sms_res.get("sms_text"),
         "appointment_link": dynamic_link,
     }
+
+
+# ============ DEV TEST SMS & DELIVERY STATUS ENDPOINTS ============
+
+@api_router.post("/dev/test-sms")
+async def dev_test_sms(
+    request: Request,
+    body: DevTestSMSBody,
+    user: dict = Depends(get_current_user),
+):
+    """Development/testing endpoint to verify provider connectivity (Requirement 10).
+    - Enabled only when DEV_TEST_SMS_ENABLED=1 or ENVIRONMENT=development
+    - Admin/Developer authorization required
+    - Rate limited (3 req / 10 min per test user)
+    - Hardcoded safe test message generated by server (no client injection)
+    - Returns provider status & message ID, NEVER leaks API tokens
+    """
+    dev_enabled = (
+        os.environ.get("DEV_TEST_SMS_ENABLED", "0").strip() in ("1", "true", "True")
+        or os.environ.get("ENVIRONMENT", "").lower() in ("development", "test", "dev")
+    )
+    if not dev_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Development test SMS endpoint is disabled."
+        )
+
+    # Require admin, owner, developer, doctor, or receptionist role
+    if user.get("role") not in ("owner", "admin", "developer", "doctor", "receptionist"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or developer privileges required for test SMS."
+        )
+
+    enforce_dev_test_sms_rate_limit(request, user.get("id", ""))
+
+    provider = get_sms_provider()
+    test_message = "Meribaari SMS integration test successful."
+
+    if provider == "liveair":
+        try:
+            from liveair_sms_service import send_liveair_sms
+        except ImportError:
+            from backend.liveair_sms_service import send_liveair_sms
+            
+        res = await send_liveair_sms(
+            phone=body.phone,
+            message=test_message,
+            purpose="connectivity_test",
+        )
+        return {
+            "ok": res.get("success", False),
+            "provider": "liveair",
+            "message_id": res.get("message_id"),
+            "status": "sent" if res.get("success") else "failed",
+            "error": res.get("error"),
+            "code": res.get("code"),
+        }
+    elif provider == "brevo":
+        try:
+            from sms_service import send_sms_via_brevo
+        except ImportError:
+            from backend.sms_service import send_sms_via_brevo
+            
+        res = await send_sms_via_brevo(body.phone, test_message)
+        return {
+            "ok": res.get("ok", False),
+            "provider": "brevo",
+            "message_id": res.get("message_id"),
+            "status": "sent" if res.get("ok") else "failed",
+            "error": res.get("error"),
+        }
+    else:
+        # Default Renflair
+        res = await send_appointment_sms(
+            phone=body.phone,
+            oid=999,
+            hour="12:00 PM",
+            hospital_name="MeriBaari Test",
+            doctor_name="Doctor Test",
+            token_number=999,
+            expected_time="12:00 PM",
+            live_queue_link=f"{get_app_public_url()}/appointment/test-link",
+        )
+        return {
+            "ok": res.get("ok", False),
+            "provider": res.get("provider", "renflair"),
+            "message_id": res.get("message_id"),
+            "status": "sent" if res.get("ok") else "failed",
+            "error": res.get("error"),
+        }
+
+
+@api_router.get("/dev/sms-delivery/{message_id}")
+async def dev_sms_delivery_status(
+    message_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Check SMS delivery status report via LiveAir Delivery Report API (Requirement 11)."""
+    dev_enabled = (
+        os.environ.get("DEV_TEST_SMS_ENABLED", "0").strip() in ("1", "true", "True")
+        or os.environ.get("ENVIRONMENT", "").lower() in ("development", "test", "dev")
+    )
+    if not dev_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Development test SMS endpoint is disabled."
+        )
+
+    if user.get("role") not in ("owner", "admin", "developer", "doctor", "receptionist"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or developer privileges required to check delivery status."
+        )
+
+    try:
+        from liveair_sms_service import get_liveair_delivery_status
+    except ImportError:
+        from backend.liveair_sms_service import get_liveair_delivery_status
+        
+    return await get_liveair_delivery_status(message_id)
+
 
 
 # ============ WEBSOCKET ENDPOINTS ============
