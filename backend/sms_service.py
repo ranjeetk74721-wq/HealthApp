@@ -93,7 +93,7 @@ def get_brevo_sender() -> str:
 
 def get_app_public_url() -> str:
     """Retrieve public frontend URL for dynamic appointment links."""
-    return os.environ.get("APP_PUBLIC_URL", "http://localhost:8081").rstrip("/")
+    return os.environ.get("APP_PUBLIC_URL", "https://health-at0ltu9id-mariya12.vercel.app").rstrip("/")
 
 
 def mask_phone_for_logging(phone: str) -> str:
@@ -276,7 +276,7 @@ def format_appointment_sms_text(
     clean_doc = doc if not doc.lower().startswith("dr.") else doc[3:].strip()
     clean_token = str(token_number or "1").strip()
     clean_time = str(expected_time or "As per live queue").strip()
-    clean_link = str(live_queue_link or "https://health-pkt0cdyis-mariya12.vercel.app/login").strip()
+    clean_link = str(live_queue_link or "https://health-at0ltu9id-mariya12.vercel.app/login").strip()
 
     return (
         f"{hosp}\n"
@@ -415,18 +415,35 @@ async def send_otp_sms(phone: str, otp: str) -> Dict[str, Any]:
 
     provider = get_sms_provider()
 
-    # Route to LiveAir OTP if explicitly enabled
+    # Route to LiveAir OTP if explicitly enabled (LIVEAIR_OTP_ENABLED=1)
     if provider == "liveair" and os.environ.get("LIVEAIR_OTP_ENABLED") == "1":
-        otp_route = os.environ.get("LIVEAIR_OTP_ROUTE", "4")
-        otp_template = os.environ.get("LIVEAIR_OTP_TEMPLATE_ID")
-        otp_msg = f"Your MeriBaari verification code is {clean_otp}. Valid for 5 minutes. Do not share this OTP."
+        otp_sender = (os.environ.get("LIVEAIR_OTP_SENDER_ID") or os.environ.get("LIVEAIR_SENDER_ID") or "newsen").strip()
+        otp_route = str(os.environ.get("LIVEAIR_OTP_ROUTE", "4")).strip()
+        otp_type = str(os.environ.get("LIVEAIR_OTP_MESSAGE_TYPE") or os.environ.get("LIVEAIR_MESSAGE_TYPE", "1")).strip()
+        otp_template = (os.environ.get("LIVEAIR_OTP_TEMPLATE_ID") or os.environ.get("LIVEAIR_TEMPLATE_ID") or "").strip()
+        otp_msg = f"Your Meribaari OTP is {clean_otp}. It is valid for 5 minutes."
+        
         res = await send_liveair_sms(
             phone=formatted_phone,
             message=otp_msg,
             template_id=otp_template,
             route=otp_route,
+            sender=otp_sender,
+            message_type=otp_type,
             purpose="otp_verification",
         )
+        
+        masked_phone = f"******{formatted_phone[-4:]}" if len(formatted_phone) >= 4 else "******"
+        logger.info(
+            f"[OTP]\n"
+            f"Phone: {masked_phone}\n"
+            f"Existing user: NO\n"
+            f"Provider: LiveAir\n"
+            f"Route: {otp_route}\n"
+            f"Send status: {'ACCEPTED' if res.get('success') else 'FAILED'}\n"
+            f"Provider message id: {res.get('message_id') or 'NONE'}"
+        )
+        
         return {
             "ok": res.get("success", False),
             "provider": "liveair",

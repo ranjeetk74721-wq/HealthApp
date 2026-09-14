@@ -12,6 +12,11 @@ from server import format_12hr_time, format_expected_time_range, calculate_appoi
 from sms_service import format_appointment_sms_text, send_appointment_sms, HINDI_QUEUE_INSTRUCTION, format_renflair_hour
 
 
+@pytest.fixture(autouse=True)
+def force_renflair_provider(monkeypatch):
+    monkeypatch.setenv("SMS_PROVIDER", "renflair")
+
+
 class Test12HourTimeFormat:
     """Tests 12-hour AM/PM conversion and formatting."""
 

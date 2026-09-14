@@ -175,6 +175,14 @@ async def ensure_db_indexes():
     """Create indexes for all frequently-queried fields.
     create_index is idempotent — safe to run on every startup.
     """
+    # LiveAir configuration validation at backend startup (Requirement 3)
+    if os.environ.get("SMS_PROVIDER", "").strip().lower() == "liveair":
+        try:
+            from liveair_sms_service import validate_liveair_startup_config
+            validate_liveair_startup_config()
+        except Exception as e:
+            logger.warning(f"LiveAir startup validation warning: {e}")
+
     try:
         await asyncio.gather(
             # users
@@ -1349,13 +1357,26 @@ async def send_otp(request: Request, body: SendOTPBody):
     otp = f"{secrets.randbelow(900000) + 100000}"
     save_memory_otp(mobile, otp, OTP_EXP_SECONDS)
     
-    # Deliver OTP via Renflair Transactional SMS V1
+    # Deliver OTP via configured SMS provider
     try:
         sms_res = await send_otp_sms(mobile, otp)
         if not sms_res.get("ok"):
-            logger.warning(f"Renflair OTP SMS failed (non-blocking): {sms_res.get('error')}")
+            logger.warning(f"OTP SMS delivery failed: {sms_res.get('error')}")
+            if get_sms_provider() == "liveair" and os.environ.get("ALLOW_DEV_OTP") != "1":
+                err_msg = sms_res.get("error") or "Failed to deliver OTP SMS via gateway."
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Unable to send verification SMS: {err_msg}"
+                )
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning(f"OTP SMS delivery error (non-blocking): {e}")
+        logger.error(f"OTP SMS delivery error: {e}")
+        if get_sms_provider() == "liveair" and os.environ.get("ALLOW_DEV_OTP") != "1":
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="SMS gateway connection error. Please try again later."
+            )
     
     # Plaintext OTP is NEVER logged or exposed in API response
     return {
@@ -1848,16 +1869,38 @@ async def create_appointment(
                 live_queue_link=dynamic_link,
                 appointment_link=dynamic_link,
             )
-            sms_status = "sent" if sms_res.get("ok") else "failed"
-            sms_updates = {"sms_status": sms_status}
+            sms_ok = sms_res.get("ok", False)
+            sms_provider_name = sms_res.get("provider") or get_sms_provider()
+            sms_status = "SENT_TO_PROVIDER" if sms_ok else "FAILED"
+            sms_updates = {
+                "sms_provider": sms_provider_name,
+                "sms_status": sms_status,
+                "sms_last_attempt_at": now_iso(),
+            }
             if sms_res.get("message_id"):
                 sms_updates["sms_provider_message_id"] = sms_res["message_id"]
                 doc["sms_provider_message_id"] = sms_res["message_id"]
+            if sms_res.get("error_code") or sms_res.get("code"):
+                sms_updates["sms_error_code"] = sms_res.get("error_code") or sms_res.get("code")
             if sms_res.get("sms_text"):
                 sms_updates["sms_text"] = sms_res["sms_text"]
                 doc["sms_text"] = sms_res["sms_text"]
             await db.appointments.update_one({"id": appt_id}, {"$set": sms_updates})
             doc["sms_status"] = sms_status
+            doc["sms_provider"] = sms_provider_name
+
+            masked_num = f"******{patient_mobile[-4:]}" if len(patient_mobile) >= 6 else "*****"
+            logger.info(
+                f"[BOOKING_SMS]\n"
+                f"Booking created: YES\n"
+                f"SMS function called: YES\n"
+                f"Provider: {sms_provider_name.title()}\n"
+                f"Recipient: {masked_num}\n"
+                f"Route: {os.environ.get('LIVEAIR_ROUTE', '3')}\n"
+                f"Template configured: {'YES' if os.environ.get('LIVEAIR_TEMPLATE_ID') else 'NO'}\n"
+                f"Provider response: {sms_res.get('message_id') or sms_res.get('error') or 'NONE'}\n"
+                f"Delivery status: {'PENDING' if sms_ok else 'FAILED'}"
+            )
         except Exception as e:
             logger.warning(f"SMS sending failed (non-blocking): {e}")
 
@@ -2426,16 +2469,38 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
                 live_queue_link=dynamic_link,
                 appointment_link=dynamic_link,
             )
-            sms_status = "sent" if sms_res.get("ok") else "failed"
-            sms_updates = {"sms_status": sms_status}
+            sms_ok = sms_res.get("ok", False)
+            sms_provider_name = sms_res.get("provider") or get_sms_provider()
+            sms_status = "SENT_TO_PROVIDER" if sms_ok else "FAILED"
+            sms_updates = {
+                "sms_provider": sms_provider_name,
+                "sms_status": sms_status,
+                "sms_last_attempt_at": now_iso(),
+            }
             if sms_res.get("message_id"):
                 sms_updates["sms_provider_message_id"] = sms_res["message_id"]
                 appt["sms_provider_message_id"] = sms_res["message_id"]
+            if sms_res.get("error_code") or sms_res.get("code"):
+                sms_updates["sms_error_code"] = sms_res.get("error_code") or sms_res.get("code")
             if sms_res.get("sms_text"):
                 sms_updates["sms_text"] = sms_res["sms_text"]
                 appt["sms_text"] = sms_res["sms_text"]
             await db.appointments.update_one({"id": appt_id}, {"$set": sms_updates})
             appt["sms_status"] = sms_status
+            appt["sms_provider"] = sms_provider_name
+
+            masked_num = f"******{mobile[-4:]}" if len(mobile) >= 6 else "*****"
+            logger.info(
+                f"[BOOKING_SMS]\n"
+                f"Booking created: YES\n"
+                f"SMS function called: YES\n"
+                f"Provider: {sms_provider_name.title()}\n"
+                f"Recipient: {masked_num}\n"
+                f"Route: {os.environ.get('LIVEAIR_ROUTE', '3')}\n"
+                f"Template configured: {'YES' if os.environ.get('LIVEAIR_TEMPLATE_ID') else 'NO'}\n"
+                f"Provider response: {sms_res.get('message_id') or sms_res.get('error') or 'NONE'}\n"
+                f"Delivery status: {'PENDING' if sms_ok else 'FAILED'}"
+            )
         except Exception as e:
             logger.warning(f"SMS sending failed (non-blocking): {e}")
 
@@ -2501,10 +2566,19 @@ async def reception_send_appointment_link(
         live_queue_link=dynamic_link,
         appointment_link=dynamic_link,
     )
-    sms_status = "sent" if sms_res.get("ok") else "failed"
-    sms_updates = {"sms_status": sms_status, "sms_last_sent_at": now_iso()}
+    sms_ok = sms_res.get("ok", False)
+    sms_provider_name = sms_res.get("provider") or get_sms_provider()
+    sms_status = "SENT_TO_PROVIDER" if sms_ok else "FAILED"
+    sms_updates = {
+        "sms_provider": sms_provider_name,
+        "sms_status": sms_status,
+        "sms_last_sent_at": now_iso(),
+        "sms_last_attempt_at": now_iso(),
+    }
     if sms_res.get("message_id"):
         sms_updates["sms_provider_message_id"] = sms_res["message_id"]
+    if sms_res.get("error_code") or sms_res.get("code"):
+        sms_updates["sms_error_code"] = sms_res.get("error_code") or sms_res.get("code")
     if sms_res.get("sms_text"):
         sms_updates["sms_text"] = sms_res["sms_text"]
     await db.appointments.update_one(
@@ -2512,9 +2586,23 @@ async def reception_send_appointment_link(
         {"$set": sms_updates}
     )
 
+    masked_num = f"******{mobile[-4:]}" if len(mobile) >= 6 else "*****"
+    logger.info(
+        f"[BOOKING_SMS]\n"
+        f"Booking created: YES\n"
+        f"SMS function called: YES\n"
+        f"Provider: {sms_provider_name.title()}\n"
+        f"Recipient: {masked_num}\n"
+        f"Route: {os.environ.get('LIVEAIR_ROUTE', '3')}\n"
+        f"Template configured: {'YES' if os.environ.get('LIVEAIR_TEMPLATE_ID') else 'NO'}\n"
+        f"Provider response: {sms_res.get('message_id') or sms_res.get('error') or 'NONE'}\n"
+        f"Delivery status: {'PENDING' if sms_ok else 'FAILED'}"
+    )
+
     return {
         "ok": True,
-        "message": f"Link sent to {mobile}",
+        "message": f"Link sent to {mobile}" if sms_ok else "Appointment link attempted, but SMS delivery failed.",
+        "warning": None if sms_ok else "Appointment created successfully, but SMS delivery failed.",
         "sms_status": sms_status,
         "provider_message_id": sms_res.get("message_id"),
         "sms_text": sms_res.get("sms_text"),
@@ -2561,22 +2649,21 @@ async def dev_test_sms(
 
     if provider == "liveair":
         try:
-            from liveair_sms_service import send_liveair_sms
+            from liveair_sms_service import execute_liveair_test_sms
         except ImportError:
-            from backend.liveair_sms_service import send_liveair_sms
+            from backend.liveair_sms_service import execute_liveair_test_sms
             
-        res = await send_liveair_sms(
-            phone=body.phone,
-            message=test_message,
-            purpose="connectivity_test",
-        )
+        test_report = await execute_liveair_test_sms(body.phone)
+        send_res = test_report.get("send_response") or {}
         return {
-            "ok": res.get("success", False),
+            "ok": test_report.get("success", False),
             "provider": "liveair",
-            "message_id": res.get("message_id"),
-            "status": "sent" if res.get("success") else "failed",
-            "error": res.get("error"),
-            "code": res.get("code"),
+            "message_id": send_res.get("message_id"),
+            "status": "sent" if test_report.get("success") else "failed",
+            "error": test_report.get("error") or send_res.get("error"),
+            "code": send_res.get("code"),
+            "credits": test_report.get("credits"),
+            "delivery_report": test_report.get("delivery_report"),
         }
     elif provider == "brevo":
         try:
@@ -2641,6 +2728,37 @@ async def dev_sms_delivery_status(
         from backend.liveair_sms_service import get_liveair_delivery_status
         
     return await get_liveair_delivery_status(message_id)
+
+
+@api_router.get("/dev/liveair-credits")
+async def dev_liveair_credits(
+    route: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """Check LiveAir available credits for configured route (Requirement 10)."""
+    dev_enabled = (
+        os.environ.get("DEV_TEST_SMS_ENABLED", "0").strip() in ("1", "true", "True")
+        or os.environ.get("ENVIRONMENT", "").lower() in ("development", "test", "dev")
+    )
+    if not dev_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Development test SMS endpoint is disabled."
+        )
+
+    if user.get("role") not in ("owner", "admin", "developer", "doctor", "receptionist"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or developer privileges required."
+        )
+
+    try:
+        from liveair_sms_service import get_liveair_credits
+    except ImportError:
+        from backend.liveair_sms_service import get_liveair_credits
+        
+    return await get_liveair_credits(route)
+
 
 
 

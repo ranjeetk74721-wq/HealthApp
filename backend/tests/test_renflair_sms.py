@@ -45,6 +45,11 @@ from sms_service import (
 from server import app, normalize_mobile, save_memory_otp, _otp_store, db, create_token
 
 
+@pytest.fixture(autouse=True)
+def force_renflair_provider(monkeypatch):
+    monkeypatch.setenv("SMS_PROVIDER", "renflair")
+
+
 # ==============================================================================
 # UNIT TESTS: RENFLAIR PHONE & PARAMETER NORMALIZATION
 # ==============================================================================
