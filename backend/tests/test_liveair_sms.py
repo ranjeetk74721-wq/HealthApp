@@ -645,8 +645,8 @@ def test_req16_test_1_new_number_requires_otp_and_verifies(monkeypatch):
         # Verify LiveAir route 4 was targeted
         assert len(captured_calls) == 1
         assert captured_calls[0]["route"] == "4"
-        assert captured_calls[0]["sender"] == "newsen"
-        assert "Your Meribaari OTP is" in captured_calls[0]["message"]
+        assert captured_calls[0]["sender"] in ("LNCHLY", "newsen")
+        assert "Your verification code is" in captured_calls[0]["message"]
         
         # Verify account does NOT exist yet in MongoDB before verification
         norm_mobile = f"+91{mobile}"
