@@ -62,7 +62,7 @@ def get_liveair_config() -> Dict[str, str]:
         "route": (os.environ.get("LIVEAIR_ROUTE") or "2").strip(),
         "type": (os.environ.get("LIVEAIR_MESSAGE_TYPE") or "1").strip(),
         "template_id": (os.environ.get("LIVEAIR_TEMPLATE_ID") or "").strip(),
-        "otp_route": (os.environ.get("LIVEAIR_OTP_ROUTE") or "4").strip(),
+        "otp_route": (os.environ.get("LIVEAIR_OTP_ROUTE") or "2").strip(),
         "otp_template_id": (os.environ.get("LIVEAIR_OTP_TEMPLATE_ID") or "1701177408762310294").strip(),
         "sms_url": sms_url,
         "credits_url": credits_url,

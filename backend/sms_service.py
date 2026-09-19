@@ -418,7 +418,7 @@ async def send_otp_sms(phone: str, otp: str) -> Dict[str, Any]:
     # Route to LiveAir OTP if explicitly enabled (LIVEAIR_OTP_ENABLED=1)
     if provider == "liveair" and os.environ.get("LIVEAIR_OTP_ENABLED") == "1":
         otp_sender = (os.environ.get("LIVEAIR_OTP_SENDER_ID") or os.environ.get("LIVEAIR_SENDER_ID") or "LNCHLY").strip()
-        otp_route = str(os.environ.get("LIVEAIR_OTP_ROUTE", "4")).strip()
+        otp_route = str(os.environ.get("LIVEAIR_OTP_ROUTE") or os.environ.get("LIVEAIR_ROUTE") or "2").strip()
         otp_type = str(os.environ.get("LIVEAIR_OTP_MESSAGE_TYPE") or os.environ.get("LIVEAIR_MESSAGE_TYPE", "1")).strip()
         otp_template = (os.environ.get("LIVEAIR_OTP_TEMPLATE_ID") or os.environ.get("LIVEAIR_TEMPLATE_ID") or "1701177408762310294").strip()
         otp_msg = f"Your verification code is {clean_otp} Use this OTP to complete your login. Do not share this code with anyone. -Launchly"
