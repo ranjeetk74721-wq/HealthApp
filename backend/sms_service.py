@@ -42,6 +42,24 @@ except ImportError:
         normalize_liveair_number,
     )
 
+try:
+    from aisensy_service import (
+        send_aisensy_otp,
+        send_aisensy_appointment,
+        send_aisensy_campaign,
+        get_aisensy_api_key,
+        normalize_aisensy_destination,
+    )
+except ImportError:
+    from backend.aisensy_service import (
+        send_aisensy_otp,
+        send_aisensy_appointment,
+        send_aisensy_campaign,
+        get_aisensy_api_key,
+        normalize_aisensy_destination,
+    )
+
+
 logger = logging.getLogger("sms_service")
 
 # Provider endpoints & timeouts
@@ -55,14 +73,19 @@ REQUEST_TIMEOUT_SECONDS = 8.0
 
 
 def get_sms_provider() -> str:
-    """Retrieve active SMS provider switch from environment (liveair, brevo, or renflair)."""
-    val = (os.environ.get("SMS_PROVIDER") or "").strip().lower()
-    if val in ("liveair", "brevo", "renflair"):
+    """Retrieve active SMS/WhatsApp provider switch from environment (aisensy, liveair, brevo, or renflair)."""
+    val = (os.environ.get("SMS_PROVIDER") or os.environ.get("WHATSAPP_PROVIDER") or "").strip().lower()
+    if val in ("aisensy", "liveair", "brevo", "renflair"):
         # If LiveAir is selected but LIVEAIR_API_TOKEN is empty, fallback to renflair if available
         if val == "liveair" and not (os.environ.get("LIVEAIR_API_TOKEN") or "").strip():
             if (os.environ.get("RENFLAIR_API_KEY") or "").strip():
                 return "renflair"
         return val
+
+    # Auto-detect AiSensy if credentials are configured
+    if get_aisensy_api_key():
+        return "aisensy"
+
     # If not explicitly set, default to renflair for backward compatibility
     return "renflair"
 
@@ -388,7 +411,7 @@ async def send_sms_via_brevo(recipient: str, content: str) -> Dict[str, Any]:
 
 # ============ DISPATCH ROUTERS ============
 
-async def send_otp_sms(phone: str, otp: str) -> Dict[str, Any]:
+async def send_otp_sms(phone: str, otp: str, **kwargs) -> Dict[str, Any]:
     """Send OTP verification code.
     Per Requirement 14:
     - Default remains on current working OTP implementation (Renflair V1).
@@ -414,6 +437,23 @@ async def send_otp_sms(phone: str, otp: str) -> Dict[str, Any]:
         }
 
     provider = get_sms_provider()
+
+    # Route to AiSensy WhatsApp OTP if active or configured
+    if provider == "aisensy":
+        res = await send_aisensy_otp(
+            phone=formatted_phone,
+            otp=clean_otp,
+            user_name=str(kwargs.get("user_name") or "Patient"),
+        )
+        return {
+            "ok": res.get("ok", False),
+            "provider": "aisensy",
+            "phone": formatted_phone,
+            "message_id": res.get("message_id"),
+            "error": res.get("error"),
+            "error_code": res.get("error_code"),
+            "response": res.get("response"),
+        }
 
     # Route to LiveAir OTP if explicitly enabled (LIVEAIR_OTP_ENABLED=1)
     if provider == "liveair" and os.environ.get("LIVEAIR_OTP_ENABLED") == "1":
@@ -592,6 +632,30 @@ async def send_appointment_sms(
         }
 
     provider = get_sms_provider()
+
+    # ============ AISENSY WHATSAPP PROVIDER BRANCH ============
+    if provider == "aisensy":
+        aisensy_res = await send_aisensy_appointment(
+            phone=formatted_phone,
+            hospital_name=hospital_name,
+            doctor_name=doctor_name,
+            token_number=token_number,
+            expected_time=expected_time,
+            live_queue_link=live_queue_link,
+            patient_name=str(kwargs.get("patient_name") or "Patient"),
+        )
+        return {
+            "ok": aisensy_res.get("ok", False),
+            "provider": "aisensy",
+            "phone": formatted_phone,
+            "oid": formatted_oid,
+            "hour": formatted_hour,
+            "message_id": aisensy_res.get("message_id"),
+            "sms_text": template_sms_text,
+            "error": aisensy_res.get("error"),
+            "error_code": aisensy_res.get("error_code"),
+            "response": aisensy_res.get("response"),
+        }
 
     # ============ LIVEAIR PROVIDER BRANCH ============
     if provider == "liveair":

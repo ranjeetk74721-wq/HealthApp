@@ -1357,35 +1357,36 @@ async def send_otp(request: Request, body: SendOTPBody):
     otp = f"{secrets.randbelow(900000) + 100000}"
     save_memory_otp(mobile, otp, OTP_EXP_SECONDS)
     
-    # Deliver OTP via configured SMS provider
+    # Deliver OTP via configured SMS/WhatsApp provider
     try:
         sms_res = await send_otp_sms(mobile, otp)
         if not sms_res.get("ok"):
-            logger.warning(f"OTP SMS delivery failed: {sms_res.get('error')}")
-            if get_sms_provider() == "liveair" and os.environ.get("ALLOW_DEV_OTP") != "1":
-                err_msg = sms_res.get("error") or "Failed to deliver OTP SMS via gateway."
+            logger.warning(f"OTP delivery failed: {sms_res.get('error')}")
+            if get_sms_provider() in ("liveair", "aisensy") and os.environ.get("ALLOW_DEV_OTP") != "1":
+                err_msg = sms_res.get("error") or "Failed to deliver OTP via gateway."
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Unable to send verification SMS: {err_msg}"
+                    detail=f"Unable to send verification code: {err_msg}"
                 )
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"OTP SMS delivery error: {e}")
-        if get_sms_provider() == "liveair" and os.environ.get("ALLOW_DEV_OTP") != "1":
+        logger.error(f"OTP delivery error: {e}")
+        if get_sms_provider() in ("liveair", "aisensy") and os.environ.get("ALLOW_DEV_OTP") != "1":
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="SMS gateway connection error. Please try again later."
+                detail="Gateway connection error. Please try again later."
             )
     
     # Plaintext OTP is NEVER logged or exposed in API response
+    channel_name = "WhatsApp" if get_sms_provider() == "aisensy" else "SMS"
     return {
         "ok": True,
         "mobile": mobile,
         "is_registered": bool(existing),
         "direct_login": False,
         "privacy_notice_version": PRIVACY_NOTICE_VERSION,
-        "message": f"OTP sent to {mobile} via SMS.",
+        "message": f"OTP sent to {mobile} via {channel_name}.",
     }
 
 
@@ -2647,7 +2648,28 @@ async def dev_test_sms(
     provider = get_sms_provider()
     test_message = "Meribaari SMS integration test successful."
 
-    if provider == "liveair":
+    if provider == "aisensy":
+        res = await send_appointment_sms(
+            phone=body.phone,
+            oid=999,
+            hour="12:00 PM",
+            hospital_name="MeriBaari Clinic",
+            doctor_name="Doctor Test",
+            token_number=999,
+            expected_time="12:00 PM",
+            live_queue_link=f"{get_app_public_url()}/appointment/test-link",
+            patient_name="Test Patient",
+        )
+        return {
+            "ok": res.get("ok", False),
+            "provider": "aisensy",
+            "message_id": res.get("message_id"),
+            "status": "sent" if res.get("ok") else "failed",
+            "error": res.get("error"),
+            "error_code": res.get("error_code"),
+            "response": res.get("response"),
+        }
+    elif provider == "liveair":
         try:
             from liveair_sms_service import execute_liveair_test_sms
         except ImportError:
