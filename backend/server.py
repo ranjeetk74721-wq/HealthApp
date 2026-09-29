@@ -138,6 +138,23 @@ app.add_middleware(
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer(auto_error=False)
 
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    for err in errors:
+        if err.get("type") in ("json_invalid", "value_error.jsondecode"):
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"ok": False, "detail": "Invalid or empty JSON body in request."}
+            )
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"ok": False, "detail": errors}
+    )
+
 @app.middleware("http")
 async def general_rate_limit_middleware(request: Request, call_next):
     # Only enforce on /api routes, skip websockets and health checks
@@ -1194,7 +1211,7 @@ async def privacy_notice():
         "effective_from": "2026-02-01",
         "grievance_officer": {
             "name": "Grievance Officer, Meribaari",
-            "email": "grievance@meribaari.example",
+            "email": os.environ.get("SUPPORT_EMAIL", "easehealthcareapp@gmail.com"),
             "response_sla_days": 30,
         },
         "sections": [

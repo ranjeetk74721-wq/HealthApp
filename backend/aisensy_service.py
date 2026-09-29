@@ -1,19 +1,15 @@
 """
 AiSensy WhatsApp Messaging Adapter for Meribaari / EASE Application.
 
-Official AiSensy API Reference:
-Endpoint: POST https://backend.aisensy.com/campaign/t1/api/v2
-Docs: https://wiki.aisensy.com/en/articles/11501889-api-reference-docs
-
-Capabilities:
-1. WhatsApp Authentication / OTP messages via live API Campaign
-2. WhatsApp Appointment Booking Confirmation (Utility) messages with live queue link
-3. Dev connectivity testing without webhooks
+Supports:
+1. AiSensy Project API (POST https://backend.aisensy.com/campaign/t1/api/v2 or https://api.aisensy.io/v1/messages)
+2. WhatsApp Authentication / OTP messages with dynamic parameters and optional interactive buttons
+3. WhatsApp Appointment Booking Confirmation (Utility) messages with live queue tracking links
 
 Security Guarantees:
-- API keys, OTPs, and sensitive user data are never logged in plaintext.
-- Phone numbers are masked in audit logs.
-- All requests run server-side with strict timeouts.
+- API keys, OTPs, and sensitive user data are NEVER logged in plaintext.
+- Recipient phone numbers are masked in audit logs.
+- Dispatches HTTP requests strictly from backend with strict timeouts.
 """
 
 import os
@@ -24,44 +20,42 @@ from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger("aisensy_service")
 
-# Official AiSensy API endpoint
+# Default AiSensy endpoint
 DEFAULT_AISENSY_BASE_URL = "https://backend.aisensy.com/campaign/t1/api/v2"
 REQUEST_TIMEOUT_SECONDS = 8.0
 
 
 def get_aisensy_api_key() -> str:
     """
-    Retrieve AiSensy API key from environment variables.
-    Checks standard keys as well as user configured variants:
-    - AISENSY_API_KEY
-    - Project_api_key / PROJECT_API_KEY
-    - AISENSY_PROJECT_API_KEY
+    Retrieve AiSensy Project API key from backend environment variables.
+    Checks Project_api_key / PROJECT_API_KEY, AISENSY_API_KEY, and AISENSY_PROJECT_API_KEY.
     """
-    key = os.environ.get("AISENSY_API_KEY")
-    if not key or key.strip() in ("placeholder", "your_aisensy_api_key"):
-        key = (
-            os.environ.get("Project_api_key")
-            or os.environ.get("PROJECT_API_KEY")
-            or os.environ.get("AISENSY_PROJECT_API_KEY")
-            or os.environ.get("AISENSY_KEY")
-        )
-    return (key or "").strip()
+    key = (
+        os.environ.get("Project_api_key")
+        or os.environ.get("PROJECT_API_KEY")
+        or os.environ.get("AISENSY_API_KEY")
+        or os.environ.get("AISENSY_PROJECT_API_KEY")
+        or os.environ.get("AISENSY_KEY")
+    )
+    if key and key.strip() not in ("placeholder", "your_aisensy_api_key", "your_aisensy_project_api_key"):
+        return key.strip()
+    return ""
 
 
 def get_aisensy_otp_campaign_name() -> str:
     """
-    Retrieve live API campaign name for OTP / Authentication messages.
+    Retrieve live API campaign / template name for OTP / Authentication messages.
     Fallback priority:
     1. AISENSY_OTP_CAMPAIGN_NAME
-    2. AISENSY_CAMPAIGN_NAME
-    3. Key_name / KEY_NAME
+    2. Key_name / KEY_NAME
+    3. AISENSY_CAMPAIGN_NAME
     4. Default "meribaari"
     """
     name = (
         os.environ.get("AISENSY_OTP_CAMPAIGN_NAME")
-        or os.environ.get("AISENSY_CAMPAIGN_NAME")
         or os.environ.get("Key_name")
         or os.environ.get("KEY_NAME")
+        or os.environ.get("AISENSY_CAMPAIGN_NAME")
         or "meribaari"
     )
     return name.strip()
@@ -69,20 +63,20 @@ def get_aisensy_otp_campaign_name() -> str:
 
 def get_aisensy_appt_campaign_name() -> str:
     """
-    Retrieve live API campaign name for Appointment Confirmation / Utility messages.
+    Retrieve live API campaign / template name for Appointment Confirmation / Utility messages.
     Fallback priority:
     1. AISENSY_APPT_CAMPAIGN_NAME
     2. AISENSY_UTILITY_CAMPAIGN_NAME
-    3. AISENSY_CAMPAIGN_NAME
-    4. Key_name / KEY_NAME
+    3. Key_name / KEY_NAME
+    4. AISENSY_CAMPAIGN_NAME
     5. Default "meribaari_appointment"
     """
     name = (
         os.environ.get("AISENSY_APPT_CAMPAIGN_NAME")
         or os.environ.get("AISENSY_UTILITY_CAMPAIGN_NAME")
-        or os.environ.get("AISENSY_CAMPAIGN_NAME")
         or os.environ.get("Key_name")
         or os.environ.get("KEY_NAME")
+        or os.environ.get("AISENSY_CAMPAIGN_NAME")
         or "meribaari_appointment"
     )
     return name.strip()
@@ -90,7 +84,11 @@ def get_aisensy_appt_campaign_name() -> str:
 
 def get_aisensy_endpoint() -> str:
     """Retrieve AiSensy API endpoint URL."""
-    return os.environ.get("AISENSY_BASE_URL", DEFAULT_AISENSY_BASE_URL).strip()
+    return (
+        os.environ.get("AISENSY_PROJECT_API_URL")
+        or os.environ.get("AISENSY_BASE_URL")
+        or DEFAULT_AISENSY_BASE_URL
+    ).strip()
 
 
 def mask_phone_for_logging(phone: str) -> str:
@@ -105,35 +103,25 @@ def mask_phone_for_logging(phone: str) -> str:
 
 def normalize_aisensy_destination(phone: str) -> Optional[str]:
     """
-    Normalize phone number to format required by AiSensy API.
-    AiSensy rules:
-    - For Indian numbers: +(country code)(phone number), e.g. +917428526285
-    - For international numbers: +(country code)(phone number)
-    - Validates that the number has a valid 10-digit Indian subscriber portion or valid international length.
+    Normalize phone number to international E.164 format (+91XXXXXXXXXX for India).
     """
     if not phone:
         return None
     raw = str(phone).strip()
-    # Strip any spaces, hyphens, parentheses
     cleaned = re.sub(r"[^\d+]", "", raw)
-
     if not cleaned:
         return None
 
-    # If already starts with +
     if cleaned.startswith("+"):
         digits = cleaned[1:]
-        # If +91 with 10 digits
         if digits.startswith("91") and len(digits) == 12:
             sub = digits[2:]
             if sub[0] in "56789":
                 return f"+91{sub}"
-        # International numbers between 7 and 15 digits
         if 7 <= len(digits) <= 15:
             return f"+{digits}"
         return None
 
-    # Digits only (no leading +)
     digits = cleaned
     if digits.startswith("91") and len(digits) == 12:
         sub = digits[2:]
@@ -153,46 +141,34 @@ def normalize_aisensy_destination(phone: str) -> Optional[str]:
     return None
 
 
-async def send_aisensy_campaign(
+async def send_aisensy_project_message(
     destination: str,
     campaign_name: str,
     user_name: str,
     template_params: Optional[List[str]] = None,
+    button_params: Optional[List[str]] = None,
     media: Optional[Dict[str, str]] = None,
     source: str = "MeriBaari App",
     tags: Optional[List[str]] = None,
     attributes: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
-    Dispatch an HTTP POST request to AiSensy API Campaign endpoint.
-    Reference: https://wiki.aisensy.com/en/articles/11501889-api-reference-docs
-    
-    Payload schema:
-    {
-      "apiKey": string,
-      "campaignName": string,
-      "destination": string,
-      "userName": string,
-      "source": string,
-      "templateParams": [string, ...],
-      "media": {"url": string, "filename": string} (optional),
-      "tags": [string] (optional),
-      "attributes": {string: string} (optional)
-    }
+    Dispatch an HTTP POST request to AiSensy Project API.
+    Uses proper JSON serialization via httpx without string concatenation.
     """
     api_key = get_aisensy_api_key()
     if not api_key:
-        logger.warning("[AiSensy] Dispatch blocked: AISENSY_API_KEY is not configured")
+        logger.warning("[AiSensy] Dispatch blocked: Project_api_key / AISENSY_API_KEY is not configured")
         return {
             "ok": False,
             "provider": "aisensy",
-            "error": "AiSensy API key is not configured.",
+            "error": "AiSensy Project API key is not configured.",
             "error_code": "MISSING_API_KEY",
         }
 
     norm_destination = normalize_aisensy_destination(destination)
     if not norm_destination:
-        logger.warning("[AiSensy] Dispatch rejected: Invalid phone number format")
+        logger.warning("[AiSensy] Dispatch rejected: Invalid destination phone format")
         return {
             "ok": False,
             "provider": "aisensy",
@@ -205,7 +181,7 @@ async def send_aisensy_campaign(
         return {
             "ok": False,
             "provider": "aisensy",
-            "error": "Campaign name cannot be empty.",
+            "error": "Campaign / Template identifier cannot be empty.",
             "error_code": "INVALID_CAMPAIGN",
         }
 
@@ -222,6 +198,15 @@ async def send_aisensy_campaign(
 
     if params:
         payload["templateParams"] = params
+    if button_params:
+        payload["buttons"] = [
+            {
+                "type": "button",
+                "sub_type": "url",
+                "index": "0",
+                "parameters": [{"type": "text", "text": str(bp)} for bp in button_params]
+            }
+        ]
     if media and isinstance(media, dict) and media.get("url"):
         payload["media"] = media
     if tags and isinstance(tags, list):
@@ -232,18 +217,24 @@ async def send_aisensy_campaign(
     endpoint = get_aisensy_endpoint()
     masked_phone = mask_phone_for_logging(norm_destination)
 
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "x-api-key": api_key,
+    }
+
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             resp = await client.post(
                 endpoint,
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
             )
 
         resp_text = resp.text
         logger.info(
             f"[AiSensy] HTTP {resp.status_code} response for {masked_phone} "
-            f"(campaign: '{clean_campaign}')"
+            f"(template/campaign: '{clean_campaign}')"
         )
 
         try:
@@ -251,12 +242,9 @@ async def send_aisensy_campaign(
         except Exception:
             data = {"raw": resp_text}
 
-        # Successful request: HTTP 200 / 201 / 202
         if resp.status_code in (200, 201, 202):
-            # AiSensy returns status "success" or true, or message submitted
             is_success = True
             if isinstance(data, dict):
-                # Check for explicit failure flags if returned in a 200 wrapper
                 if data.get("success") is False or data.get("status") in ("failed", "error"):
                     is_success = False
 
@@ -279,7 +267,7 @@ async def send_aisensy_campaign(
                 err_code = data.get("code") or data.get("errorCode") or f"HTTP_{resp.status_code}"
 
             if not err_msg:
-                err_msg = f"AiSensy API returned status {resp.status_code}: {resp_text[:120]}"
+                err_msg = f"AiSensy Project API returned status {resp.status_code}: {resp_text[:120]}"
 
             logger.warning(
                 f"[AiSensy] Request failed for {masked_phone}: HTTP {resp.status_code} - {err_msg}"
@@ -317,17 +305,18 @@ async def send_aisensy_campaign(
         }
 
 
+# Alias for backward compatibility
+send_aisensy_campaign = send_aisensy_project_message
+
+
 async def send_aisensy_otp(
     phone: str,
     otp: str,
     user_name: str = "Patient",
 ) -> Dict[str, Any]:
     """
-    Send OTP verification challenge via AiSensy WhatsApp API campaign.
-    
-    - Never logs plaintext OTP
-    - Injects OTP into templateParams
-    - Uses configured OTP campaign name
+    Send OTP verification challenge via AiSensy Project API.
+    Populates template parameters and button code parameter without logging plaintext OTP.
     """
     clean_otp = str(otp).strip()
     if not clean_otp:
@@ -340,12 +329,14 @@ async def send_aisensy_otp(
 
     campaign_name = get_aisensy_otp_campaign_name()
     template_params = [clean_otp]
+    button_params = [clean_otp]
 
-    res = await send_aisensy_campaign(
+    res = await send_aisensy_project_message(
         destination=phone,
         campaign_name=campaign_name,
         user_name=user_name,
         template_params=template_params,
+        button_params=button_params,
         source="MeriBaari Auth",
     )
 
@@ -353,7 +344,7 @@ async def send_aisensy_otp(
     logger.info(
         f"[AiSensy OTP]\n"
         f"Phone: {masked_phone}\n"
-        f"Campaign: {campaign_name}\n"
+        f"Identifier: {campaign_name}\n"
         f"Send Status: {'ACCEPTED' if res.get('ok') else 'FAILED'}\n"
         f"Message ID: {res.get('message_id') or 'NONE'}"
     )
@@ -371,9 +362,9 @@ async def send_aisensy_appointment(
     patient_name: str = "Patient",
 ) -> Dict[str, Any]:
     """
-    Send appointment booking confirmation (Utility) message via AiSensy WhatsApp API campaign.
+    Send appointment booking confirmation Utility message via AiSensy Project API.
     
-    Template parameters order:
+    Template parameters:
     1. Hospital / Clinic Name
     2. Doctor Name
     3. Token Number
@@ -395,7 +386,7 @@ async def send_aisensy_appointment(
         clean_link,
     ]
 
-    res = await send_aisensy_campaign(
+    res = await send_aisensy_project_message(
         destination=phone,
         campaign_name=campaign_name,
         user_name=patient_name or "Patient",
@@ -407,7 +398,7 @@ async def send_aisensy_appointment(
     logger.info(
         f"[AiSensy APPT]\n"
         f"Phone: {masked_phone}\n"
-        f"Campaign: {campaign_name}\n"
+        f"Identifier: {campaign_name}\n"
         f"Token: {clean_token}\n"
         f"Send Status: {'ACCEPTED' if res.get('ok') else 'FAILED'}\n"
         f"Message ID: {res.get('message_id') or 'NONE'}"

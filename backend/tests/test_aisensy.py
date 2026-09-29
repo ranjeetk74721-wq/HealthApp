@@ -1,12 +1,13 @@
 """
-Unit and integration tests for AiSensy WhatsApp OTP and Utility messaging.
+Unit and integration tests for AiSensy Project API WhatsApp OTP and Utility messaging.
 Covers:
 1. Destination phone normalization (+91 E.164 and international)
-2. AiSensy API campaign HTTP dispatch and payload verification
-3. OTP dispatch and cryptographic verification lifecycle
-4. Appointment booking utility message formatting and parameter mapping
-5. Provider failure modes (rejection, timeout, connection errors) and non-blocking guarantees
-6. Credential fallback behavior (AISENSY_API_KEY vs Project_api_key)
+2. AiSensy Project API HTTP dispatch, headers, and JSON payload verification
+3. Proper JSON validation and decode error handling
+4. OTP dispatch with button parameters and cryptographic verification lifecycle
+5. Appointment booking utility message formatting and parameter mapping
+6. Provider failure modes (rejection, timeout, connection errors) and non-blocking guarantees
+7. Credential fallback behavior (Project_api_key vs AISENSY_API_KEY)
 """
 
 import pytest
@@ -14,13 +15,14 @@ import os
 import json
 import httpx
 from unittest.mock import patch, MagicMock, AsyncMock
+from fastapi.testclient import TestClient
 
 from aisensy_service import (
     normalize_aisensy_destination,
     get_aisensy_api_key,
     get_aisensy_otp_campaign_name,
     get_aisensy_appt_campaign_name,
-    send_aisensy_campaign,
+    send_aisensy_project_message,
     send_aisensy_otp,
     send_aisensy_appointment,
 )
@@ -30,6 +32,7 @@ from sms_service import (
     send_appointment_sms,
 )
 from server import (
+    app,
     hash_otp,
     save_memory_otp,
     normalize_mobile,
@@ -94,11 +97,11 @@ def test_get_sms_provider_auto_detect_aisensy(monkeypatch):
     assert get_sms_provider() == "aisensy"
 
 
-# ============ 3. AISENSY HTTP DISPATCH TESTS (MOCKED) ============
+# ============ 3. AISENSY PROJECT API HTTP DISPATCH TESTS (MOCKED) ============
 
 @pytest.mark.asyncio
-async def test_send_aisensy_campaign_success(monkeypatch):
-    monkeypatch.setenv("AISENSY_API_KEY", "test_api_key")
+async def test_send_aisensy_project_message_success(monkeypatch):
+    monkeypatch.setenv("Project_api_key", "test_project_key_999")
     
     mock_response = MagicMock(spec=httpx.Response)
     mock_response.status_code = 200
@@ -108,11 +111,12 @@ async def test_send_aisensy_campaign_success(monkeypatch):
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
         mock_post.return_value = mock_response
 
-        res = await send_aisensy_campaign(
+        res = await send_aisensy_project_message(
             destination="9876543210",
             campaign_name="meribaari",
             user_name="John Doe",
             template_params=["482910"],
+            button_params=["482910"],
             source="MeriBaari Auth",
         )
 
@@ -121,32 +125,37 @@ async def test_send_aisensy_campaign_success(monkeypatch):
         assert res["message_id"] == "msg_aisensy_12345"
         assert res["phone"] == "+919876543210"
 
-        # Verify exact payload structure sent to AiSensy
+        # Verify exact payload and headers sent to AiSensy
         mock_post.assert_called_once()
         call_args, call_kwargs = mock_post.call_args
         assert call_args[0] == "https://backend.aisensy.com/campaign/t1/api/v2"
         sent_json = call_kwargs["json"]
-        assert sent_json["apiKey"] == "test_api_key"
+        assert sent_json["apiKey"] == "test_project_key_999"
         assert sent_json["campaignName"] == "meribaari"
         assert sent_json["destination"] == "+919876543210"
         assert sent_json["userName"] == "John Doe"
         assert sent_json["templateParams"] == ["482910"]
+        assert sent_json["buttons"][0]["parameters"][0]["text"] == "482910"
         assert sent_json["source"] == "MeriBaari Auth"
+
+        sent_headers = call_kwargs["headers"]
+        assert sent_headers["Content-Type"] == "application/json"
+        assert "Bearer test_project_key_999" in sent_headers["Authorization"]
 
 
 @pytest.mark.asyncio
-async def test_send_aisensy_campaign_provider_rejection(monkeypatch):
-    monkeypatch.setenv("AISENSY_API_KEY", "invalid_key")
+async def test_send_aisensy_project_message_rejection(monkeypatch):
+    monkeypatch.setenv("Project_api_key", "invalid_key")
     
     mock_response = MagicMock(spec=httpx.Response)
     mock_response.status_code = 401
-    mock_response.text = json.dumps({"status": "failed", "message": "Invalid API Key", "code": "AUTH_FAILED"})
-    mock_response.json.return_value = {"status": "failed", "message": "Invalid API Key", "code": "AUTH_FAILED"}
+    mock_response.text = json.dumps({"status": "failed", "message": "Unauthorized", "code": "AUTH_FAILED"})
+    mock_response.json.return_value = {"status": "failed", "message": "Unauthorized", "code": "AUTH_FAILED"}
 
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
         mock_post.return_value = mock_response
 
-        res = await send_aisensy_campaign(
+        res = await send_aisensy_project_message(
             destination="9876543210",
             campaign_name="meribaari",
             user_name="John Doe",
@@ -154,18 +163,18 @@ async def test_send_aisensy_campaign_provider_rejection(monkeypatch):
 
         assert res["ok"] is False
         assert res["provider"] == "aisensy"
-        assert "Invalid API Key" in res["error"]
+        assert "Unauthorized" in res["error"]
         assert res["status_code"] == 401
 
 
 @pytest.mark.asyncio
-async def test_send_aisensy_campaign_timeout(monkeypatch):
-    monkeypatch.setenv("AISENSY_API_KEY", "test_key")
+async def test_send_aisensy_project_message_timeout(monkeypatch):
+    monkeypatch.setenv("Project_api_key", "test_key")
 
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
         mock_post.side_effect = httpx.TimeoutException("Connection timed out")
 
-        res = await send_aisensy_campaign(
+        res = await send_aisensy_project_message(
             destination="9876543210",
             campaign_name="meribaari",
             user_name="John Doe",
@@ -180,8 +189,9 @@ async def test_send_aisensy_campaign_timeout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_send_aisensy_otp_payload(monkeypatch):
-    monkeypatch.setenv("AISENSY_API_KEY", "test_key")
-    monkeypatch.setenv("AISENSY_OTP_CAMPAIGN_NAME", "meribaari_otp")
+    monkeypatch.setenv("Project_api_key", "test_key")
+    monkeypatch.setenv("AISENSY_OTP_CAMPAIGN_NAME", "meribaari")
+    monkeypatch.setenv("Key_name", "meribaari")
 
     mock_response = MagicMock(spec=httpx.Response)
     mock_response.status_code = 200
@@ -198,14 +208,15 @@ async def test_send_aisensy_otp_payload(monkeypatch):
 
         sent_json = mock_post.call_args[1]["json"]
         assert sent_json["templateParams"] == ["654321"]
-        assert sent_json["campaignName"] == "meribaari_otp"
+        assert sent_json["buttons"][0]["parameters"][0]["text"] == "654321"
+        assert sent_json["campaignName"] == "meribaari"
         assert sent_json["destination"] == "+919876543210"
 
 
 @pytest.mark.asyncio
 async def test_send_otp_sms_routes_to_aisensy(monkeypatch):
     monkeypatch.setenv("SMS_PROVIDER", "aisensy")
-    monkeypatch.setenv("AISENSY_API_KEY", "test_key")
+    monkeypatch.setenv("Project_api_key", "test_key")
 
     with patch("sms_service.send_aisensy_otp", new_callable=AsyncMock) as mock_otp:
         mock_otp.return_value = {
@@ -245,7 +256,7 @@ def test_in_memory_otp_hash_and_single_use():
 
 @pytest.mark.asyncio
 async def test_send_aisensy_appointment_payload(monkeypatch):
-    monkeypatch.setenv("AISENSY_API_KEY", "test_key")
+    monkeypatch.setenv("Project_api_key", "test_key")
     monkeypatch.setenv("AISENSY_APPT_CAMPAIGN_NAME", "meribaari_appointment")
 
     mock_response = MagicMock(spec=httpx.Response)
@@ -285,7 +296,7 @@ async def test_send_aisensy_appointment_payload(monkeypatch):
 @pytest.mark.asyncio
 async def test_send_appointment_sms_routes_to_aisensy(monkeypatch):
     monkeypatch.setenv("SMS_PROVIDER", "aisensy")
-    monkeypatch.setenv("AISENSY_API_KEY", "test_key")
+    monkeypatch.setenv("Project_api_key", "test_key")
 
     with patch("sms_service.send_aisensy_appointment", new_callable=AsyncMock) as mock_appt:
         mock_appt.return_value = {
@@ -306,3 +317,18 @@ async def test_send_appointment_sms_routes_to_aisensy(monkeypatch):
         assert res["ok"] is True
         assert res["provider"] == "aisensy"
         mock_appt.assert_called_once()
+
+
+# ============ 6. FASTAPI JSON VALIDATION ERROR HANDLER TEST ============
+
+def test_fastapi_json_validation_error_handling():
+    client = TestClient(app, raise_server_exceptions=False)
+    # Send malformed JSON payload
+    response = client.post(
+        "/api/auth/send-otp",
+        content="invalid json payload { missing",
+        headers={"Content-Type": "application/json"}
+    )
+    assert response.status_code == 400
+    assert response.json()["ok"] is False
+    assert "Invalid or empty JSON body" in response.json()["detail"]

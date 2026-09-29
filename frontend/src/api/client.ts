@@ -85,7 +85,10 @@ export interface RequestOpts extends RequestInit {
 // ─── Core request ───────────────────────────────────────────────────────────
 async function request(path: string, opts: RequestOpts = {}) {
   const token = await getToken();
-  const headers: any = { "Content-Type": "application/json", ...(opts.headers || {}) };
+  const headers: any = { ...(opts.headers || {}) };
+  if (opts.body !== undefined && opts.body !== null) {
+    headers["Content-Type"] = "application/json";
+  }
   if (token) headers.Authorization = `Bearer ${token}`;
   const method = (opts.method || "GET").toUpperCase();
   const apiBase = getApiBase();
@@ -132,8 +135,8 @@ async function request(path: string, opts: RequestOpts = {}) {
 
 export const api = {
   get: (p: string, opts?: RequestOpts) => request(p, { method: "GET", ...opts }),
-  post: (p: string, body?: any, opts?: RequestOpts) => request(p, { method: "POST", body: body ? JSON.stringify(body) : undefined, ...opts }),
-  put: (p: string, body?: any, opts?: RequestOpts) => request(p, { method: "PUT", body: body ? JSON.stringify(body) : undefined, ...opts }),
+  post: (p: string, body?: any, opts?: RequestOpts) => request(p, { method: "POST", body: body !== undefined ? JSON.stringify(body) : undefined, ...opts }),
+  put: (p: string, body?: any, opts?: RequestOpts) => request(p, { method: "PUT", body: body !== undefined ? JSON.stringify(body) : undefined, ...opts }),
   del: (p: string, opts?: RequestOpts) => request(p, { method: "DELETE", ...opts }),
   delete: (p: string, opts?: RequestOpts) => request(p, { method: "DELETE", ...opts }),
 };

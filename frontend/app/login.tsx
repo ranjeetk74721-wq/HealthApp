@@ -7,6 +7,8 @@ import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { isFirebaseConfigured, sendFirebasePhoneOtp } from "@/src/firebase";
+import PublicFooter from "@/src/components/PublicFooter";
+import { BUSINESS_CONFIG } from "@/src/config/business";
 
 export default function Login() {
   const router = useRouter();
@@ -117,6 +119,18 @@ export default function Login() {
             <Text style={styles.staffBtnText}>Hospital Staff Login</Text>
           </Pressable>
 
+          {/* Compact About Meribaari Section */}
+          <View style={styles.aboutCard}>
+            <View style={styles.aboutHeader}>
+              <Ionicons name="information-circle-outline" size={18} color={colors.brandPrimary} />
+              <Text style={styles.aboutTitle}>About Meribaari</Text>
+            </View>
+            <Text style={styles.aboutText}>{BUSINESS_CONFIG.aboutSummary}</Text>
+          </View>
+
+          {/* Public Business Footer */}
+          <PublicFooter showBorderTop={true} />
+
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -148,4 +162,8 @@ const styles = StyleSheet.create({
   demoText: { color: colors.onBrandSecondary, fontSize: font.sm },
   staffBtn: { flexDirection: "row", alignItems: "center", justifyContent: "center", marginTop: spacing.xl, padding: spacing.md, backgroundColor: colors.brandPrimary + "15", borderRadius: radius.md, borderWidth: 1, borderColor: colors.brandPrimary + "30" },
   staffBtnText: { color: colors.brandPrimary, fontWeight: "600", fontSize: font.base, marginLeft: spacing.sm },
+  aboutCard: { backgroundColor: colors.surface, borderRadius: radius.md, padding: spacing.lg, marginTop: spacing.lg, borderWidth: 1, borderColor: colors.border, gap: spacing.xs },
+  aboutHeader: { flexDirection: "row", alignItems: "center", gap: spacing.xs },
+  aboutTitle: { fontSize: font.base, fontWeight: "700", color: colors.onSurface },
+  aboutText: { fontSize: font.sm, color: colors.onSurfaceSecondary, lineHeight: 20 },
 });
