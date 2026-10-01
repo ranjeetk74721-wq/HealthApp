@@ -69,7 +69,7 @@ def get_aisensy_appt_campaign_name() -> str:
     2. AISENSY_UTILITY_CAMPAIGN_NAME
     3. Key_name / KEY_NAME
     4. AISENSY_CAMPAIGN_NAME
-    5. Default "meribaari_appointment"
+    5. Default "Meribaari_appointment_api"
     """
     name = (
         os.environ.get("AISENSY_APPT_CAMPAIGN_NAME")
@@ -77,7 +77,7 @@ def get_aisensy_appt_campaign_name() -> str:
         or os.environ.get("Key_name")
         or os.environ.get("KEY_NAME")
         or os.environ.get("AISENSY_CAMPAIGN_NAME")
-        or "meribaari_appointment"
+        or "Meribaari_appointment_api"
     )
     return name.strip()
 
@@ -352,6 +352,110 @@ async def send_aisensy_otp(
     return res
 
 
+def format_appointment_date(val: Any) -> Optional[str]:
+    """
+    Format appointment date strictly as DD/MM/YYYY.
+    Preserves date-only values without shifting across timezones.
+    Never substitutes today's date if missing or invalid.
+    """
+    if val is None:
+        return None
+
+    # Handle datetime.date and datetime.datetime
+    if hasattr(val, "strftime") and callable(val.strftime):
+        try:
+            return val.strftime("%d/%m/%Y")
+        except Exception:
+            return None
+
+    val_str = str(val).strip()
+    if not val_str or val_str.lower() in ("none", "null", "undefined"):
+        return None
+
+    # Check for DD/MM/YYYY (e.g. 05/10/2026 or 5/10/2026)
+    m_dmy = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", val_str)
+    if m_dmy:
+        d, m, y = m_dmy.groups()
+        d_int, m_int = int(d), int(m)
+        if 1 <= d_int <= 31 and 1 <= m_int <= 12:
+            return f"{d_int:02d}/{m_int:02d}/{y}"
+        return None
+
+    # Check for DD-MM-YYYY (e.g. 05-10-2026 or 5-10-2026)
+    m_dmy_dash = re.match(r"^(\d{1,2})-(\d{1,2})-(\d{4})$", val_str)
+    if m_dmy_dash:
+        d, m, y = m_dmy_dash.groups()
+        d_int, m_int = int(d), int(m)
+        if 1 <= d_int <= 31 and 1 <= m_int <= 12:
+            return f"{d_int:02d}/{m_int:02d}/{y}"
+        return None
+
+    # Check for YYYY-MM-DD or ISO string prefix (e.g. 2026-10-05 or 2026-10-05T...)
+    m_ymd = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", val_str)
+    if m_ymd:
+        y, m, d = m_ymd.groups()
+        d_int, m_int = int(d), int(m)
+        if 1 <= d_int <= 31 and 1 <= m_int <= 12:
+            return f"{d_int:02d}/{m_int:02d}/{y}"
+        return None
+
+    # Check for YYYY/MM/DD (e.g. 2026/10/05)
+    m_ymd_slash = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})", val_str)
+    if m_ymd_slash:
+        y, m, d = m_ymd_slash.groups()
+        d_int, m_int = int(d), int(m)
+        if 1 <= d_int <= 31 and 1 <= m_int <= 12:
+            return f"{d_int:02d}/{m_int:02d}/{y}"
+        return None
+
+    return None
+
+
+def format_12hr_time(val: Any) -> str:
+    """Format time string or datetime into standard 12-hour AM/PM format."""
+    if val is None:
+        return ""
+    val_str = str(val).strip()
+    if not val_str:
+        return ""
+    m_12 = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)$", val_str, re.IGNORECASE)
+    if m_12:
+        hr = str(int(m_12.group(1)))
+        return f"{hr}:{m_12.group(2)} {m_12.group(3).upper()}"
+    m_24 = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", val_str)
+    if m_24:
+        hr_24 = int(m_24.group(1))
+        minute = m_24.group(2)
+        ampm = "PM" if hr_24 >= 12 else "AM"
+        hr_12 = hr_24 % 12 or 12
+        return f"{hr_12}:{minute} {ampm}"
+    return val_str
+
+
+def format_expected_time_range(start: Any, end: Optional[Any] = None) -> str:
+    """Format start and end times into standard 12-hour AM/PM range."""
+    if start is None and end is None:
+        return ""
+    if isinstance(start, str) and not end:
+        sep = " – " if " – " in start else (" - " if " - " in start else None)
+        if sep:
+            parts = start.split(sep, 1)
+            s_part = format_12hr_time(parts[0].strip())
+            e_part = format_12hr_time(parts[1].strip())
+            if not e_part or s_part == e_part:
+                return s_part
+            return f"{s_part} – {e_part}"
+    start_str = format_12hr_time(start)
+    if not end:
+        return start_str
+    end_str = format_12hr_time(end)
+    if not start_str:
+        return end_str
+    if not end_str or start_str == end_str:
+        return start_str
+    return f"{start_str} – {end_str}"
+
+
 async def send_aisensy_appointment(
     phone: str,
     hospital_name: str,
@@ -360,41 +464,95 @@ async def send_aisensy_appointment(
     expected_time: str,
     live_queue_link: str,
     patient_name: str = "Patient",
+    appointment_date: Optional[Any] = None,
+    **kwargs,
 ) -> Dict[str, Any]:
     """
     Send appointment booking confirmation Utility message via AiSensy Project API.
     
-    Template parameters:
-    1. Hospital / Clinic Name
-    2. Doctor Name
-    3. Token Number
-    4. Expected / Estimated Turn Time
-    5. Live Queue Tracking Link
+    Template parameters (exactly 6 strings):
+    1. Hospital Name
+    2. Patient-specific Live Queue Tracking Link
+    3. Doctor Name
+    4. Actual Appointment Date (DD/MM/YYYY)
+    5. Token Number
+    6. Expected Time / Estimated Time Range
     """
     campaign_name = get_aisensy_appt_campaign_name()
-    clean_hosp = (hospital_name or "MeriBaari Clinic").strip()
+
+    norm_destination = normalize_aisensy_destination(phone)
+    if not norm_destination:
+        logger.warning("[AiSensy APPT] Dispatch rejected: Invalid destination phone format")
+        return {
+            "ok": False,
+            "provider": "aisensy",
+            "campaign_name": campaign_name,
+            "error": "Invalid destination phone number format. Must include valid country code & subscriber digits.",
+            "error_code": "INVALID_PHONE",
+        }
+
+    raw_date = appointment_date if appointment_date is not None else kwargs.get("date")
+    clean_date = format_appointment_date(raw_date)
+    if not clean_date:
+        logger.warning(f"[AiSensy APPT] Dispatch blocked: Missing or invalid appointment date '{raw_date}'")
+        return {
+            "ok": False,
+            "provider": "aisensy",
+            "phone": norm_destination,
+            "campaign_name": campaign_name,
+            "error": "Valid appointment date is required for WhatsApp confirmation (format: DD/MM/YYYY).",
+            "error_code": "MISSING_APPOINTMENT_DATE",
+        }
+
+    clean_link = str(live_queue_link or kwargs.get("appointment_link") or "").strip()
+    if not clean_link:
+        logger.warning("[AiSensy APPT] Dispatch blocked: Missing live queue tracking link")
+        return {
+            "ok": False,
+            "provider": "aisensy",
+            "phone": norm_destination,
+            "campaign_name": campaign_name,
+            "error": "Live queue tracking link is required for WhatsApp confirmation.",
+            "error_code": "MISSING_QUEUE_LINK",
+        }
+
+    clean_token = str(token_number if token_number is not None else (kwargs.get("oid") if kwargs.get("oid") is not None else "")).strip()
+    if not clean_token:
+        logger.warning("[AiSensy APPT] Dispatch blocked: Missing token number")
+        return {
+            "ok": False,
+            "provider": "aisensy",
+            "phone": norm_destination,
+            "campaign_name": campaign_name,
+            "error": "Token number is required for WhatsApp confirmation.",
+            "error_code": "MISSING_TOKEN_NUMBER",
+        }
+
+    clean_hosp = (hospital_name or kwargs.get("clinic_name") or "MeriBaari Clinic").strip()
     clean_doc = (doctor_name or "Doctor").strip()
-    clean_token = str(token_number or "1").strip()
-    clean_time = str(expected_time or "As per live queue").strip()
-    clean_link = str(live_queue_link or "").strip()
+    raw_time = expected_time or kwargs.get("estimated_time") or "As per live queue"
+    clean_time = format_expected_time_range(raw_time) if raw_time else "As per live queue"
+    if not clean_time:
+        clean_time = "As per live queue"
 
     template_params = [
-        clean_hosp,
-        clean_doc,
-        clean_token,
-        clean_time,
-        clean_link,
+        str(clean_hosp),
+        str(clean_link),
+        str(clean_doc),
+        str(clean_date),
+        str(clean_token),
+        str(clean_time),
     ]
 
     res = await send_aisensy_project_message(
-        destination=phone,
+        destination=norm_destination,
         campaign_name=campaign_name,
         user_name=patient_name or "Patient",
         template_params=template_params,
         source="MeriBaari Booking",
     )
 
-    masked_phone = mask_phone_for_logging(phone)
+    masked_phone = mask_phone_for_logging(norm_destination)
     logger.info(
         f"[AiSensy APPT]\n"
         f"Phone: {masked_phone}\n"

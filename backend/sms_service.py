@@ -49,6 +49,7 @@ try:
         send_aisensy_campaign,
         get_aisensy_api_key,
         normalize_aisensy_destination,
+        format_appointment_date,
     )
 except ImportError:
     from backend.aisensy_service import (
@@ -57,6 +58,7 @@ except ImportError:
         send_aisensy_campaign,
         get_aisensy_api_key,
         normalize_aisensy_destination,
+        format_appointment_date,
     )
 
 
@@ -569,6 +571,7 @@ async def send_appointment_sms(
     phone: str,
     oid: Optional[Any] = None,
     hour: Optional[Any] = None,
+    appointment_date: Optional[Any] = None,
     **kwargs,
 ) -> Dict[str, Any]:
     """Send appointment booking confirmation SMS using configured provider.
@@ -578,7 +581,7 @@ async def send_appointment_sms(
     - SMS_PROVIDER=brevo   -> Brevo Transactional SMS API
     - SMS_PROVIDER=renflair (default) -> Renflair V7 API
 
-    Accepts arguments (hospital_name, doctor_name, token_number, expected_time, live_queue_link)
+    Accepts arguments (hospital_name, doctor_name, token_number, expected_time, live_queue_link, appointment_date)
     """
     # Resolve OID & HOUR
     resolved_oid = oid
@@ -603,6 +606,7 @@ async def send_appointment_sms(
     token_number = kwargs.get("token_number") or formatted_oid
     expected_time = kwargs.get("expected_time") or kwargs.get("estimated_time") or "As per live queue"
     live_queue_link = kwargs.get("live_queue_link") or kwargs.get("appointment_link") or ""
+    resolved_date = appointment_date or kwargs.get("appointment_date") or kwargs.get("date")
 
     # Generate custom appointment confirmation message (Requirement 5)
     custom_sms_text = format_custom_appointment_sms(
@@ -643,6 +647,7 @@ async def send_appointment_sms(
             expected_time=expected_time,
             live_queue_link=live_queue_link,
             patient_name=str(kwargs.get("patient_name") or "Patient"),
+            appointment_date=resolved_date,
         )
         return {
             "ok": aisensy_res.get("ok", False),
@@ -650,6 +655,7 @@ async def send_appointment_sms(
             "phone": formatted_phone,
             "oid": formatted_oid,
             "hour": formatted_hour,
+            "appointment_date": resolved_date,
             "message_id": aisensy_res.get("message_id"),
             "sms_text": template_sms_text,
             "error": aisensy_res.get("error"),

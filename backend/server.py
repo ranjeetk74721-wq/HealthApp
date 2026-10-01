@@ -1873,6 +1873,7 @@ async def create_appointment(
         dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
         hour_val = expected_time_val if (" – " in expected_time_val or " - " in expected_time_val) else format_renflair_hour(expected_time_val, default="2")
         hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
+        appt_date = doc.get("date") or getattr(body, "date", None)
         try:
             sms_res = await send_appointment_sms(
                 phone=patient_mobile,
@@ -1886,6 +1887,7 @@ async def create_appointment(
                 estimated_time=expected_time_val,
                 live_queue_link=dynamic_link,
                 appointment_link=dynamic_link,
+                appointment_date=appt_date,
             )
             sms_ok = sms_res.get("ok", False)
             sms_provider_name = sms_res.get("provider") or get_sms_provider()
@@ -2473,6 +2475,7 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
         appt["expected_time"] = expected_time_val
         appt["eta_minutes"] = eta_data.get("eta_minutes", 0)
         hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
+        appt_date = appt.get("date")
         try:
             sms_res = await send_appointment_sms(
                 phone=mobile,
@@ -2486,6 +2489,7 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
                 estimated_time=expected_time_val,
                 live_queue_link=dynamic_link,
                 appointment_link=dynamic_link,
+                appointment_date=appt_date,
             )
             sms_ok = sms_res.get("ok", False)
             sms_provider_name = sms_res.get("provider") or get_sms_provider()
@@ -2570,6 +2574,7 @@ async def reception_send_appointment_link(
     hour_val = expected_time_val if (" – " in expected_time_val or " - " in expected_time_val) else format_renflair_hour(expected_time_val, default="2")
     doctor = await db.doctors.find_one({"id": appt.get("doctor_id")}) if appt.get("doctor_id") else None
     hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
+    appt_date = appt.get("date")
 
     sms_res = await send_appointment_sms(
         phone=mobile,
@@ -2583,6 +2588,7 @@ async def reception_send_appointment_link(
         estimated_time=expected_time_val,
         live_queue_link=dynamic_link,
         appointment_link=dynamic_link,
+        appointment_date=appt_date,
     )
     sms_ok = sms_res.get("ok", False)
     sms_provider_name = sms_res.get("provider") or get_sms_provider()
@@ -2666,6 +2672,7 @@ async def dev_test_sms(
     test_message = "Meribaari SMS integration test successful."
 
     if provider == "aisensy":
+        sample_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         res = await send_appointment_sms(
             phone=body.phone,
             oid=999,
@@ -2676,6 +2683,7 @@ async def dev_test_sms(
             expected_time="12:00 PM",
             live_queue_link=f"{get_app_public_url()}/appointment/test-link",
             patient_name="Test Patient",
+            appointment_date=sample_date,
         )
         return {
             "ok": res.get("ok", False),
@@ -2720,6 +2728,7 @@ async def dev_test_sms(
         }
     else:
         # Default Renflair
+        sample_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         res = await send_appointment_sms(
             phone=body.phone,
             oid=999,
@@ -2729,6 +2738,7 @@ async def dev_test_sms(
             token_number=999,
             expected_time="12:00 PM",
             live_queue_link=f"{get_app_public_url()}/appointment/test-link",
+            appointment_date=sample_date,
         )
         return {
             "ok": res.get("ok", False),

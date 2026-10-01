@@ -25,6 +25,7 @@ from aisensy_service import (
     send_aisensy_project_message,
     send_aisensy_otp,
     send_aisensy_appointment,
+    format_appointment_date,
 )
 from sms_service import (
     get_sms_provider,
@@ -254,10 +255,53 @@ def test_in_memory_otp_hash_and_single_use():
 
 # ============ 5. APPOINTMENT UTILITY MESSAGING TESTS ============
 
+def test_format_appointment_date_valid_and_invalid():
+    """Verify DD/MM/YYYY formatting, future dates preservation, and non-substitution of today."""
+    # YYYY-MM-DD
+    assert format_appointment_date("2026-10-15") == "15/10/2026"
+    assert format_appointment_date("2026-05-03") == "03/05/2026"
+    # Future dates must remain their booked date without shifting
+    assert format_appointment_date("2027-12-31") == "31/12/2027"
+    # ISO strings - extracts date part directly without timezone shifting
+    assert format_appointment_date("2026-10-15T00:00:00Z") == "15/10/2026"
+    assert format_appointment_date("2026-10-15T23:59:59+05:30") == "15/10/2026"
+    # Already DD/MM/YYYY
+    assert format_appointment_date("15/10/2026") == "15/10/2026"
+    assert format_appointment_date("5/3/2026") == "05/03/2026"
+    # DD-MM-YYYY
+    assert format_appointment_date("15-10-2026") == "15/10/2026"
+    # YYYY/MM/DD
+    assert format_appointment_date("2026/10/15") == "15/10/2026"
+
+    # Missing or invalid - must NEVER substitute today's date
+    assert format_appointment_date(None) is None
+    assert format_appointment_date("") is None
+    assert format_appointment_date("   ") is None
+    assert format_appointment_date("null") is None
+    assert format_appointment_date("undefined") is None
+    assert format_appointment_date("today") is None
+    assert format_appointment_date("tomorrow") is None
+    assert format_appointment_date("2026-13-45") is None
+
+
+def test_aisensy_campaign_name_config(monkeypatch):
+    """Verify campaign name prioritizes AISENSY_APPT_CAMPAIGN_NAME and defaults to Meribaari_appointment_api."""
+    monkeypatch.delenv("AISENSY_APPT_CAMPAIGN_NAME", raising=False)
+    monkeypatch.delenv("AISENSY_UTILITY_CAMPAIGN_NAME", raising=False)
+    monkeypatch.delenv("Key_name", raising=False)
+    monkeypatch.delenv("KEY_NAME", raising=False)
+    monkeypatch.delenv("AISENSY_CAMPAIGN_NAME", raising=False)
+    assert get_aisensy_appt_campaign_name() == "Meribaari_appointment_api"
+
+    monkeypatch.setenv("AISENSY_APPT_CAMPAIGN_NAME", "Meribaari_appointment_api")
+    assert get_aisensy_appt_campaign_name() == "Meribaari_appointment_api"
+
+
 @pytest.mark.asyncio
-async def test_send_aisensy_appointment_payload(monkeypatch):
+async def test_send_aisensy_appointment_payload_6_params(monkeypatch):
+    """Verify outgoing appointment payload has exactly 6 string parameters in required order."""
     monkeypatch.setenv("Project_api_key", "test_key")
-    monkeypatch.setenv("AISENSY_APPT_CAMPAIGN_NAME", "meribaari_appointment")
+    monkeypatch.setenv("AISENSY_APPT_CAMPAIGN_NAME", "Meribaari_appointment_api")
 
     mock_response = MagicMock(spec=httpx.Response)
     mock_response.status_code = 200
@@ -275,26 +319,136 @@ async def test_send_aisensy_appointment_payload(monkeypatch):
             expected_time="2:30 PM",
             live_queue_link="https://app.meribaari.com/appointment/sec_token_123",
             patient_name="Rahul Sharma",
+            appointment_date="2026-10-15",
         )
 
         assert res["ok"] is True
         assert res["message_id"] == "appt_msg_888"
 
         sent_json = mock_post.call_args[1]["json"]
-        assert sent_json["campaignName"] == "meribaari_appointment"
+        assert sent_json["campaignName"] == "Meribaari_appointment_api"
         assert sent_json["destination"] == "+919876543210"
         assert sent_json["userName"] == "Rahul Sharma"
-        assert sent_json["templateParams"] == [
+
+        params = sent_json["templateParams"]
+        # Must have exactly 6 parameters
+        assert len(params) == 6
+        # All 6 must be strings
+        assert all(isinstance(p, str) for p in params)
+        # Required order:
+        # 1. Hospital name
+        # 2. Patient-specific live queue URL
+        # 3. Doctor name
+        # 4. Actual appointment date (DD/MM/YYYY)
+        # 5. Token number
+        # 6. Expected time / estimated time range
+        assert params == [
             "City Heart Clinic",
+            "https://app.meribaari.com/appointment/sec_token_123",
             "Dr. Mariya",
+            "15/10/2026",
             "7",
             "2:30 PM",
-            "https://app.meribaari.com/appointment/sec_token_123",
         ]
 
 
 @pytest.mark.asyncio
+async def test_send_aisensy_appointment_future_date_not_today(monkeypatch):
+    """Verify a future appointment strictly uses its booked date, never today's date."""
+    monkeypatch.setenv("Project_api_key", "test_key")
+
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_response.status_code = 200
+    mock_response.text = json.dumps({"success": True, "messageId": "appt_future_1"})
+    mock_response.json.return_value = {"success": True, "messageId": "appt_future_1"}
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_response
+
+        res = await send_aisensy_appointment(
+            phone="9876543210",
+            hospital_name="City Heart Clinic",
+            doctor_name="Dr. Mariya",
+            token_number=14,
+            expected_time="10:00 AM",
+            live_queue_link="https://app.meribaari.com/appointment/sec_future",
+            patient_name="Future Patient",
+            appointment_date="2027-01-25",
+        )
+
+        assert res["ok"] is True
+        sent_json = mock_post.call_args[1]["json"]
+        # Date param (index 3) must be the booked future date
+        assert sent_json["templateParams"][3] == "25/01/2027"
+
+
+@pytest.mark.asyncio
+async def test_send_aisensy_appointment_validation_missing_date(monkeypatch):
+    """Verify missing appointment date returns clear error without HTTP dispatch."""
+    monkeypatch.setenv("Project_api_key", "test_key")
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        res = await send_aisensy_appointment(
+            phone="9876543210",
+            hospital_name="City Heart Clinic",
+            doctor_name="Dr. Mariya",
+            token_number=7,
+            expected_time="2:30 PM",
+            live_queue_link="https://app.meribaari.com/appointment/sec_token_123",
+            patient_name="Rahul Sharma",
+            appointment_date=None,
+        )
+
+        assert res["ok"] is False
+        assert res["error_code"] == "MISSING_APPOINTMENT_DATE"
+        mock_post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_aisensy_appointment_validation_missing_link(monkeypatch):
+    """Verify missing live queue link returns clear error without HTTP dispatch."""
+    monkeypatch.setenv("Project_api_key", "test_key")
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        res = await send_aisensy_appointment(
+            phone="9876543210",
+            hospital_name="City Heart Clinic",
+            doctor_name="Dr. Mariya",
+            token_number=7,
+            expected_time="2:30 PM",
+            live_queue_link="",
+            appointment_date="2026-10-15",
+        )
+
+        assert res["ok"] is False
+        assert res["error_code"] == "MISSING_QUEUE_LINK"
+        mock_post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_aisensy_appointment_validation_missing_token(monkeypatch):
+    """Verify missing token number returns clear error without HTTP dispatch."""
+    monkeypatch.setenv("Project_api_key", "test_key")
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        res = await send_aisensy_appointment(
+            phone="9876543210",
+            hospital_name="City Heart Clinic",
+            doctor_name="Dr. Mariya",
+            token_number="",
+            expected_time="2:30 PM",
+            live_queue_link="https://app.meribaari.com/appointment/sec_123",
+            appointment_date="2026-10-15",
+        )
+
+        assert res["ok"] is False
+        assert res["error_code"] == "MISSING_TOKEN_NUMBER"
+        mock_post.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_send_appointment_sms_routes_to_aisensy(monkeypatch):
+    """Verify send_appointment_sms forwards appointment_date to send_aisensy_appointment."""
     monkeypatch.setenv("SMS_PROVIDER", "aisensy")
     monkeypatch.setenv("Project_api_key", "test_key")
 
@@ -312,11 +466,44 @@ async def test_send_appointment_sms_routes_to_aisensy(monkeypatch):
             doctor_name="Dr. Sharma",
             expected_time="11:00 AM",
             live_queue_link="https://app.meribaari.com/appointment/xyz",
+            appointment_date="2026-10-20",
         )
 
         assert res["ok"] is True
         assert res["provider"] == "aisensy"
         mock_appt.assert_called_once()
+        call_kwargs = mock_appt.call_args[1]
+        assert call_kwargs["appointment_date"] == "2026-10-20"
+
+
+@pytest.mark.asyncio
+async def test_notification_failure_does_not_crash_or_rollback():
+    """Verify that an HTTP 400 or provider rejection returns a clean error dict without throwing."""
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_response.status_code = 400
+    mock_response.text = json.dumps({"message": "Template params does not match the campaign", "code": "INVALID_PARAMS"})
+    mock_response.json.return_value = {"message": "Template params does not match the campaign", "code": "INVALID_PARAMS"}
+
+    with patch("aisensy_service.get_aisensy_api_key", return_value="dummy_key"), \
+         patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_response
+
+        res = await send_aisensy_appointment(
+            phone="9876543210",
+            hospital_name="City Heart Clinic",
+            doctor_name="Dr. Mariya",
+            token_number=7,
+            expected_time="2:30 PM",
+            live_queue_link="https://app.meribaari.com/appointment/sec_token_123",
+            patient_name="Rahul Sharma",
+            appointment_date="2026-10-15",
+        )
+
+        # Provider failed with 400, but function handles gracefully without raising
+        assert res["ok"] is False
+        assert res["status_code"] == 400
+        assert "Template params does not match the campaign" in res["error"]
+
 
 
 # ============ 6. FASTAPI JSON VALIDATION ERROR HANDLER TEST ============
