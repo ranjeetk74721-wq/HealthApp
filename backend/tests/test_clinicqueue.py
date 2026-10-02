@@ -10,6 +10,11 @@ from server import hash_otp, normalize_mobile
 BASE_URL = os.environ.get("BACKEND_TEST_URL", "http://127.0.0.1:8000").rstrip("/")
 API = f"{BASE_URL}/api"
 
+try:
+    requests.get(f"{BASE_URL}/docs", timeout=0.8)
+except Exception:
+    pytest.skip(f"Live backend server is not reachable at {BASE_URL}. Skipping live E2E tests.", allow_module_level=True)
+
 RECEPTION_EMAIL = "reception@clinic.com"
 RECEPTION_PASSWORD = "reception123"
 DOCTOR_EMAIL = "drrajeshkumar@clinic.com"

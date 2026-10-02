@@ -29,7 +29,9 @@ def client():
 
 
 @pytest.fixture(autouse=True)
-def reset_rate_limits():
+def reset_rate_limits(monkeypatch):
+    # Ensure offline test isolation for auth and SMS delivery
+    monkeypatch.setenv("ALLOW_DEV_OTP", "1")
     # Clear in-memory rate limits before each test to isolate test cases
     rate_limiter._records.clear()
     rate_limiter._blocks.clear()
@@ -113,7 +115,7 @@ def test_1_receptionist_books_new_patient(client, reception_token, test_doctor):
     assert patient["mobile"] == f"+91{unique_mobile}"
     assert appointment["patient_id"] == patient["id"]
     assert appointment["secure_token"] is not None
-    assert appointment["sms_status"] in ("sent", "failed", "pending")
+    assert appointment["sms_status"].lower() in ("sent", "failed", "pending", "sent_to_provider")
 
     # Verify in DB: phone_verified must be False for receptionist-created patient
     u = sync_db.users.find_one({"id": patient["id"]})
@@ -406,7 +408,7 @@ def test_10_patient_direct_booking(client, test_doctor):
     assert r.status_code == 200, r.text
     data = r.json()
     assert "secure_token" in data
-    assert data["sms_status"] in ("sent", "failed", "pending")
+    assert data["sms_status"].lower() in ("sent", "failed", "pending", "sent_to_provider")
 
 
 # ==============================================================================

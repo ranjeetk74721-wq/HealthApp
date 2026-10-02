@@ -32,10 +32,42 @@ export default function DynamicAppointmentScreen() {
 
   const [apptData, setApptData] = useState<any | null>(null);
   const [queueData, setQueueData] = useState<any | null>(null);
+  const [isOnline, setIsOnline] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState<string | null>(null);
+  const [isStale, setIsStale] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isMounted = useRef(true);
+
+  // Online / Offline and visibility listeners for weak connection resilience
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const handleOnline = () => {
+        setIsOnline(true);
+        setIsStale(false);
+        loadAppointment(true);
+      };
+      const handleOffline = () => {
+        setIsOnline(false);
+        setIsStale(true);
+      };
+      const handleVisibilityChange = () => {
+        if (document.visibilityState === "visible") {
+          loadAppointment(true);
+        }
+      };
+
+      window.addEventListener("online", handleOnline);
+      window.addEventListener("offline", handleOffline);
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+      return () => {
+        window.removeEventListener("online", handleOnline);
+        window.removeEventListener("offline", handleOffline);
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+      };
+    }
+  }, []);
 
   // If not authenticated after auth is loaded, redirect to login
   useEffect(() => {
@@ -62,9 +94,13 @@ export default function DynamicAppointmentScreen() {
         if (isMounted.current) {
           setApptData(res.appointment);
           setQueueData(res.queue);
+          const nowStr = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true });
+          setLastUpdated(nowStr);
+          setIsStale(false);
         }
       } catch (err: any) {
         if (!isMounted.current) return;
+        setIsStale(true);
         const msg = err.message || "";
         if (msg.includes("401") || msg.includes("Not authenticated")) {
           router.replace({
@@ -233,7 +269,9 @@ export default function DynamicAppointmentScreen() {
   const tokenNumber = apptData?.token_number;
   const currentServing = queueData?.currently_serving;
   const rawExpectedTurnTime = queueData?.expected_turn_time;
-  const expectedTurnTime = rawExpectedTurnTime
+  const expectedTurnTime = queueData?.is_estimate_pending
+    ? "Doctor unavailable — estimate pending"
+    : rawExpectedTurnTime
     ? formatExpectedTimeRange(rawExpectedTurnTime)
     : "Calculating...";
   const myPosition = queueData?.my_position ?? -1;
@@ -264,6 +302,23 @@ export default function DynamicAppointmentScreen() {
           <Text style={styles.headerTitle}>Live Appointment</Text>
           <View style={{ width: 40 }} />
         </View>
+
+        {/* Offline / Stale Banner for weak connection */}
+        {!isOnline ? (
+          <View style={[styles.infoBox, { backgroundColor: "#DC2626", borderColor: "#B91C1C", borderWidth: 1 }]}>
+            <Ionicons name="cloud-offline" size={18} color="#fff" />
+            <Text style={{ color: "#fff", fontWeight: "600", fontSize: font.xs }}>
+              Offline · Displaying cached queue data {lastUpdated ? `(as of ${lastUpdated})` : ""}
+            </Text>
+          </View>
+        ) : isStale ? (
+          <View style={[styles.infoBox, { backgroundColor: "#FEF3C7", borderColor: "#F59E0B", borderWidth: 1 }]}>
+            <Ionicons name="sync" size={16} color="#92400E" />
+            <Text style={{ color: "#92400E", fontWeight: "600", fontSize: font.xs }}>
+              Reconnecting... Queue data may be stale {lastUpdated ? `(as of ${lastUpdated})` : ""}
+            </Text>
+          </View>
+        ) : null}
 
         {/* Doctor & Clinic Card */}
         <View style={styles.card}>

@@ -20,11 +20,44 @@ export default function PatientQueue() {
   const [data, setData] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [isOnline, setIsOnline] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState<string | null>(null);
+  const [isStale, setIsStale] = useState(false);
+
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
   const currentApptId = useRef<string | null>(null);
   const isFocused = useRef(true);
+
+  // Network and visibility listeners for weak connection resilience
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const handleOnline = () => {
+        setIsOnline(true);
+        setIsStale(false);
+        load(true, true);
+      };
+      const handleOffline = () => {
+        setIsOnline(false);
+        setIsStale(true);
+      };
+      const handleVisibilityChange = () => {
+        if (document.visibilityState === "visible") {
+          load(true, true);
+        }
+      };
+
+      window.addEventListener("online", handleOnline);
+      window.addEventListener("offline", handleOffline);
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+      return () => {
+        window.removeEventListener("online", handleOnline);
+        window.removeEventListener("offline", handleOffline);
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+      };
+    }
+  }, []);
 
   const load = useCallback(async (silent = false, bypassCache = false) => {
     const shouldBypass = silent || bypassCache;
@@ -41,12 +74,16 @@ export default function PatientQueue() {
       }
       const q = await api.get(`/appointments/${active.id}/queue`, { bypassCache: shouldBypass });
       setData(q);
+      const nowStr = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true });
+      setLastUpdated(nowStr);
+      setIsStale(false);
       // Only open a new WS if the active appointment changed
       if (currentApptId.current !== active.id) {
         currentApptId.current = active.id;
         connectWs(active.id);
       }
     } catch (err: any) {
+      setIsStale(true);
       if (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired"))) {
         await signOut();
         router.replace("/login");
@@ -163,6 +200,23 @@ export default function PatientQueue() {
         <Text style={styles.doctorName}>{appt.doctor_name}</Text>
         <Text style={styles.slotText}>Token #{appt.token_number} · {appt.slot}</Text>
 
+        {/* Weak Internet: Offline & Stale Indicators (Requirement 6) */}
+        {!isOnline ? (
+          <View style={[styles.statusBanner, { backgroundColor: "#DC2626", borderColor: "#B91C1C" }]}>
+            <Ionicons name="cloud-offline" size={20} color="#fff" />
+            <Text style={{ color: "#fff", fontWeight: "600", fontSize: font.xs, flex: 1 }}>
+              Offline · Showing cached queue data {lastUpdated ? `(as of ${lastUpdated})` : ""}
+            </Text>
+          </View>
+        ) : isStale ? (
+          <View style={[styles.statusBanner, { backgroundColor: "#FEF3C7", borderColor: "#F59E0B" }]}>
+            <Ionicons name="sync" size={18} color="#92400E" />
+            <Text style={{ color: "#92400E", fontWeight: "600", fontSize: font.xs, flex: 1 }}>
+              Reconnecting... Queue data may be stale {lastUpdated ? `(as of ${lastUpdated})` : ""}
+            </Text>
+          </View>
+        ) : null}
+
         {/* Doctor Break / Emergency Status Banner */}
         {data.doctor_status === "break" && (
           <View style={[styles.statusBanner, { backgroundColor: "#FEF3C7", borderColor: "#F59E0B" }]}>
@@ -224,41 +278,56 @@ export default function PatientQueue() {
 
         <View style={styles.hero}>
           <Text style={styles.heroLabel}>
-            {isServing ? "IT'S YOUR TURN 🎉" : isDone ? "COMPLETED" : "YOU ARE NUMBER"}
+            {isServing ? "IT'S YOUR TURN 🎉" : isDone ? "COMPLETED" : "YOUR TOKEN NUMBER"}
           </Text>
           <Text style={styles.heroNumber} testID="queue-position">
-            {isServing ? "NOW" : isDone ? "✓" : `#${data.my_position || 0}`}
+            {isServing ? "NOW" : isDone ? "✓" : `#${appt.token_number || 0}`}
           </Text>
           <Text style={styles.heroExpectedTime} testID="expected-turn-time">
             {isServing
               ? "Please head to the consultation room"
               : isDone
               ? "Consultation completed"
+              : data.is_estimate_pending
+              ? "Doctor unavailable — estimate pending"
               : data.is_delayed_awaited
               ? "Doctor delayed—updated time awaited"
-              : `Estimated Consultation Time: ${formatExpectedTimeRange(data.expected_turn_time || data.eta_minutes || "Calculating...")}`}
+              : `Estimated Consultation: ${formatExpectedTimeRange(data.expected_turn_time || data.eta_minutes || "Calculating...")}`}
           </Text>
           {!isServing && !isDone && (
             <Text style={styles.heroSub}>
-              {data.my_position > 1 ? `${data.my_position - 1} patient${data.my_position > 2 ? 's' : ''} ahead` : 'Next in line'}
+              {data.patients_ahead != null
+                ? `${data.patients_ahead} patient${data.patients_ahead !== 1 ? 's' : ''} ahead of you`
+                : data.my_position > 1
+                ? `${data.my_position - 1} patient${data.my_position > 2 ? 's' : ''} ahead`
+                : 'Next in line'}
             </Text>
           )}
         </View>
 
+        {/* Separate Values: Your token, Now consulting, Patients ahead (Requirement 3) */}
         <View style={styles.statsRow}>
           <View style={styles.statCard}>
-            <Text style={styles.statLabel}>Currently serving</Text>
-            <Text style={styles.statValue}>
-              {data.currently_serving != null ? `#${data.currently_serving}` : "-"}
+            <Text style={styles.statLabel}>Your token</Text>
+            <Text style={[styles.statValue, { color: colors.brandPrimary }]}>
+              #{appt.token_number}
             </Text>
           </View>
           <View style={styles.statCard}>
-            <Text style={styles.statLabel}>Completed today</Text>
-            <Text style={styles.statValue}>{data.completed_count}</Text>
+            <Text style={styles.statLabel}>Now consulting</Text>
+            <Text style={styles.statValue}>
+              {data.currently_serving != null ? `#${data.currently_serving}` : "Waiting"}
+            </Text>
           </View>
           <View style={styles.statCard}>
-            <Text style={styles.statLabel}>In queue</Text>
-            <Text style={styles.statValue}>{data.total_in_queue}</Text>
+            <Text style={styles.statLabel}>Patients ahead</Text>
+            <Text style={styles.statValue}>
+              {data.patients_ahead != null
+                ? data.patients_ahead
+                : data.my_position > 1
+                ? data.my_position - 1
+                : 0}
+            </Text>
           </View>
         </View>
 

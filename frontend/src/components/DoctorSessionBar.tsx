@@ -64,6 +64,38 @@ export default function DoctorSessionBar({
     }
   };
 
+  const [endingSession, setEndingSession] = useState(false);
+
+  const handleEndSession = async () => {
+    const confirmEnd = () => {
+      setEndingSession(true);
+      api
+        .post(`/doctor/${doctorId}/session/end`, { date: session.date })
+        .then(() => onRefresh())
+        .catch((err) => {
+          Alert.alert("Error", err.message || "Failed to end doctor session");
+        })
+        .finally(() => setEndingSession(false));
+    };
+
+    if (Platform.OS === "web") {
+      if (window.confirm(`Are you sure you want to end today's session for ${doctorName}?`)) {
+        confirmEnd();
+      }
+    } else {
+      Alert.alert(
+        "End Session",
+        `Are you sure you want to end today's session for ${doctorName}?`,
+        [
+          { text: "Cancel", style: "cancel" },
+          { text: "End Session", style: "destructive", onPress: confirmEnd },
+        ]
+      );
+    }
+  };
+
+  const isBusy = startingSession || endingSession;
+
   return (
     <View style={styles.container}>
       {/* Top row: Status, Times & Badges */}
@@ -197,33 +229,36 @@ export default function DoctorSessionBar({
         </View>
       ) : null}
 
-      {/* Action Buttons */}
+      {/* Action Buttons: Visible text label below every action icon matching its actual function */}
       {canEdit && status !== "completed" ? (
         <View style={styles.actionsRow}>
           {/* Adjust Doctor Timing Button */}
           <Pressable
             testID="adjust-doctor-timing-btn"
             onPress={() => setTimingModalOpen(true)}
-            style={styles.actionBtnSecondary}
+            disabled={isBusy}
+            style={[styles.actionColBtn, isBusy && { opacity: 0.6 }]}
           >
-            <Ionicons name="time" size={16} color={colors.brandPrimary} />
-            <Text style={styles.actionBtnSecondaryText}>Adjust Timing</Text>
+            <Ionicons name="time-outline" size={20} color={colors.brandPrimary} />
+            <Text style={styles.actionColLabel}>Adjust Doctor Timing</Text>
           </Pressable>
 
-          {/* Start Consultation Button (when not started) */}
+          {/* Start Session Button (when not started) */}
           {status === "not_started" && (
             <Pressable
               testID="start-consultation-btn"
               onPress={handleStartConsultation}
-              disabled={startingSession}
-              style={[styles.actionBtnPrimary, { backgroundColor: colors.brandPrimary }]}
+              disabled={isBusy}
+              style={[styles.actionColBtn, styles.actionColBtnPrimary, isBusy && { opacity: 0.6 }]}
             >
               {startingSession ? (
                 <ActivityIndicator size="small" color="#fff" />
               ) : (
                 <>
-                  <Ionicons name="play" size={16} color="#fff" />
-                  <Text style={styles.actionBtnPrimaryText}>Start Consultation</Text>
+                  <Ionicons name="play" size={20} color="#fff" />
+                  <Text style={[styles.actionColLabel, { color: "#fff", fontWeight: "700" }]}>
+                    Start Session
+                  </Text>
                 </>
               )}
             </Pressable>
@@ -234,24 +269,45 @@ export default function DoctorSessionBar({
             <Pressable
               testID="pause-resume-session-btn"
               onPress={() => setPauseModalOpen(true)}
+              disabled={isBusy}
               style={[
-                styles.actionBtnSecondary,
-                isPaused && { backgroundColor: "#DCFCE7", borderColor: "#86EFAC" },
+                styles.actionColBtn,
+                isPaused ? { backgroundColor: "#DCFCE7", borderColor: "#86EFAC" } : {},
+                isBusy && { opacity: 0.6 },
               ]}
             >
               <Ionicons
                 name={isPaused ? "play" : "pause"}
-                size={16}
+                size={20}
                 color={isPaused ? "#059669" : colors.warning}
               />
               <Text
                 style={[
-                  styles.actionBtnSecondaryText,
-                  isPaused && { color: "#059669" },
+                  styles.actionColLabel,
+                  isPaused ? { color: "#059669" } : { color: colors.warning },
                 ]}
               >
                 {isPaused ? "Resume Session" : "Pause Session"}
               </Text>
+            </Pressable>
+          )}
+
+          {/* End Session Button (when active or paused) */}
+          {(status === "in_consultation" || isPaused) && (
+            <Pressable
+              testID="end-doctor-session-btn"
+              onPress={handleEndSession}
+              disabled={isBusy}
+              style={[styles.actionColBtn, { borderColor: "#FECACA", backgroundColor: "#FEF2F2" }, isBusy && { opacity: 0.6 }]}
+            >
+              {endingSession ? (
+                <ActivityIndicator size="small" color={colors.error} />
+              ) : (
+                <>
+                  <Ionicons name="stop-circle-outline" size={20} color={colors.error} />
+                  <Text style={[styles.actionColLabel, { color: colors.error }]}>End Session</Text>
+                </>
+              )}
             </Pressable>
           )}
         </View>
@@ -393,6 +449,28 @@ const styles = StyleSheet.create({
     paddingTop: spacing.xs,
     borderTopWidth: StyleSheet.hairlineWidth,
     borderColor: colors.border,
+  },
+  actionColBtn: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 8,
+    paddingHorizontal: 6,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.surface,
+    gap: 4,
+  },
+  actionColBtnPrimary: {
+    backgroundColor: colors.brandPrimary,
+    borderColor: colors.brandPrimary,
+  },
+  actionColLabel: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: colors.onSurface,
+    textAlign: "center",
   },
   actionBtnSecondary: {
     flex: 1,

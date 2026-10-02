@@ -286,7 +286,9 @@ def test_send_otp_api_endpoint_never_exposes_plaintext_otp():
     client = TestClient(app)
     mobile = f"98765{secrets.randbelow(90000) + 10000}"
     
-    with patch("server.send_otp_sms", new_callable=AsyncMock) as mock_send:
+    with patch("server.send_otp_sms", new_callable=AsyncMock) as mock_send, \
+         patch("server.db.users.find_one", new_callable=AsyncMock) as mock_user_find:
+        mock_user_find.return_value = None
         mock_send.return_value = {"ok": True, "provider": "renflair"}
         
         r = client.post("/api/auth/send-otp", json={"mobile": mobile})

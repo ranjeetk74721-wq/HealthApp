@@ -341,6 +341,9 @@ def test_get_sms_provider_switching(monkeypatch):
     assert get_sms_provider() == "renflair"
 
     monkeypatch.delenv("SMS_PROVIDER", raising=False)
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    monkeypatch.delenv("AISENSY_API_KEY", raising=False)
+    monkeypatch.delenv("Project_api_key", raising=False)
     assert get_sms_provider() == "renflair"
 
 

@@ -18,6 +18,8 @@ import {
 } from "@/src/utils/pushNotifications";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
+const PUSH_DISMISSED_KEY = "cq_push_dismissed";
+
 interface Props {
   appointmentId?: string;
   appointmentToken?: string;
@@ -34,11 +36,16 @@ export default function NotificationPermissionBanner({
   const [status, setStatus] = useState<PushPermissionStatus>("default");
   const [loading, setLoading] = useState(false);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
+  const [dismissed, setDismissed] = useState(false);
 
   const checkStatus = useCallback(async () => {
     if (Platform.OS !== "web" || typeof window === "undefined") {
       setStatus("unsupported");
       return;
+    }
+    const isDismissed = await AsyncStorage.getItem(PUSH_DISMISSED_KEY);
+    if (isDismissed === "true") {
+      setDismissed(true);
     }
     const perm = getNotificationPermissionState();
     const cachedToken = await AsyncStorage.getItem(PUSH_TOKEN_KEY);
@@ -57,6 +64,15 @@ export default function NotificationPermissionBanner({
   useEffect(() => {
     checkStatus();
   }, [checkStatus]);
+
+  const handleDismiss = async () => {
+    setDismissed(true);
+    try {
+      await AsyncStorage.setItem(PUSH_DISMISSED_KEY, "true");
+    } catch {
+      // ignore
+    }
+  };
 
   const handleEnableNotifications = async () => {
     setLoading(true);
@@ -206,6 +222,11 @@ export default function NotificationPermissionBanner({
     );
   }
 
+  // If user tapped Not Now previously and not forced compact, don't nag
+  if (dismissed && !compact) {
+    return null;
+  }
+
   // State: Default / Not enabled yet (Request Permission CTA)
   return (
     <View style={[styles.card, compact && styles.cardCompact]}>
@@ -238,9 +259,9 @@ export default function NotificationPermissionBanner({
             </Text>
           </View>
           <View style={styles.featureItem}>
-            <Ionicons name="checkmark-circle" size={16} color="#059669" />
-            <Text style={styles.featureText}>
-              प्ले स्टोर से किसी ऐप डाउनलोड की आवश्यकता नहीं है।
+            <Ionicons name="shield-checkmark" size={16} color="#0284C7" />
+            <Text style={[styles.featureText, { color: "#0369A1", fontSize: 11 }]}>
+              यह अनुमति केवल कतार अपडेट भेजने के लिए है; यह आपके फोन के नोटिफिकेशन पढ़ने का अधिकार नहीं देती। (Only sends queue updates; cannot read your notification panel).
             </Text>
           </View>
         </View>
@@ -250,23 +271,33 @@ export default function NotificationPermissionBanner({
         <Text style={styles.feedbackMsg}>{infoMsg}</Text>
       ) : null}
 
-      <Pressable
-        testID="enable-push-notifications-btn"
-        onPress={handleEnableNotifications}
-        disabled={loading}
-        style={styles.enableBtn}
-      >
-        {loading ? (
-          <ActivityIndicator size="small" color="#fff" />
-        ) : (
-          <>
-            <Ionicons name="notifications" size={18} color="#fff" />
-            <Text style={styles.enableBtnText}>
-              Enable Queue Notifications / नोटिफिकेशन चालू करें
-            </Text>
-          </>
-        )}
-      </Pressable>
+      <View style={{ flexDirection: "row", gap: spacing.sm, marginTop: 6 }}>
+        <Pressable
+          testID="not-now-push-notifications-btn"
+          onPress={handleDismiss}
+          style={styles.notNowBtn}
+        >
+          <Text style={styles.notNowBtnText}>Not Now / अभी नहीं</Text>
+        </Pressable>
+
+        <Pressable
+          testID="enable-push-notifications-btn"
+          onPress={handleEnableNotifications}
+          disabled={loading}
+          style={styles.enableBtn}
+        >
+          {loading ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <>
+              <Ionicons name="notifications" size={16} color="#fff" />
+              <Text style={styles.enableBtnText}>
+                Enable Notifications
+              </Text>
+            </>
+          )}
+        </Pressable>
+      </View>
     </View>
   );
 }
@@ -395,7 +426,23 @@ const styles = StyleSheet.create({
     color: "#0369A1",
     flex: 1,
   },
+  notNowBtn: {
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    borderColor: "#BAE6FD",
+    backgroundColor: "#fff",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  notNowBtnText: {
+    color: "#0369A1",
+    fontSize: 12,
+    fontWeight: "600",
+  },
   enableBtn: {
+    flex: 1,
     backgroundColor: colors.brand,
     flexDirection: "row",
     alignItems: "center",
@@ -404,7 +451,6 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 14,
     borderRadius: radius.sm,
-    marginTop: 6,
   },
   enableBtnText: {
     color: "#fff",
