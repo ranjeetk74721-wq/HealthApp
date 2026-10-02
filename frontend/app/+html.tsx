@@ -12,6 +12,12 @@ export default function Root({ children }: PropsWithChildren) {
         <meta name="google-site-verification" content="odBixVw-npeF1pKbiKtQ8c85qhvGX0UPzNCRC_oY82M" />
         <meta name="theme-color" content="#0369A1" />
         <meta name="description" content="Meribaari — Skip the wait. Book clinic appointments and track your live queue position." />
+        <meta name="mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+        <meta name="apple-mobile-web-app-title" content="MeriBaari" />
+        <link rel="manifest" href="/manifest.json" />
+        <link rel="apple-touch-icon" href="/assets/images/icon.png" />
         <title>Meribaari — Skip the wait</title>
         {/*
           Disable body scrolling on web so ScrollView works correctly.

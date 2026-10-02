@@ -226,6 +226,9 @@ async def ensure_db_indexes():
             db.doctors.create_index([("user_id", 1)]),
             db.doctors.create_index([("specialty", 1)]),
             db.doctors.create_index([("city", 1)]),
+            # push subscriptions
+            db.push_subscriptions.create_index([("token", 1)], unique=True),
+            db.push_subscriptions.create_index([("user_id", 1), ("active", 1)]),
         )
     except Exception:
         pass
@@ -663,6 +666,19 @@ async def get_current_user(
     return user
 
 
+async def get_current_user_optional(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> Optional[dict]:
+    if not creds:
+        return None
+    try:
+        payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
+        return user
+    except Exception:
+        return None
+
+
 def require_role(*roles: str):
     async def checker(user: dict = Depends(get_current_user)):
         if user["role"] not in roles:
@@ -927,98 +943,666 @@ async def broadcast_doctor_update(doctor_id: str, event: str = "queue_update"):
         pass
 
 
-# ============ PUSH NOTIFICATION HELPERS ============
+# ============ PUSH NOTIFICATION HELPERS & WEB PUSH ============
+def get_ist_now() -> datetime:
+    """Return current Indian Standard Time (UTC+5:30)."""
+    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
+
+
+def format_ist_12hr(dt: Optional[datetime] = None) -> str:
+    """Format datetime into standard 12-hour AM/PM string in clinic timezone: e.g. '3:50 PM'."""
+    if dt is None:
+        dt = get_ist_now()
+    formatted = dt.strftime("%I:%M %p")
+    return formatted.lstrip("0") if formatted.startswith("0") else formatted
+
+
 class RegisterPushBody(BaseModel):
     user_id: str
     platform: str
     device_token: str
 
 
-async def send_push(recipients: List[str], data: dict, idempotency_key: Optional[str] = None) -> None:
-    """Emergent-managed push relay. Non-blocking (caller should wrap in try/except)."""
+class PushSubscribeBody(BaseModel):
+    token: str
+    platform: str = "web"
+    user_agent: Optional[str] = None
+    appointment_id: Optional[str] = None
+    appointment_token: Optional[str] = None
+
+
+class PushUnsubscribeBody(BaseModel):
+    token: str
+
+
+async def calculate_appointment_eta(appt: dict) -> dict:
+    """Calculate live queue metrics and latest estimated turn time for an appointment."""
+    all_appts = await db.appointments.find(
+        {"doctor_id": appt["doctor_id"], "date": appt["date"], "status": {"$ne": "cancelled"}},
+        {"_id": 0},
+    ).sort("token_number", 1).to_list(500)
+
+    active = [a for a in all_appts if a.get("status") in ("booked", "arrived", "in_consultation")]
+    current = next((a for a in all_appts if a.get("status") == "in_consultation"), None)
+    completed_count = len([a for a in all_appts if a.get("status") == "completed"])
+
+    # My position = number of active appts with token <= mine
+    my_position = 0
+    if appt.get("status") in ("booked", "arrived"):
+        my_position = sum(1 for a in active if a.get("token_number", 0) <= appt.get("token_number", 0))
+    elif appt.get("status") == "in_consultation":
+        my_position = 0
+    else:
+        my_position = -1  # done / cancelled
+
+    # Fetch doctor details
+    doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "avg_consult_minutes": 1, "status": 1, "full_name": 1})
+    doc_status = (doctor or {}).get("status", "active")
+    per = int((doctor or {}).get("avg_consult_minutes") or 15)
+
+    eta_minutes = 0
+    expected_turn_time = None
+
+    if my_position == 0 and appt.get("status") == "in_consultation":
+        expected_turn_time = "Now"
+    elif my_position > 0:
+        eta_minutes = max(0, (my_position - (1 if current else 0))) * per
+        # Local clinic / Indian Standard Time (UTC+5:30)
+        ist_now = get_ist_now()
+        future_dt = ist_now + timedelta(minutes=eta_minutes)
+        window_minutes = max(per, 30)
+        end_dt = future_dt + timedelta(minutes=window_minutes)
+        expected_turn_time = format_expected_time_range(future_dt, end_dt)
+    elif appt.get("slot") and appt.get("slot") != "Walk-in":
+        slot_str = appt.get("slot", "")
+        m_slot = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)?", slot_str, re.IGNORECASE)
+        if m_slot:
+            start_fmt = format_12hr_time(slot_str)
+            hr_p = int(m_slot.group(1))
+            min_p = int(m_slot.group(2))
+            meridiem = (m_slot.group(3) or "AM").upper()
+            if meridiem == "PM" and hr_p < 12:
+                hr_p += 12
+            elif meridiem == "AM" and hr_p == 12:
+                hr_p = 0
+            end_min = min_p + 30
+            end_hr = (hr_p + end_min // 60) % 24
+            end_min = end_min % 60
+            end_time_str = format_12hr_time(f"{end_hr:02d}:{end_min:02d}")
+            expected_turn_time = format_expected_time_range(start_fmt, end_time_str)
+        else:
+            expected_turn_time = format_12hr_time(slot_str) or None
+
+    return {
+        "my_position": my_position,
+        "eta_minutes": eta_minutes,
+        "expected_turn_time": expected_turn_time,
+        "currently_serving": current["token_number"] if current else None,
+        "completed_count": completed_count,
+        "total_in_queue": len(active),
+        "doctor_status": doc_status,
+    }
+
+
+async def send_fcm_web_push(
+    recipients: List[str],
+    title: str,
+    body: str,
+    action_url: str = "/patient/queue",
+    tag: Optional[str] = None,
+    extra_data: Optional[dict] = None,
+) -> dict:
+    """Delivers Web Push notification to active device tokens of recipient users via Firebase Cloud Messaging."""
     if not recipients:
-        return
-    if len(recipients) > 100:
-        recipients = recipients[:100]
-    if "title" not in data or "message" not in data:
-        return
-    payload: dict = {"recipients": recipients, "data": data}
-    if idempotency_key:
-        payload["$idempotency_key"] = idempotency_key
+        return {"sent": 0, "failed": 0}
+
+    init_firebase_admin_if_available()
+
+    # Query active subscriptions for these users
+    subs = await db.push_subscriptions.find(
+        {"user_id": {"$in": recipients}, "active": True},
+        {"_id": 0, "token": 1, "user_id": 1, "platform": 1},
+    ).to_list(500)
+
+    if not subs:
+        logger.debug(f"[WebPush] No active subscriptions for users: {recipients}")
+        return {"sent": 0, "failed": 0}
+
+    # Record push attempt in log for auditing and tracking
+    log_doc = {
+        "id": str(uuid.uuid4()),
+        "recipients": recipients,
+        "title": title,
+        "body": body,
+        "action_url": action_url,
+        "token_count": len(subs),
+        "sent_at": now_iso(),
+    }
     try:
-        resp = await _push_client.post("/api/v1/push/trigger", json=payload)
-        if resp.status_code >= 400:
-            logger.warning(f"push relay non-ok: {resp.status_code} {resp.text[:200]}")
+        await db.push_notifications_log.insert_one(log_doc)
+    except Exception:
+        pass
+
+    global FIREBASE_ADMIN_AVAILABLE, _firebase_admin_app
+    if not FIREBASE_ADMIN_AVAILABLE:
+        logger.info(f"[WebPush Mock/Dev] (Firebase Admin not configured) Would push to {len(subs)} device(s): {title}")
+        return {"sent": len(subs), "simulated": True}
+
+    try:
+        from firebase_admin import messaging
     except Exception as e:
-        logger.warning(f"push relay error (non-blocking): {e}")
+        logger.warning(f"firebase_admin.messaging import error: {e}")
+        return {"sent": 0, "failed": len(subs)}
+
+    sent_count = 0
+    failed_count = 0
+    invalid_tokens = []
+
+    for sub in subs:
+        token = sub.get("token")
+        if not token:
+            continue
+        try:
+            webpush_config = messaging.WebpushConfig(
+                notification=messaging.WebpushNotification(
+                    title=title,
+                    body=body,
+                    icon="/assets/images/icon.png",
+                    badge="/assets/images/favicon.png",
+                    tag=tag or "meribaari-queue",
+                    renotify=True,
+                    require_interaction=True,
+                    custom_data={"url": action_url, **(extra_data or {})},
+                ),
+                fcm_options=messaging.WebpushFCMOptions(link=action_url),
+                headers={"Urgency": "high", "TTL": "86400"},
+            )
+            msg = messaging.Message(
+                token=token,
+                notification=messaging.Notification(title=title, body=body),
+                data={"title": title, "body": body, "url": action_url, **(extra_data or {})},
+                webpush=webpush_config,
+            )
+            messaging.send(msg)
+            sent_count += 1
+        except (messaging.UnregisteredError, messaging.SenderIdMismatchError) as err:
+            logger.info(f"Push token expired/unregistered: {token[:12]}... ({err})")
+            invalid_tokens.append(token)
+            failed_count += 1
+        except Exception as e:
+            err_str = str(e).lower()
+            if "invalid registration token" in err_str or "registration-token-not-registered" in err_str:
+                invalid_tokens.append(token)
+            logger.warning(f"Push delivery error for token {token[:12]}...: {e}")
+            failed_count += 1
+
+    # Cleanup expired or unregistered device tokens automatically
+    if invalid_tokens:
+        try:
+            await db.push_subscriptions.update_many(
+                {"token": {"$in": invalid_tokens}},
+                {"$set": {"active": False, "deactivated_at": now_iso()}},
+            )
+        except Exception as e:
+            logger.warning(f"Error marking invalid push tokens: {e}")
+
+    return {"sent": sent_count, "failed": failed_count}
 
 
-async def notify_queue_movement(doctor_id: str):
-    """Fire push notifications when queue moves — instant turn + almost-up alerts."""
+async def send_push(recipients: List[str], data: dict, idempotency_key: Optional[str] = None) -> None:
+    """Unified push dispatcher — sends via FCM Web Push to registered devices."""
+    if not recipients or not data:
+        return
+    title = data.get("title", "MeriBaari Queue Alert")
+    message = data.get("message") or data.get("body") or ""
+    action_url = data.get("action_url") or data.get("url") or "/patient/queue"
+    try:
+        await send_fcm_web_push(
+            recipients=recipients,
+            title=title,
+            body=message,
+            action_url=action_url,
+            tag=idempotency_key,
+            extra_data=data,
+        )
+    except Exception as e:
+        logger.warning(f"send_push error: {e}")
+
+
+async def notify_appointment_booked(appt: dict, doctor: dict, eta_data: dict) -> None:
+    """Send push notification on successful booking if patient has active push subscriptions."""
+    try:
+        pid = appt.get("patient_id")
+        if not pid or pid == "emergency":
+            return
+        sub_count = await db.push_subscriptions.count_documents({"user_id": pid, "active": True})
+        if sub_count == 0:
+            return
+
+        hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
+        token_num = appt.get("token_number")
+        current_serving = eta_data.get("currently_serving")
+        serving_display = f"#{current_serving}" if current_serving is not None else "Not started yet"
+        eta_display = eta_data.get("expected_turn_time") or "Estimated time updating"
+        time_str = format_ist_12hr()
+        sec_token = appt.get("secure_token")
+        target_url = f"/appointment/{sec_token}" if sec_token else "/patient/queue"
+
+        body_lines = [
+            f"Your Token: {token_num}",
+            f"Now Serving: {serving_display}",
+            f"Estimated Turn: {eta_display}",
+            f"Updated: {time_str}",
+            "Tap to view live queue.",
+        ]
+        await send_fcm_web_push(
+            recipients=[pid],
+            title=f"{hospital_name} — MeriBaari",
+            body="\n".join(body_lines),
+            action_url=target_url,
+            tag=f"booking-{appt['id']}",
+            extra_data={"token_number": str(token_num), "event": "booked"},
+        )
+        await db.appointments.update_one(
+            {"id": appt["id"]},
+            {"$set": {
+                "notifications_sent.booked": True,
+                "notifications_sent.last_eta_minutes": eta_data.get("eta_minutes", 0),
+            }},
+        )
+    except Exception as e:
+        logger.warning(f"notify_appointment_booked error: {e}")
+
+
+async def send_welcome_status_if_needed(
+    user_id: str,
+    device_token: str,
+    appointment_id: Optional[str] = None,
+    secure_token: Optional[str] = None,
+) -> None:
+    """If patient enables notifications after booking, send one current appointment-status
+    notification instead of a duplicate booking confirmation.
+    """
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        query: dict = {
+            "patient_id": user_id,
+            "date": today,
+            "status": {"$in": ["booked", "arrived", "in_consultation"]},
+        }
+        if appointment_id:
+            query = {"id": appointment_id, "patient_id": user_id}
+        elif secure_token:
+            query = {"secure_token": secure_token, "patient_id": user_id}
+
+        appt = await db.appointments.find_one(query)
+        if not appt:
+            return
+
+        notifs = appt.get("notifications_sent") or {}
+        if notifs.get("status_welcomed") or notifs.get("booked"):
+            return
+
+        doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0})
+        hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
+        token_num = appt.get("token_number")
+        eta_data = await calculate_appointment_eta(appt)
+        current_serving = eta_data.get("currently_serving")
+        serving_display = f"#{current_serving}" if current_serving is not None else "Not started yet"
+        eta_display = eta_data.get("expected_turn_time") or "Estimated time updating"
+        time_str = format_ist_12hr()
+        sec_token = appt.get("secure_token")
+        target_url = f"/appointment/{sec_token}" if sec_token else "/patient/queue"
+
+        body_lines = [
+            f"Your Token: {token_num}",
+            f"Now Serving: {serving_display}",
+            f"Estimated Turn: {eta_display}",
+            f"Updated: {time_str}",
+            "Tap to view live queue.",
+        ]
+        await send_fcm_web_push(
+            recipients=[user_id],
+            title=f"{hospital_name} — MeriBaari",
+            body="\n".join(body_lines),
+            action_url=target_url,
+            tag=f"status-{appt['id']}",
+            extra_data={"token_number": str(token_num), "event": "status_welcomed"},
+        )
+        await db.appointments.update_one(
+            {"id": appt["id"]},
+            {"$set": {
+                "notifications_sent.status_welcomed": True,
+                "notifications_sent.last_eta_minutes": eta_data.get("eta_minutes", 0),
+            }},
+        )
+    except Exception as e:
+        logger.warning(f"send_welcome_status_if_needed error: {e}")
+
+
+async def notify_queue_movement(doctor_id: str) -> None:
+    """Fire Web Push notifications when queue moves:
+    - Exactly 5 patients ahead
+    - Exactly 2 patients ahead
+    - Patient called (in_consultation)
+    - Meaningful ETA change (>= 10 min threshold)
+    Authoritative queue order is derived from actual eligible appointments.
+    """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
+        doctor = await db.doctors.find_one({"id": doctor_id}, {"_id": 0})
+        if not doctor:
+            return
+        hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
+        doc_name = doctor.get("full_name", "").replace("Dr. ", "")
+
+        # Fetch all today's appointments for this doctor, ordered by token_number
         all_appts = await db.appointments.find(
-            {"doctor_id": doctor_id, "date": today, "status": {"$nin": ["cancelled", "completed", "skipped"]}},
+            {"doctor_id": doctor_id, "date": today, "status": {"$nin": ["cancelled"]}},
             {"_id": 0},
         ).sort("token_number", 1).to_list(500)
 
-        # 1) Current in_consultation → notify that patient "It's your turn"
-        in_cons = [a for a in all_appts if a["status"] == "in_consultation"]
-        for a in in_cons:
-            if a["patient_id"] and a["patient_id"] != "emergency":
-                try:
-                    await send_push(
-                        recipients=[a["patient_id"]],
-                        data={
-                            "title": "🎉 It's your turn now!",
-                            "message": f"Dr. {a['doctor_name'].replace('Dr. ', '')} is ready to see you. Please head to the consultation room.",
-                            "action_url": "/patient/queue",
-                        },
-                        idempotency_key=f"turn-{a['id']}",
-                    )
-                except Exception:
-                    pass
+        # Active eligible queue: booked, arrived
+        # Completed / skipped / cancelled are excluded from ahead count
+        current_in_consultation = next((a for a in all_appts if a.get("status") == "in_consultation"), None)
+        currently_serving_token = current_in_consultation.get("token_number") if current_in_consultation else None
+        serving_display = f"#{currently_serving_token}" if currently_serving_token is not None else "Not started yet"
 
-        # 2) Patients at position 2 or 3 → almost-up alert (idempotent per appt-position)
-        active = [a for a in all_appts if a["status"] in ("booked", "arrived")]
-        for idx, a in enumerate(active[:3], start=1):
-            if idx <= 1:
-                continue  # position 1 = next, we'll cover them when they move to in_consultation
-            if a["patient_id"] and a["patient_id"] != "emergency":
-                try:
-                    await send_push(
-                        recipients=[a["patient_id"]],
-                        data={
-                            "title": f"You're #{idx} in queue",
-                            "message": f"Only {idx - 1} patient(s) ahead of you at Dr. {a['doctor_name'].replace('Dr. ', '')}. Please arrive at the clinic.",
-                            "action_url": "/patient/queue",
-                        },
-                        idempotency_key=f"almost-{a['id']}-{idx}",
+        # 1. Check current in_consultation patient: called notification
+        if current_in_consultation and current_in_consultation.get("patient_id") and current_in_consultation["patient_id"] != "emergency":
+            c_notifs = current_in_consultation.get("notifications_sent") or {}
+            if not c_notifs.get("called"):
+                time_str = format_ist_12hr()
+                token_num = current_in_consultation.get("token_number")
+                body_lines = [
+                    f"🎉 It's your turn now!",
+                    f"Your Token: #{token_num}",
+                    f"Dr. {doc_name} is ready for you. Please proceed to the consultation room.",
+                    f"Updated: {time_str}",
+                    "Tap to view live queue.",
+                ]
+                sec_token = current_in_consultation.get("secure_token")
+                target_url = f"/appointment/{sec_token}" if sec_token else "/patient/queue"
+                await send_fcm_web_push(
+                    recipients=[current_in_consultation["patient_id"]],
+                    title=f"{hospital_name} — MeriBaari",
+                    body="\n".join(body_lines),
+                    action_url=target_url,
+                    tag=f"queue-called-{current_in_consultation['id']}",
+                    extra_data={
+                        "token_number": str(token_num),
+                        "status": "in_consultation",
+                        "doctor_id": doctor_id,
+                    },
+                )
+                await db.appointments.update_one(
+                    {"id": current_in_consultation["id"]},
+                    {"$set": {"notifications_sent.called": True, "notifications_sent.called_at": now_iso()}},
+                )
+
+        # 2. Waiting patients in active queue (booked, arrived)
+        active_waiting = [a for a in all_appts if a.get("status") in ("booked", "arrived")]
+
+        for appt in active_waiting:
+            pid = appt.get("patient_id")
+            if not pid or pid == "emergency":
+                continue
+
+            notifs = appt.get("notifications_sent") or {}
+            token_num = appt.get("token_number")
+            sec_token = appt.get("secure_token")
+            target_url = f"/appointment/{sec_token}" if sec_token else "/patient/queue"
+
+            # Actual eligible patients ahead = waiting patients with token < mine + 1 if current_in_consultation
+            patients_ahead = sum(1 for a in active_waiting if a.get("token_number", 0) < token_num) + (1 if current_in_consultation else 0)
+
+            # Calculate ETA using the existing calculate_appointment_eta
+            eta_data = await calculate_appointment_eta(appt)
+            eta_display = eta_data.get("expected_turn_time") or "Estimated time updating"
+            current_eta_min = eta_data.get("eta_minutes", 0)
+            time_str = format_ist_12hr()
+
+            # Condition A: Approximately 5 patients away
+            if patients_ahead == 5 and not notifs.get("five_ahead"):
+                body_lines = [
+                    f"Your Token: #{token_num}",
+                    f"Now Serving: {serving_display}",
+                    f"5 patients ahead. Please get ready.",
+                    f"Estimated Turn: {eta_display}",
+                    f"Updated: {time_str}",
+                    "Tap to view live queue.",
+                ]
+                await send_fcm_web_push(
+                    recipients=[pid],
+                    title=f"{hospital_name} — MeriBaari",
+                    body="\n".join(body_lines),
+                    action_url=target_url,
+                    tag=f"queue-5ahead-{appt['id']}",
+                    extra_data={"token_number": str(token_num), "patients_ahead": "5"},
+                )
+                await db.appointments.update_one(
+                    {"id": appt["id"]},
+                    {"$set": {
+                        "notifications_sent.five_ahead": True,
+                        "notifications_sent.last_eta_minutes": current_eta_min,
+                    }},
+                )
+
+            # Condition B: Approximately 2 patients away
+            elif patients_ahead == 2 and not notifs.get("two_ahead"):
+                body_lines = [
+                    f"Your Token: #{token_num}",
+                    f"Now Serving: {serving_display}",
+                    f"Only 2 patients ahead! Please reach the clinic room.",
+                    f"Estimated Turn: {eta_display}",
+                    f"Updated: {time_str}",
+                    "Tap to view live queue.",
+                ]
+                await send_fcm_web_push(
+                    recipients=[pid],
+                    title=f"{hospital_name} — MeriBaari",
+                    body="\n".join(body_lines),
+                    action_url=target_url,
+                    tag=f"queue-2ahead-{appt['id']}",
+                    extra_data={"token_number": str(token_num), "patients_ahead": "2"},
+                )
+                await db.appointments.update_one(
+                    {"id": appt["id"]},
+                    {"$set": {
+                        "notifications_sent.two_ahead": True,
+                        "notifications_sent.last_eta_minutes": current_eta_min,
+                    }},
+                )
+
+            # Condition C: Meaningful ETA change (configurable threshold, default 10 minutes)
+            else:
+                last_eta = notifs.get("last_eta_minutes")
+                threshold = int(os.environ.get("QUEUE_ETA_CHANGE_THRESHOLD_MINUTES", "10"))
+                if last_eta is not None and abs(current_eta_min - last_eta) >= threshold and patients_ahead > 0:
+                    body_lines = [
+                        f"Your Token: #{token_num}",
+                        f"Now Serving: {serving_display}",
+                        f"Estimated Turn: {eta_display}",
+                        f"Updated: {time_str}",
+                        "Tap to view live queue.",
+                    ]
+                    await send_fcm_web_push(
+                        recipients=[pid],
+                        title=f"{hospital_name} — MeriBaari",
+                        body="\n".join(body_lines),
+                        action_url=target_url,
+                        tag=f"queue-eta-{appt['id']}",
+                        extra_data={"token_number": str(token_num), "eta_minutes": str(current_eta_min)},
                     )
-                except Exception:
-                    pass
+                    await db.appointments.update_one(
+                        {"id": appt["id"]},
+                        {"$set": {"notifications_sent.last_eta_minutes": current_eta_min}},
+                    )
     except Exception as e:
         logger.warning(f"notify_queue_movement error: {e}")
 
 
+async def notify_doctor_status_change(doctor_id: str, new_status: str) -> None:
+    """Notify active waiting patients when doctor status is paused, on break, emergency, or resumed active."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        doctor = await db.doctors.find_one({"id": doctor_id}, {"_id": 0})
+        if not doctor:
+            return
+        hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
+        doc_name = doctor.get("full_name", "").replace("Dr. ", "")
+
+        waiting_appts = await db.appointments.find(
+            {"doctor_id": doctor_id, "date": today, "status": {"$in": ["booked", "arrived"]}},
+            {"_id": 0},
+        ).to_list(300)
+
+        current = await db.appointments.find_one(
+            {"doctor_id": doctor_id, "date": today, "status": "in_consultation"},
+            {"_id": 0},
+        )
+        serving_display = f"#{current['token_number']}" if current else "Not started yet"
+        time_str = format_ist_12hr()
+
+        status_messages = {
+            "paused": f"Notice: Consultations with Dr. {doc_name} are briefly paused. Queue will resume shortly.",
+            "break": f"Notice: Dr. {doc_name} is on a short break. Queue will resume shortly.",
+            "emergency": f"Notice: Dr. {doc_name} is attending to an emergency. Queue will resume shortly.",
+            "active": f"Notice: Dr. {doc_name} has resumed consultations.",
+        }
+        msg = status_messages.get(new_status, f"Notice: Dr. {doc_name} status is {new_status}.")
+
+        for appt in waiting_appts:
+            pid = appt.get("patient_id")
+            if not pid or pid == "emergency":
+                continue
+            token_num = appt.get("token_number")
+            sec_token = appt.get("secure_token")
+            target_url = f"/appointment/{sec_token}" if sec_token else "/patient/queue"
+            body_lines = [
+                f"Your Token: #{token_num}",
+                f"Now Serving: {serving_display}",
+                msg,
+                f"Updated: {time_str}",
+                "Tap to view live queue.",
+            ]
+            await send_fcm_web_push(
+                recipients=[pid],
+                title=f"{hospital_name} — MeriBaari",
+                body="\n".join(body_lines),
+                action_url=target_url,
+                tag=f"doc-status-{doctor_id}",
+                extra_data={"doctor_status": new_status, "token_number": str(token_num)},
+            )
+    except Exception as e:
+        logger.warning(f"notify_doctor_status_change error: {e}")
+
+
+async def notify_appointment_cancelled(appt: dict) -> None:
+    """Notify patient when an appointment is cancelled."""
+    try:
+        pid = appt.get("patient_id")
+        if not pid or pid == "emergency":
+            return
+        doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0})
+        hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
+        doc_name = (doctor or {}).get("full_name", "").replace("Dr. ", "")
+        token_num = appt.get("token_number")
+        time_str = format_ist_12hr()
+        body_lines = [
+            f"Your appointment (Token #{token_num}) with Dr. {doc_name} has been cancelled.",
+            f"Updated: {time_str}",
+        ]
+        await send_fcm_web_push(
+            recipients=[pid],
+            title=f"{hospital_name} — MeriBaari",
+            body="\n".join(body_lines),
+            action_url="/patient/history",
+            tag=f"appt-cancel-{appt['id']}",
+            extra_data={"appointment_id": appt["id"], "status": "cancelled"},
+        )
+    except Exception as e:
+        logger.warning(f"notify_appointment_cancelled error: {e}")
+
+
+@api_router.post("/push/subscribe")
+async def push_subscribe(body: PushSubscribeBody, user: dict = Depends(get_current_user)):
+    """Register or refresh a device FCM Web Push token for the authenticated patient."""
+    token = body.token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Token is required")
+
+    now = now_iso()
+    doc = {
+        "user_id": user["id"],
+        "token": token,
+        "platform": body.platform or "web",
+        "user_agent": body.user_agent,
+        "active": True,
+        "updated_at": now,
+        "last_seen_at": now,
+    }
+    await db.push_subscriptions.update_one(
+        {"token": token},
+        {"$set": doc, "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}},
+        upsert=True,
+    )
+
+    # If the patient enabled notifications after booking, send one current appointment status notification
+    asyncio.create_task(
+        send_welcome_status_if_needed(
+            user["id"],
+            token,
+            appointment_id=body.appointment_id,
+            secure_token=body.appointment_token,
+        )
+    )
+
+    return {"ok": True, "status": "subscribed"}
+
+
+@api_router.post("/push/unsubscribe")
+async def push_unsubscribe(body: PushUnsubscribeBody, user: Optional[dict] = Depends(get_current_user_optional)):
+    """Deactivate device Web Push token on logout or explicit unsubscribe."""
+    token = body.token.strip()
+    if not token:
+        return {"ok": True, "status": "ignored"}
+
+    now = now_iso()
+    q: dict = {"token": token}
+    if user:
+        q["user_id"] = user["id"]
+    await db.push_subscriptions.update_many(q, {"$set": {"active": False, "updated_at": now}})
+    return {"ok": True, "status": "unsubscribed"}
+
+
+@api_router.get("/push/status")
+async def push_status(token: str, user: dict = Depends(get_current_user)):
+    """Check subscription status for a device token."""
+    sub = await db.push_subscriptions.find_one({"token": token, "user_id": user["id"], "active": True})
+    return {"ok": True, "active": sub is not None}
+
+
 @api_router.post("/register-push", status_code=201)
 async def register_push(body: RegisterPushBody):
-    # In dev/preview with placeholder key, soft-fail so mobile clients don't error
-    if PUSH_KEY == "placeholder":
-        return {"status": "queued_local"}
-    try:
-        resp = await _push_client.post("/api/v1/push/users/register", json=body.model_dump())
-        if resp.status_code == 401:
-            raise HTTPException(500, "EMERGENT_PUSH_KEY missing or invalid")
-        if resp.status_code >= 500:
-            raise HTTPException(502, "Push provider unavailable")
-        resp.raise_for_status()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(f"register-push non-fatal: {e}")
-        return {"status": "queued_local"}
+    """Backward-compatible endpoint: stores device push token in MongoDB push_subscriptions."""
+    now = now_iso()
+    await db.push_subscriptions.update_one(
+        {"token": body.device_token},
+        {
+            "$set": {
+                "user_id": body.user_id,
+                "platform": body.platform,
+                "active": True,
+                "updated_at": now,
+                "last_seen_at": now,
+            },
+            "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now},
+        },
+        upsert=True,
+    )
     return {"status": "registered"}
+
 
 
 # ============ AUTH ============
@@ -1723,75 +2307,6 @@ async def get_doctor(doctor_id: str):
     return d
 
 
-async def calculate_appointment_eta(appt: dict) -> dict:
-    """Calculate live queue metrics and latest estimated turn time for an appointment."""
-    all_appts = await db.appointments.find(
-        {"doctor_id": appt["doctor_id"], "date": appt["date"], "status": {"$ne": "cancelled"}},
-        {"_id": 0},
-    ).sort("token_number", 1).to_list(500)
-
-    active = [a for a in all_appts if a["status"] in ("booked", "arrived", "in_consultation")]
-    current = next((a for a in all_appts if a["status"] == "in_consultation"), None)
-    completed_count = len([a for a in all_appts if a["status"] == "completed"])
-
-    # My position = number of active appts with token <= mine
-    my_position = 0
-    if appt.get("status") in ("booked", "arrived"):
-        my_position = sum(1 for a in active if a["token_number"] <= appt["token_number"])
-    elif appt.get("status") == "in_consultation":
-        my_position = 0
-    else:
-        my_position = -1  # done / cancelled
-
-    # Fetch doctor details
-    doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "avg_consult_minutes": 1, "status": 1, "full_name": 1})
-    doc_status = (doctor or {}).get("status", "active")
-    per = int((doctor or {}).get("avg_consult_minutes") or 15)
-
-    eta_minutes = 0
-    expected_turn_time = None
-
-    if my_position == 0 and appt.get("status") == "in_consultation":
-        expected_turn_time = "Now"
-    elif my_position > 0:
-        eta_minutes = max(0, (my_position - (1 if current else 0))) * per
-        # Local clinic / Indian Standard Time (UTC+5:30)
-        ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
-        future_dt = ist_now + timedelta(minutes=eta_minutes)
-        window_minutes = max(per, 30)
-        end_dt = future_dt + timedelta(minutes=window_minutes)
-        expected_turn_time = format_expected_time_range(future_dt, end_dt)
-    elif appt.get("slot") and appt.get("slot") != "Walk-in":
-        slot_str = appt.get("slot", "")
-        m_slot = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)?", slot_str, re.IGNORECASE)
-        if m_slot:
-            start_fmt = format_12hr_time(slot_str)
-            hr_p = int(m_slot.group(1))
-            min_p = int(m_slot.group(2))
-            meridiem = (m_slot.group(3) or "AM").upper()
-            if meridiem == "PM" and hr_p < 12:
-                hr_p += 12
-            elif meridiem == "AM" and hr_p == 12:
-                hr_p = 0
-            end_min = min_p + 30
-            end_hr = (hr_p + end_min // 60) % 24
-            end_min = end_min % 60
-            end_time_str = format_12hr_time(f"{end_hr:02d}:{end_min:02d}")
-            expected_turn_time = format_expected_time_range(start_fmt, end_time_str)
-        else:
-            expected_turn_time = format_12hr_time(slot_str) or None
-
-    return {
-        "my_position": my_position,
-        "eta_minutes": eta_minutes,
-        "expected_turn_time": expected_turn_time,
-        "currently_serving": current["token_number"] if current else None,
-        "completed_count": completed_count,
-        "total_in_queue": len(active),
-        "doctor_status": doc_status,
-    }
-
-
 # ============ APPOINTMENTS ============
 @api_router.post("/appointments")
 async def create_appointment(
@@ -1926,6 +2441,7 @@ async def create_appointment(
 
     doc.pop("_id", None)
     await broadcast_doctor_update(body.doctor_id, "booked")
+    asyncio.create_task(notify_appointment_booked(doc, doctor, eta_data))
     return doc
 
 
@@ -1995,6 +2511,8 @@ async def cancel_appointment(appt_id: str, user: dict = Depends(get_current_user
         raise HTTPException(status_code=403, detail="Forbidden")
     await db.appointments.update_one({"id": appt_id}, {"$set": {"status": "cancelled"}})
     await broadcast_doctor_update(appt["doctor_id"], "cancelled")
+    asyncio.create_task(notify_appointment_cancelled(appt))
+    asyncio.create_task(notify_queue_movement(appt["doctor_id"]))
     return {"ok": True}
 
 
@@ -2078,11 +2596,15 @@ async def reschedule(appt_id: str, body: AppointmentCreate, user: dict = Depends
     appt = await db.appointments.find_one({"id": appt_id})
     if not appt or appt["patient_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Not found")
-    count = await db.appointments.count_documents({"doctor_id": body.doctor_id, "date": body.date})
+    old_doctor_id = appt["doctor_id"]
+    new_token = count + 1
     await db.appointments.update_one(
         {"id": appt_id},
-        {"$set": {"date": body.date, "slot": body.slot, "token_number": count + 1, "status": "booked"}},
+        {"$set": {"doctor_id": body.doctor_id, "date": body.date, "slot": body.slot, "token_number": new_token, "status": "booked", "notifications_sent": {}}},
     )
+    asyncio.create_task(notify_queue_movement(old_doctor_id))
+    if body.doctor_id != old_doctor_id:
+        asyncio.create_task(notify_queue_movement(body.doctor_id))
     return {"ok": True}
 
 
@@ -2134,6 +2656,7 @@ async def set_doctor_status(body: DoctorStatusBody, user: dict = Depends(require
     d = await db.doctors.find_one({"user_id": user["id"]}, {"_id": 0, "id": 1})
     if d:
         await broadcast_doctor_update(d["id"], "doctor_status_changed")
+        asyncio.create_task(notify_doctor_status_change(d["id"], body.status))
     return {"ok": True, "status": body.status}
 
 
@@ -2333,6 +2856,7 @@ async def reorder(body: ReorderBody, user: dict = Depends(require_role("receptio
         raise HTTPException(status_code=404, detail="Not found")
     await db.appointments.update_one({"id": body.appointment_id}, {"$set": {"token_number": body.new_position}})
     await broadcast_doctor_update(appt["doctor_id"], "reordered")
+    asyncio.create_task(notify_queue_movement(appt["doctor_id"]))
     return {"ok": True}
 
 
@@ -2365,6 +2889,7 @@ async def emergency_insert(body: dict, user: dict = Depends(require_role("recept
     await db.appointments.insert_one(doc)
     doc.pop("_id", None)
     await broadcast_doctor_update(doctor_id, "emergency_inserted")
+    asyncio.create_task(notify_queue_movement(doctor_id))
     return doc
 
 

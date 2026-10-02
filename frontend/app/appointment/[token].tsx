@@ -15,6 +15,8 @@ import { api, getBackendWebSocketBase } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import { formatExpectedTimeRange } from "@/src/utils/timeFormat";
+import NotificationPermissionBanner from "@/src/components/NotificationPermissionBanner";
+import { setupForegroundNotificationListener } from "@/src/utils/pushNotifications";
 
 const POLL_INTERVAL_MS = 15_000;
 
@@ -173,6 +175,16 @@ export default function DynamicAppointmentScreen() {
     };
   }, [apptData?.id, loadAppointment]);
 
+  // Listen for foreground push updates to immediately refresh live appointment
+  useEffect(() => {
+    const unsub = setupForegroundNotificationListener(() => {
+      if (isMounted.current) {
+        loadAppointment(true);
+      }
+    });
+    return () => unsub();
+  }, [loadAppointment]);
+
   if (authLoading || loading) {
     return (
       <SafeAreaView style={styles.safe}>
@@ -281,6 +293,12 @@ export default function DynamicAppointmentScreen() {
             </View>
           </View>
         </View>
+
+        {/* Enable Queue Push Notifications Banner */}
+        <NotificationPermissionBanner
+          appointmentId={apptData?.id}
+          appointmentToken={apptData?.secure_token || token}
+        />
 
         {/* Live Token & ETA Hero */}
         <View style={styles.heroCard}>

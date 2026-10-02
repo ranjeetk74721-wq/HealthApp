@@ -6,6 +6,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { api } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
 import { formatExpectedTimeRange } from "@/src/utils/timeFormat";
+import NotificationPermissionBanner from "@/src/components/NotificationPermissionBanner";
 
 function getDates(count: number) {
   const arr = [];
@@ -60,7 +61,7 @@ export default function BookAppointment() {
   if (success) {
     return (
       <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
-        <View style={styles.successWrap}>
+        <ScrollView contentContainerStyle={styles.successWrap}>
           <View style={styles.successIcon}><Ionicons name="checkmark" size={44} color="#fff" /></View>
           <Text style={styles.successTitle} testID="booking-success">Appointment Booked!</Text>
           <Text style={styles.successSub}>Your sequential token number is</Text>
@@ -74,13 +75,21 @@ export default function BookAppointment() {
               </Text>
             ) : null}
           </View>
+
+          <View style={{ width: "100%", marginVertical: spacing.xs }}>
+            <NotificationPermissionBanner
+              appointmentId={success.id}
+              appointmentToken={success.secure_token}
+            />
+          </View>
+
           <Pressable testID="view-queue-btn" onPress={() => router.replace("/patient/queue")} style={styles.primaryBtn}>
             <Text style={styles.primaryBtnText}>अपनी बारी देखे</Text>
           </Pressable>
           <Pressable onPress={() => router.replace("/patient/home")} style={styles.linkBtn}>
             <Text style={{ color: colors.muted }}>Back to home</Text>
           </Pressable>
-        </View>
+        </ScrollView>
       </SafeAreaView>
     );
   }

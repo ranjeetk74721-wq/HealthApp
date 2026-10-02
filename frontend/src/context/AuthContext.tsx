@@ -101,10 +101,66 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     setState({ token, user, loading: false });
     if (user.id) {
       registerForPush(user.id).catch(() => {});
+
+      // On web, if notifications were previously granted, link the device token to the new user
+      if (
+        Platform.OS === "web" &&
+        typeof window !== "undefined" &&
+        typeof Notification !== "undefined" &&
+        Notification.permission === "granted"
+      ) {
+        AsyncStorage.getItem(PUSH_TOKEN_KEY).then((cached) => {
+          if (cached) {
+            const base = getBackendBase();
+            fetch(`${base}/api/push/subscribe`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                token: cached,
+                platform: "web",
+                user_agent: typeof navigator !== "undefined" ? navigator.userAgent : "web",
+              }),
+            }).catch(() => {});
+          }
+        });
+      }
     }
   }, []);
 
   const signOut = useCallback(async () => {
+    try {
+      const cachedToken = await AsyncStorage.getItem(PUSH_TOKEN_KEY);
+      if (cachedToken) {
+        const base = getBackendBase();
+        // Deactivate push subscription on backend for this device
+        await fetch(`${base}/api/push/unsubscribe`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: cachedToken }),
+        }).catch(() => {});
+
+        // On Web, delete FCM token on the device to stop previous account's notifications
+        if (Platform.OS === "web" && typeof window !== "undefined") {
+          try {
+            const { getFirebaseApp } = await import("@/src/firebase");
+            const app = getFirebaseApp();
+            if (app) {
+              const { getMessaging, deleteToken } = await import("firebase/messaging");
+              const messaging = getMessaging(app);
+              await deleteToken(messaging).catch(() => {});
+            }
+          } catch {
+            // Non-fatal
+          }
+        }
+      }
+    } catch {
+      // Non-fatal
+    }
+
     await Promise.all([
       AsyncStorage.removeItem(TOKEN_KEY),
       AsyncStorage.removeItem(USER_KEY),

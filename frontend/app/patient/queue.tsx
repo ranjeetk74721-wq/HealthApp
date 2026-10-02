@@ -7,6 +7,9 @@ import { api, getBackendWebSocketBase } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import { formatExpectedTimeRange } from "@/src/utils/timeFormat";
+import NotificationPermissionBanner from "@/src/components/NotificationPermissionBanner";
+import { setupForegroundNotificationListener } from "@/src/utils/pushNotifications";
+import { useEffect } from "react";
 
 // Polling interval when WebSocket is NOT connected (fallback)
 const POLL_INTERVAL_MS = 20_000;
@@ -108,6 +111,15 @@ export default function PatientQueue() {
     }, [load]),
   );
 
+  useEffect(() => {
+    const unsub = setupForegroundNotificationListener(() => {
+      if (isFocused.current) {
+        load(true);
+      }
+    });
+    return () => unsub();
+  }, [load]);
+
   if (loading) {
     return (
       <SafeAreaView style={styles.safe}>
@@ -175,6 +187,11 @@ export default function PatientQueue() {
             </View>
           </View>
         )}
+
+        <NotificationPermissionBanner
+          appointmentId={appt?.id}
+          appointmentToken={appt?.secure_token}
+        />
 
         <View style={styles.hero}>
           <Text style={styles.heroLabel}>

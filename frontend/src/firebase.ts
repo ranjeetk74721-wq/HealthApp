@@ -18,6 +18,15 @@ export function isFirebaseConfigured(): boolean {
   return !!(firebaseConfig.apiKey && firebaseConfig.projectId);
 }
 
+export function getFirebaseConfig() {
+  return { ...firebaseConfig };
+}
+
+export function getFirebaseApp(): any {
+  if (!isFirebaseConfigured()) return null;
+  return getApps().length ? getApp() : initializeApp(firebaseConfig as any);
+}
+
 export function getFirebaseAuth(): any {
   if (!isFirebaseConfigured()) return null;
   if (cachedAuth) return cachedAuth;
