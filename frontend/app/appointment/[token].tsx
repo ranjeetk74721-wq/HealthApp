@@ -300,6 +300,35 @@ export default function DynamicAppointmentScreen() {
           appointmentToken={apptData?.secure_token || token}
         />
 
+        {/* Doctor Timing Adjustment & Delay Banner */}
+        {queueData?.is_delayed_awaited && (
+          <View style={[styles.infoBox, { backgroundColor: "#FEF3C7", borderColor: "#F59E0B", borderWidth: 1 }]}>
+            <Ionicons name="time" size={20} color="#D97706" />
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontWeight: "700", color: "#92400E", fontSize: font.sm }}>
+                Doctor delayed — updated time awaited
+              </Text>
+              <Text style={{ color: "#B45309", fontSize: font.xs, marginTop: 2 }}>
+                डॉक्टर के परामर्श शुरू होने में देरी है—नए समय की प्रतीक्षा है। Live queue will update automatically once consultation begins.
+              </Text>
+            </View>
+          </View>
+        )}
+
+        {queueData?.delay_notice && !queueData?.is_delayed_awaited && (
+          <View style={[styles.infoBox, { backgroundColor: "#EFF6FF", borderColor: "#3B82F6", borderWidth: 1 }]}>
+            <Ionicons name="information-circle" size={20} color="#2563EB" />
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontWeight: "700", color: "#1E40AF", fontSize: font.sm }}>
+                Doctor Timing Adjusted
+              </Text>
+              <Text style={{ color: "#1E3A8A", fontSize: font.xs, marginTop: 2 }}>
+                {queueData.delay_notice}
+              </Text>
+            </View>
+          </View>
+        )}
+
         {/* Live Token & ETA Hero */}
         <View style={styles.heroCard}>
           <Text style={styles.heroLabel}>YOUR TOKEN NUMBER</Text>
@@ -316,9 +345,9 @@ export default function DynamicAppointmentScreen() {
               </Text>
             </View>
             <View style={styles.kpiItem}>
-              <Text style={styles.kpiCaption}>Expected Time</Text>
+              <Text style={styles.kpiCaption}>Estimated Turn</Text>
               <Text style={[styles.kpiValue, { color: colors.brandPrimary }]} testID="expected-turn-time">
-                {expectedTurnTime}
+                {queueData?.is_delayed_awaited ? "Time Awaited" : expectedTurnTime}
               </Text>
             </View>
             <View style={styles.kpiItem}>

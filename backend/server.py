@@ -229,6 +229,10 @@ async def ensure_db_indexes():
             # push subscriptions
             db.push_subscriptions.create_index([("token", 1)], unique=True),
             db.push_subscriptions.create_index([("user_id", 1), ("active", 1)]),
+            # doctor sessions
+            db.doctor_sessions.create_index([("id", 1)], unique=True),
+            db.doctor_sessions.create_index([("doctor_id", 1), ("date", 1)]),
+            db.doctor_sessions.create_index([("hospital_id", 1), ("date", 1)]),
         )
     except Exception:
         pass
@@ -364,6 +368,28 @@ class DoctorStatusBody(BaseModel):
 class PrescriptionBody(BaseModel):
     appointment_id: str
     prescription: str
+
+
+class DoctorTimingAdjustBody(BaseModel):
+    date: Optional[str] = None  # YYYY-MM-DD, defaults to today in IST
+    new_start_time: Optional[str] = None  # e.g. "11:00 AM" or "11:30"
+    delay_minutes: Optional[int] = None  # shortcut: 15, 30, or 60 minutes
+    reason: Optional[str] = None
+    expected_version: Optional[int] = None
+
+
+class DoctorSessionStartBody(BaseModel):
+    date: Optional[str] = None
+
+
+class DoctorSessionPauseBody(BaseModel):
+    date: Optional[str] = None
+    expected_resume_time: Optional[str] = None
+    pause_reason: Optional[str] = None
+
+
+class DoctorSessionResumeBody(BaseModel):
+    date: Optional[str] = None
 
 
 # ---- Mobile OTP Auth models ----
@@ -613,6 +639,59 @@ def format_expected_time_range(start: Any, end: Optional[Any] = None) -> str:
 def format_clock_time(dt: datetime) -> str:
     """Format datetime into 12-hour clock format with AM/PM (e.g. 1:00 PM, 10:30 AM)."""
     return format_12hr_time(dt)
+
+
+def parse_time_to_ist_dt(date_str: str, time_str: str) -> Optional[datetime]:
+    """Parse date ('YYYY-MM-DD') and time string ('10:00 AM', '10 AM', '14:30', etc.) into an IST-aware datetime."""
+    if not date_str or not time_str:
+        return None
+    time_str = str(time_str).strip()
+    tz_ist = timezone(timedelta(hours=5, minutes=30))
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+    # Check 12-hour format: 10:00 AM, 10 AM, 02:30 PM, 2 PM, 10:00AM
+    m12 = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$", time_str, re.IGNORECASE)
+    if m12:
+        hr = int(m12.group(1))
+        minute = int(m12.group(2) or 0)
+        meridiem = m12.group(3).upper()
+        if meridiem == "PM" and hr < 12:
+            hr += 12
+        elif meridiem == "AM" and hr == 12:
+            hr = 0
+        try:
+            return datetime(d.year, d.month, d.day, hr, minute, 0, tzinfo=tz_ist)
+        except Exception:
+            return None
+
+    # Check 24-hour format: 14:30, 09:15, 10:00, 10
+    m24 = re.match(r"^(\d{1,2})(?::(\d{2}))?$", time_str)
+    if m24:
+        hr = int(m24.group(1))
+        minute = int(m24.group(2) or 0)
+        try:
+            return datetime(d.year, d.month, d.day, hr, minute, 0, tzinfo=tz_ist)
+        except Exception:
+            return None
+
+    return None
+
+
+def extract_session_start_time(timings_str: Optional[str]) -> str:
+    """Extract standard 12-hour start time from timings string (e.g. '10:00 AM - 6:00 PM' -> '10:00 AM')."""
+    if not timings_str:
+        return "10:00 AM"
+    m = re.search(r"(\d{1,2}(?::\d{2})?\s*(?:AM|PM)?)", timings_str, re.IGNORECASE)
+    if m:
+        extracted = m.group(1).strip()
+        formatted = format_12hr_time(extracted)
+        if formatted:
+            return formatted
+    return "10:00 AM"
+
 def hash_password(pw: str) -> str:
     return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
 
@@ -975,6 +1054,77 @@ class PushUnsubscribeBody(BaseModel):
     token: str
 
 
+async def get_or_create_doctor_session(doctor_id: str, date: str) -> dict:
+    """Fetch existing doctor session for given date or create and persist default session."""
+    session_id = f"{doctor_id}_{date}"
+    if not hasattr(db, "doctor_sessions") or not hasattr(db.doctor_sessions, "find_one"):
+        return {
+            "id": session_id,
+            "doctor_id": doctor_id,
+            "date": date,
+            "original_start_time": "10:00 AM",
+            "expected_start_time": "10:00 AM",
+            "status": "not_started",
+            "version": 1,
+        }
+    session = await db.doctor_sessions.find_one({"id": session_id}, {"_id": 0})
+    if session:
+        return session
+
+    # Fetch doctor profile to seed original start time and hospital_id
+    doctor = await db.doctors.find_one(
+        {"id": doctor_id},
+        {"_id": 0, "timings": 1, "hospital_id": 1, "full_name": 1, "clinic_name": 1, "status": 1}
+    )
+    timings = (doctor or {}).get("timings", "10:00 AM - 6:00 PM")
+    orig_start = extract_session_start_time(timings)
+    hospital_id = (doctor or {}).get("hospital_id")
+
+    # Check appointments for today
+    all_appts = await db.appointments.find(
+        {"doctor_id": doctor_id, "date": date, "status": {"$ne": "cancelled"}},
+        {"_id": 0, "status": 1}
+    ).to_list(500)
+
+    has_in_consult = any(a.get("status") == "in_consultation" for a in all_appts)
+    has_completed = any(a.get("status") == "completed" for a in all_appts)
+    all_completed = bool(all_appts and all(a.get("status") == "completed" for a in all_appts))
+
+    init_status = "not_started"
+    if all_completed:
+        init_status = "completed"
+    elif has_in_consult or has_completed:
+        init_status = "in_consultation"
+    elif (doctor or {}).get("status") == "paused":
+        init_status = "paused"
+
+    session = {
+        "id": session_id,
+        "doctor_id": doctor_id,
+        "hospital_id": hospital_id,
+        "date": date,
+        "original_start_time": orig_start,
+        "expected_start_time": orig_start,
+        "actual_start_time": format_ist_12hr() if (has_in_consult or has_completed) else None,
+        "status": init_status,
+        "delay_reason": None,
+        "paused_at": None,
+        "expected_resume_time": None,
+        "pause_reason": None,
+        "version": 1,
+        "history": [],
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    try:
+        await db.doctor_sessions.update_one({"id": session_id}, {"$setOnInsert": session}, upsert=True)
+    except Exception:
+        pass
+
+    saved = await db.doctor_sessions.find_one({"id": session_id}, {"_id": 0})
+    return saved or session
+
+
 async def calculate_appointment_eta(appt: dict) -> dict:
     """Calculate live queue metrics and latest estimated turn time for an appointment."""
     all_appts = await db.appointments.find(
@@ -996,23 +1146,83 @@ async def calculate_appointment_eta(appt: dict) -> dict:
         my_position = -1  # done / cancelled
 
     # Fetch doctor details
-    doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "avg_consult_minutes": 1, "status": 1, "full_name": 1})
+    doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "avg_consult_minutes": 1, "status": 1, "full_name": 1, "clinic_name": 1})
     doc_status = (doctor or {}).get("status", "active")
     per = int((doctor or {}).get("avg_consult_minutes") or 15)
 
+    # Fetch doctor session
+    appt_date = appt.get("date") or get_ist_now().strftime("%Y-%m-%d")
+    session = await get_or_create_doctor_session(appt["doctor_id"], appt_date)
+
     eta_minutes = 0
     expected_turn_time = None
+    is_delayed_awaited = False
+    is_delayed = bool(
+        session.get("expected_start_time")
+        and session.get("original_start_time")
+        and session.get("expected_start_time") != session.get("original_start_time")
+    )
+
+    ist_now = get_ist_now()
 
     if my_position == 0 and appt.get("status") == "in_consultation":
         expected_turn_time = "Now"
     elif my_position > 0:
-        eta_minutes = max(0, (my_position - (1 if current else 0))) * per
-        # Local clinic / Indian Standard Time (UTC+5:30)
-        ist_now = get_ist_now()
-        future_dt = ist_now + timedelta(minutes=eta_minutes)
-        window_minutes = max(per, 30)
-        end_dt = future_dt + timedelta(minutes=window_minutes)
-        expected_turn_time = format_expected_time_range(future_dt, end_dt)
+        session_status = session.get("status", "not_started")
+        if current is not None or completed_count > 0 or session.get("actual_start_time"):
+            session_status = "in_consultation"
+
+        is_today = (appt_date == ist_now.strftime("%Y-%m-%d"))
+
+        # CASE 1: Consultation has not started yet
+        if session_status == "not_started":
+            exp_start_str = session.get("expected_start_time") or session.get("original_start_time") or "10:00 AM"
+            start_dt = parse_time_to_ist_dt(appt_date, exp_start_str)
+
+            if is_today and start_dt and ist_now > start_dt:
+                # Revised start time has passed without consultation beginning!
+                expected_turn_time = "Doctor delayed—updated time awaited"
+                is_delayed_awaited = True
+                eta_minutes = 0
+            elif start_dt:
+                patient_offset = max(0, my_position - 1) * per
+                patient_start_dt = start_dt + timedelta(minutes=patient_offset)
+                patient_end_dt = patient_start_dt + timedelta(minutes=max(per, 30))
+                expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
+                if is_today:
+                    eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60))
+                else:
+                    eta_minutes = max(0, (my_position - 1) * per)
+            else:
+                eta_minutes = (my_position - 1) * per
+                future_dt = ist_now + timedelta(minutes=eta_minutes)
+                end_dt = future_dt + timedelta(minutes=max(per, 30))
+                expected_turn_time = format_expected_time_range(future_dt, end_dt)
+
+        # CASE 2: Doctor is paused
+        elif session_status == "paused" or doc_status == "paused":
+            exp_resume_str = session.get("expected_resume_time")
+            resume_dt = parse_time_to_ist_dt(appt_date, exp_resume_str) if exp_resume_str else None
+
+            if resume_dt and resume_dt > ist_now:
+                patient_offset = max(0, (my_position - (1 if current else 0))) * per
+                patient_start_dt = resume_dt + timedelta(minutes=patient_offset)
+                patient_end_dt = patient_start_dt + timedelta(minutes=max(per, 30))
+                expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
+                eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60))
+            else:
+                expected_turn_time = "Doctor paused—resume time awaited"
+                is_delayed_awaited = True
+                eta_minutes = 0
+
+        # CASE 3: Active in_consultation queue
+        else:
+            eta_minutes = max(0, (my_position - (1 if current else 0))) * per
+            future_dt = ist_now + timedelta(minutes=eta_minutes)
+            window_minutes = max(per, 30)
+            end_dt = future_dt + timedelta(minutes=window_minutes)
+            expected_turn_time = format_expected_time_range(future_dt, end_dt)
+
     elif appt.get("slot") and appt.get("slot") != "Walk-in":
         slot_str = appt.get("slot", "")
         m_slot = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)?", slot_str, re.IGNORECASE)
@@ -1033,6 +1243,24 @@ async def calculate_appointment_eta(appt: dict) -> dict:
         else:
             expected_turn_time = format_12hr_time(slot_str) or None
 
+    # Construct patient delay message in Hindi/English
+    delay_notice = None
+    if session.get("status") == "not_started":
+        if is_delayed_awaited:
+            delay_notice = "Doctor delayed—updated time awaited. डॉक्टर के परामर्श शुरू होने में देरी है—नए समय की प्रतीक्षा है।"
+        elif is_delayed:
+            delay_notice = (
+                f"Doctor ke consultation start hone mein deri hai. "
+                f"Naya expected start time: {session.get('expected_start_time')}. "
+                f"Aapka updated estimated time: {expected_turn_time}."
+            )
+    elif session.get("status") == "paused":
+        delay_notice = (
+            f"Doctor consultation is paused. "
+            f"{'Reason: ' + session['pause_reason'] + '. ' if session.get('pause_reason') else ''}"
+            f"{'Expected resume: ' + session['expected_resume_time'] + '.' if session.get('expected_resume_time') else 'Resume time awaited.'}"
+        )
+
     return {
         "my_position": my_position,
         "eta_minutes": eta_minutes,
@@ -1041,6 +1269,17 @@ async def calculate_appointment_eta(appt: dict) -> dict:
         "completed_count": completed_count,
         "total_in_queue": len(active),
         "doctor_status": doc_status,
+        "session_status": session.get("status", "not_started"),
+        "original_start_time": session.get("original_start_time"),
+        "expected_start_time": session.get("expected_start_time"),
+        "actual_start_time": session.get("actual_start_time"),
+        "delay_reason": session.get("delay_reason"),
+        "is_delayed": is_delayed,
+        "is_delayed_awaited": is_delayed_awaited,
+        "delay_notice": delay_notice,
+        "expected_resume_time": session.get("expected_resume_time"),
+        "pause_reason": session.get("pause_reason"),
+        "session_version": session.get("version", 1),
     }
 
 
@@ -1496,6 +1735,70 @@ async def notify_doctor_status_change(doctor_id: str, new_status: str) -> None:
             )
     except Exception as e:
         logger.warning(f"notify_doctor_status_change error: {e}")
+
+
+async def notify_timing_adjusted(doctor_id: str, date: str, new_start_time: str, reason: Optional[str] = None) -> None:
+    """Notify all active waiting patients about the doctor's revised timing."""
+    try:
+        doctor = await db.doctors.find_one({"id": doctor_id}, {"_id": 0, "full_name": 1, "clinic_name": 1, "hospital_name": 1})
+        hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
+        doc_name = (doctor or {}).get("full_name", "").replace("Dr. ", "")
+
+        # Only notify waiting patients (booked or arrived)
+        appts = await db.appointments.find(
+            {"doctor_id": doctor_id, "date": date, "status": {"$in": ["booked", "arrived"]}},
+            {"_id": 0}
+        ).sort("token_number", 1).to_list(500)
+
+        time_str = format_ist_12hr()
+        for a in appts:
+            pid = a.get("patient_id")
+            recipients = []
+            if pid and pid != "emergency":
+                recipients.append(pid)
+            if a.get("secure_token"):
+                recipients.append(f"token_{a['secure_token']}")
+            if not recipients:
+                continue
+
+            eta_data = await calculate_appointment_eta(a)
+            token_num = a.get("token_number")
+            serving = eta_data.get("currently_serving")
+            serving_display = f"#{serving}" if serving is not None else "Waiting"
+            eta_display = eta_data.get("expected_turn_time") or "Updating"
+
+            reason_line = f"Reason: {reason}" if reason else None
+            body_lines = [
+                f"Your Token: #{token_num}",
+                f"Now Serving: {serving_display}",
+                f"Dr. {doc_name} revised start: {new_start_time}",
+            ]
+            if reason_line:
+                body_lines.append(reason_line)
+            body_lines.extend([
+                f"Estimated Turn: {eta_display}",
+                f"Updated: {time_str}",
+                "Tap to view live queue.",
+            ])
+            target_url = f"/appointment/{a['secure_token']}" if a.get("secure_token") else "/patient/queue"
+            tag = f"timing-{doctor_id}-{date}-{new_start_time.replace(' ', '')}"
+
+            await send_fcm_web_push(
+                recipients=recipients,
+                title=f"{hospital_name} — MeriBaari",
+                body="\n".join(body_lines),
+                action_url=target_url,
+                tag=tag,
+                extra_data={
+                    "type": "timing_adjusted",
+                    "doctor_id": doctor_id,
+                    "revised_start_time": new_start_time,
+                    "expected_turn_time": eta_display,
+                    "token_number": str(token_num),
+                },
+            )
+    except Exception as e:
+        logger.warning(f"notify_timing_adjusted error: {e}")
 
 
 async def notify_appointment_cancelled(appt: dict) -> None:
@@ -2666,6 +2969,303 @@ async def set_prescription(body: PrescriptionBody, user: dict = Depends(require_
     return {"ok": True}
 
 
+# ============ DOCTOR SESSION & TIMING ADJUSTMENT ============
+
+async def verify_doctor_session_access(doctor_id: str, user: dict, write: bool = False) -> dict:
+    """Validate user permissions to view or edit doctor session timing."""
+    doc = await db.doctors.find_one({"id": doctor_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    role = user.get("role")
+    if role == "doctor":
+        if doc.get("user_id") != user.get("id") and doc.get("id") != user.get("id"):
+            raise HTTPException(status_code=403, detail="Forbidden: You can only adjust your own session")
+    elif role == "receptionist":
+        user_hosp = (user.get("hospital_id") or "").strip().upper()
+        doc_hosp = (doc.get("hospital_id") or "").strip().upper()
+        if user_hosp and doc_hosp and user_hosp != doc_hosp:
+            raise HTTPException(status_code=403, detail="Forbidden: Doctor does not belong to your hospital")
+    elif role in ("admin", "owner", "developer"):
+        user_hosp = (user.get("hospital_id") or "").strip().upper()
+        doc_hosp = (doc.get("hospital_id") or "").strip().upper()
+        if user_hosp and doc_hosp and user_hosp != doc_hosp:
+            raise HTTPException(status_code=403, detail="Forbidden: Doctor does not belong to your hospital")
+    elif role == "patient":
+        if write:
+            raise HTTPException(status_code=403, detail="Patients cannot modify doctor timing")
+    else:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    return doc
+
+
+@api_router.get("/doctor/{doctor_id}/session")
+async def get_doctor_session(
+    doctor_id: str,
+    date: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    """Retrieve session timings and consultation status for a doctor on a specific date."""
+    doc = await verify_doctor_session_access(doctor_id, user, write=False)
+    session_date = date or get_ist_now().strftime("%Y-%m-%d")
+    session = await get_or_create_doctor_session(doctor_id, session_date)
+
+    # Count waiting patients affected
+    waiting_count = await db.appointments.count_documents({
+        "doctor_id": doctor_id,
+        "date": session_date,
+        "status": {"$in": ["booked", "arrived"]}
+    })
+    total_active = await db.appointments.count_documents({
+        "doctor_id": doctor_id,
+        "date": session_date,
+        "status": {"$in": ["booked", "arrived", "in_consultation"]}
+    })
+
+    return {
+        "ok": True,
+        "session": session,
+        "doctor_name": doc.get("full_name"),
+        "clinic_name": doc.get("clinic_name"),
+        "timings": doc.get("timings"),
+        "waiting_patients_count": waiting_count,
+        "total_active_patients": total_active,
+    }
+
+
+@api_router.post("/doctor/{doctor_id}/session/adjust-timing")
+async def adjust_doctor_timing(
+    doctor_id: str,
+    body: DoctorTimingAdjustBody,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer"))
+):
+    """Receptionist or Doctor adjusts session expected start time with reason and audit history."""
+    doc = await verify_doctor_session_access(doctor_id, user, write=True)
+    session_date = body.date or get_ist_now().strftime("%Y-%m-%d")
+    session = await get_or_create_doctor_session(doctor_id, session_date)
+
+    # Reject adjustments to closed / completed sessions
+    if session.get("status") == "completed":
+        raise HTTPException(status_code=400, detail="Cannot adjust timing for a completed session")
+
+    # Determine revised expected start time
+    current_expected = session.get("expected_start_time") or session.get("original_start_time") or "10:00 AM"
+
+    if body.delay_minutes:
+        # Shortcut: +15, +30, +60 minutes
+        base_dt = parse_time_to_ist_dt(session_date, current_expected)
+        if not base_dt:
+            base_dt = parse_time_to_ist_dt(session_date, "10:00 AM")
+        revised_dt = base_dt + timedelta(minutes=body.delay_minutes)
+        revised_start_time = format_12hr_time(revised_dt)
+    elif body.new_start_time:
+        parsed_dt = parse_time_to_ist_dt(session_date, body.new_start_time)
+        if not parsed_dt:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid time format. Please provide a valid time (e.g. '11:00 AM' or '02:30 PM')"
+            )
+        revised_start_time = format_12hr_time(parsed_dt)
+    else:
+        raise HTTPException(status_code=400, detail="Either new_start_time or delay_minutes is required")
+
+    # Optimistic concurrency check
+    current_version = int(session.get("version") or 1)
+    if body.expected_version is not None and body.expected_version != current_version:
+        raise HTTPException(
+            status_code=409,
+            detail="Session timing was updated concurrently by another user. Please refresh and retry."
+        )
+
+    # Prepare audit history entry
+    history_entry = {
+        "previous_time": current_expected,
+        "revised_time": revised_start_time,
+        "reason": body.reason,
+        "changed_by": user.get("id"),
+        "changed_by_name": user.get("full_name") or user.get("email"),
+        "changed_by_role": user.get("role"),
+        "timestamp": now_iso(),
+    }
+
+    # Atomically update session document
+    update_res = await db.doctor_sessions.find_one_and_update(
+        {"id": session["id"], "version": current_version},
+        {
+            "$set": {
+                "expected_start_time": revised_start_time,
+                "delay_reason": body.reason,
+                "updated_at": now_iso(),
+            },
+            "$inc": {"version": 1},
+            "$push": {"history": history_entry},
+        },
+        return_document=pymongo.ReturnDocument.AFTER,
+    )
+    if not update_res:
+        # Fallback if optimistic concurrency failed during race
+        update_res = await db.doctor_sessions.find_one_and_update(
+            {"id": session["id"]},
+            {
+                "$set": {
+                    "expected_start_time": revised_start_time,
+                    "delay_reason": body.reason,
+                    "updated_at": now_iso(),
+                },
+                "$inc": {"version": 1},
+                "$push": {"history": history_entry},
+            },
+            return_document=pymongo.ReturnDocument.AFTER,
+        )
+
+    # Count affected waiting patients
+    waiting_count = await db.appointments.count_documents({
+        "doctor_id": doctor_id,
+        "date": session_date,
+        "status": {"$in": ["booked", "arrived"]}
+    })
+
+    # Broadcast real-time update
+    await broadcast_doctor_update(doctor_id, "timing_adjusted")
+
+    # Asynchronously dispatch Web Push notification to waiting patients
+    asyncio.create_task(notify_timing_adjusted(doctor_id, session_date, revised_start_time, body.reason))
+
+    # Remove internal _id for JSON serialization
+    if update_res and "_id" in update_res:
+        del update_res["_id"]
+
+    return {
+        "ok": True,
+        "message": f"Doctor expected start time updated to {revised_start_time}",
+        "session": update_res,
+        "affected_patients_count": waiting_count,
+    }
+
+
+@api_router.post("/doctor/{doctor_id}/session/start-consultation")
+async def start_doctor_session(
+    doctor_id: str,
+    body: DoctorSessionStartBody,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer"))
+):
+    """Start consultation session for doctor, recording actual start time and transitioning status."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+    session_date = body.date or get_ist_now().strftime("%Y-%m-%d")
+    session = await get_or_create_doctor_session(doctor_id, session_date)
+
+    if session.get("status") == "completed":
+        raise HTTPException(status_code=400, detail="Session is already completed")
+
+    actual_time = format_ist_12hr()
+    updated = await db.doctor_sessions.find_one_and_update(
+        {"id": session["id"]},
+        {
+            "$set": {
+                "status": "in_consultation",
+                "actual_start_time": session.get("actual_start_time") or actual_time,
+                "paused_at": None,
+                "expected_resume_time": None,
+                "pause_reason": None,
+                "updated_at": now_iso(),
+            },
+            "$inc": {"version": 1},
+        },
+        return_document=pymongo.ReturnDocument.AFTER,
+    )
+    # Sync doctor status to active
+    await db.doctors.update_one({"id": doctor_id}, {"$set": {"status": "active"}})
+
+    await broadcast_doctor_update(doctor_id, "consultation_started")
+    asyncio.create_task(notify_queue_movement(doctor_id))
+
+    if updated and "_id" in updated:
+        del updated["_id"]
+
+    return {"ok": True, "session": updated, "actual_start_time": actual_time}
+
+
+@api_router.post("/doctor/{doctor_id}/session/pause")
+async def pause_doctor_session(
+    doctor_id: str,
+    body: DoctorSessionPauseBody,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer"))
+):
+    """Pause consultation session with optional expected resume time and reason."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+    session_date = body.date or get_ist_now().strftime("%Y-%m-%d")
+    session = await get_or_create_doctor_session(doctor_id, session_date)
+
+    if session.get("status") == "completed":
+        raise HTTPException(status_code=400, detail="Cannot pause a completed session")
+
+    paused_time = format_ist_12hr()
+    formatted_resume = format_12hr_time(body.expected_resume_time) if body.expected_resume_time else None
+
+    updated = await db.doctor_sessions.find_one_and_update(
+        {"id": session["id"]},
+        {
+            "$set": {
+                "status": "paused",
+                "paused_at": paused_time,
+                "expected_resume_time": formatted_resume,
+                "pause_reason": body.pause_reason or "Doctor break",
+                "updated_at": now_iso(),
+            },
+            "$inc": {"version": 1},
+        },
+        return_document=pymongo.ReturnDocument.AFTER,
+    )
+    # Sync doctor status to paused
+    await db.doctors.update_one({"id": doctor_id}, {"$set": {"status": "paused"}})
+
+    await broadcast_doctor_update(doctor_id, "consultation_paused")
+    asyncio.create_task(notify_doctor_status_change(doctor_id, "paused"))
+
+    if updated and "_id" in updated:
+        del updated["_id"]
+
+    return {"ok": True, "session": updated}
+
+
+@api_router.post("/doctor/{doctor_id}/session/resume")
+async def resume_doctor_session(
+    doctor_id: str,
+    body: DoctorSessionResumeBody,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer"))
+):
+    """Resume a paused consultation session."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+    session_date = body.date or get_ist_now().strftime("%Y-%m-%d")
+    session = await get_or_create_doctor_session(doctor_id, session_date)
+
+    updated = await db.doctor_sessions.find_one_and_update(
+        {"id": session["id"]},
+        {
+            "$set": {
+                "status": "in_consultation",
+                "paused_at": None,
+                "expected_resume_time": None,
+                "pause_reason": None,
+                "updated_at": now_iso(),
+            },
+            "$inc": {"version": 1},
+        },
+        return_document=pymongo.ReturnDocument.AFTER,
+    )
+    # Sync doctor status to active
+    await db.doctors.update_one({"id": doctor_id}, {"$set": {"status": "active"}})
+
+    await broadcast_doctor_update(doctor_id, "consultation_resumed")
+    asyncio.create_task(notify_doctor_status_change(doctor_id, "active"))
+    asyncio.create_task(notify_queue_movement(doctor_id))
+
+    if updated and "_id" in updated:
+        del updated["_id"]
+
+    return {"ok": True, "session": updated}
+
+
 # ============ REFERRAL & QUEUE MANAGEMENT ============
 @api_router.post("/reception/refer")
 @api_router.post("/appointments/{appt_id}/refer")
@@ -2822,6 +3422,23 @@ async def start_consultation(body: QueueActionBody, user: dict = Depends(require
     if not appt:
         raise HTTPException(status_code=404, detail="Not found")
     await db.appointments.update_one({"id": body.appointment_id}, {"$set": {"status": "in_consultation"}})
+
+    # Auto-sync doctor session to in_consultation and record actual_start_time
+    appt_date = appt.get("date") or get_ist_now().strftime("%Y-%m-%d")
+    session = await get_or_create_doctor_session(appt["doctor_id"], appt_date)
+    if session.get("status") == "not_started" or not session.get("actual_start_time"):
+        await db.doctor_sessions.update_one(
+            {"id": session["id"]},
+            {
+                "$set": {
+                    "status": "in_consultation",
+                    "actual_start_time": session.get("actual_start_time") or format_ist_12hr(),
+                    "updated_at": now_iso(),
+                },
+                "$inc": {"version": 1},
+            }
+        )
+
     await broadcast_doctor_update(appt["doctor_id"], "started")
     asyncio.create_task(notify_queue_movement(appt["doctor_id"]))
     return {"ok": True}
@@ -2833,6 +3450,20 @@ async def complete_consultation(body: QueueActionBody, user: dict = Depends(requ
     if not appt:
         raise HTTPException(status_code=404, detail="Not found")
     await db.appointments.update_one({"id": body.appointment_id}, {"$set": {"status": "completed", "payment_status": "paid"}})
+
+    # Check if remaining queue for today is complete
+    appt_date = appt.get("date") or get_ist_now().strftime("%Y-%m-%d")
+    remaining = await db.appointments.count_documents({
+        "doctor_id": appt["doctor_id"],
+        "date": appt_date,
+        "status": {"$in": ["booked", "arrived", "in_consultation"]}
+    })
+    if remaining == 0:
+        await db.doctor_sessions.update_one(
+            {"id": f"{appt['doctor_id']}_{appt_date}"},
+            {"$set": {"status": "completed", "updated_at": now_iso()}}
+        )
+
     await broadcast_doctor_update(appt["doctor_id"], "completed")
     asyncio.create_task(notify_queue_movement(appt["doctor_id"]))
     return {"ok": True}

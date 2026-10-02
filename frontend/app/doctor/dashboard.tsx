@@ -11,6 +11,7 @@ import { api, getBackendWebSocketBase } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import CalendarSummary from "@/src/components/CalendarSummary";
+import DoctorSessionBar from "@/src/components/DoctorSessionBar";
 
 const POLL_INTERVAL_MS = 20_000;
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024; // 5 MB limit
@@ -36,6 +37,7 @@ const STATUS_COLORS: Record<string, string> = {
 export default function DoctorDashboard() {
   const router = useRouter();
   const { user, signOut } = useAuth();
+  const [docSession, setDocSession]   = useState<any | null>(null);
   const [data, setData]       = useState<any | null>(null);
   const [appts, setAppts]     = useState<any[]>([]);
   const [summaryData, setSummaryData] = useState<any[]>([]);
@@ -81,6 +83,13 @@ export default function DoctorDashboard() {
       setAppts(a);
       setSummaryData(sum || []);
       setReceptionists(recs || []);
+
+      const docId = d?.doctor?.id;
+      if (docId) {
+        api.get(`/doctor/${docId}/session`, { bypassCache: shouldBypass })
+          .then((res) => { if (res?.session) setDocSession(res.session); })
+          .catch(() => {});
+      }
     } catch (err: any) {
       if (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired"))) {
         await signOut();
@@ -326,6 +335,17 @@ export default function DoctorDashboard() {
         contentContainerStyle={styles.scroll}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true); }} />}
       >
+        {/* ── Doctor Session Timing Bar & Controls ── */}
+        {data?.doctor?.id && docSession && (
+          <DoctorSessionBar
+            doctorId={data.doctor.id}
+            doctorName={data.doctor.full_name || user?.full_name || "Doctor"}
+            session={docSession}
+            waitingCount={appts.filter((a) => ["booked", "arrived"].includes(a.status)).length}
+            onRefresh={() => load(true, true)}
+          />
+        )}
+
         {/* ── Status chips ── */}
         <View style={styles.modeRow}>
           {modes.map((m) => {

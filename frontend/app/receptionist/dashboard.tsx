@@ -10,6 +10,7 @@ import { api, getBackendWebSocketBase } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import CalendarSummary from "@/src/components/CalendarSummary";
+import DoctorSessionBar from "@/src/components/DoctorSessionBar";
 
 const POLL_INTERVAL_MS = 10_000;
 
@@ -27,6 +28,7 @@ export default function ReceptionistDashboard() {
   const { user, signOut } = useAuth();
   const [doctors, setDoctors]       = useState<any[]>([]);
   const [selectedDoc, setSelectedDoc] = useState<string | null>(null);
+  const [docSession, setDocSession]   = useState<any | null>(null);
   const [queue, setQueue]           = useState<any[]>([]);
   const [summaryData, setSummaryData] = useState<any[]>([]);
   const [loading, setLoading]       = useState(true);
@@ -79,8 +81,12 @@ export default function ReceptionistDashboard() {
         selectedDocRef.current = doctorId;
       }
       if (doctorId) {
-        const q = await api.get(`/reception/queue?doctor_id=${doctorId}`, { bypassCache: shouldBypass });
+        const [q, sessRes] = await Promise.all([
+          api.get(`/reception/queue?doctor_id=${doctorId}`, { bypassCache: shouldBypass }),
+          api.get(`/doctor/${doctorId}/session`, { bypassCache: shouldBypass }).catch(() => null),
+        ]);
         setQueue(q);
+        if (sessRes?.session) setDocSession(sessRes.session);
       }
     } catch (err: any) {
       if (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired"))) {
@@ -136,11 +142,17 @@ export default function ReceptionistDashboard() {
     }, [load, wsConnected]),
   );
 
-  // Reload queue when user manually picks a different doctor
+  // Reload queue and doctor session when user manually picks a different doctor
   useEffect(() => {
     if (!selectedDoc) return;
-    api.get(`/reception/queue?doctor_id=${selectedDoc}`, { bypassCache: true })
-      .then(setQueue)
+    Promise.all([
+      api.get(`/reception/queue?doctor_id=${selectedDoc}`, { bypassCache: true }),
+      api.get(`/doctor/${selectedDoc}/session`, { bypassCache: true }).catch(() => null),
+    ])
+      .then(([q, sessRes]) => {
+        setQueue(q);
+        if (sessRes?.session) setDocSession(sessRes.session);
+      })
       .catch(() => {});
   }, [selectedDoc]);
 
@@ -294,6 +306,17 @@ export default function ReceptionistDashboard() {
         contentContainerStyle={styles.scroll}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true); }} />}
       >
+        {/* ── Doctor Session Timing & Adjustment Controls ── */}
+        {selectedDoc && docSession && (
+          <DoctorSessionBar
+            doctorId={selectedDoc}
+            doctorName={doctors.find((d) => d.id === selectedDoc)?.full_name || "Doctor"}
+            session={docSession}
+            waitingCount={activeQueue.filter((q) => ["booked", "arrived"].includes(q.status)).length}
+            onRefresh={() => load(true, true)}
+          />
+        )}
+
         {/* ── View-Only Calendar Summary ── */}
         <Text style={{ fontSize: font.lg, fontWeight: "700", color: colors.onSurface, marginBottom: spacing.sm }}>Daily Patient Calendar</Text>
         <CalendarSummary summaryData={summaryData} />

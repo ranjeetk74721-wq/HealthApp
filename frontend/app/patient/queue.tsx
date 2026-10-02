@@ -188,6 +188,35 @@ export default function PatientQueue() {
           </View>
         )}
 
+        {/* Doctor Timing Adjustment & Delay Banner */}
+        {data.is_delayed_awaited && (
+          <View style={[styles.statusBanner, { backgroundColor: "#FEF3C7", borderColor: "#F59E0B" }]}>
+            <Ionicons name="time" size={20} color="#D97706" />
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontWeight: "700", color: "#92400E", fontSize: font.sm }}>
+                Doctor delayed — updated time awaited
+              </Text>
+              <Text style={{ color: "#B45309", fontSize: font.xs, marginTop: 2 }}>
+                डॉक्टर के परामर्श शुरू होने में देरी है—नए समय की प्रतीक्षा है। Live queue will update automatically once consultation begins.
+              </Text>
+            </View>
+          </View>
+        )}
+
+        {data.delay_notice && !data.is_delayed_awaited && (
+          <View style={[styles.statusBanner, { backgroundColor: "#EFF6FF", borderColor: "#3B82F6" }]}>
+            <Ionicons name="information-circle" size={20} color="#2563EB" />
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontWeight: "700", color: "#1E40AF", fontSize: font.sm }}>
+                Doctor Timing Adjusted
+              </Text>
+              <Text style={{ color: "#1E3A8A", fontSize: font.xs, marginTop: 2 }}>
+                {data.delay_notice}
+              </Text>
+            </View>
+          </View>
+        )}
+
         <NotificationPermissionBanner
           appointmentId={appt?.id}
           appointmentToken={appt?.secure_token}
@@ -205,7 +234,9 @@ export default function PatientQueue() {
               ? "Please head to the consultation room"
               : isDone
               ? "Consultation completed"
-              : `Expected Time: ${formatExpectedTimeRange(data.expected_turn_time || data.eta_minutes || "Calculating...")}`}
+              : data.is_delayed_awaited
+              ? "Doctor delayed—updated time awaited"
+              : `Estimated Consultation Time: ${formatExpectedTimeRange(data.expected_turn_time || data.eta_minutes || "Calculating...")}`}
           </Text>
           {!isServing && !isDone && (
             <Text style={styles.heroSub}>
