@@ -1432,8 +1432,17 @@ async def send_fcm_web_push(
         {"_id": 0, "token": 1, "user_id": 1, "platform": 1},
     ).to_list(500)
 
-    if not subs:
-        logger.debug(f"[WebPush] No active subscriptions for users: {recipients}")
+    # Deduplicate subscriptions by device token so the same physical device never receives duplicate notifications
+    seen_tokens = set()
+    unique_subs = []
+    for sub in subs:
+        t = sub.get("token")
+        if t and t not in seen_tokens:
+            seen_tokens.add(t)
+            unique_subs.append(sub)
+
+    if not unique_subs:
+        logger.debug(f"[WebPush] No valid tokens for recipients: {recipients}")
         return {"sent": 0, "failed": 0}
 
     # Record push attempt in log for auditing and tracking
@@ -1443,7 +1452,7 @@ async def send_fcm_web_push(
         "title": title,
         "body": body,
         "action_url": action_url,
-        "token_count": len(subs),
+        "token_count": len(unique_subs),
         "sent_at": now_iso(),
     }
     try:
@@ -1453,20 +1462,32 @@ async def send_fcm_web_push(
 
     global FIREBASE_ADMIN_AVAILABLE, _firebase_admin_app
     if not FIREBASE_ADMIN_AVAILABLE:
-        logger.info(f"[WebPush Mock/Dev] (Firebase Admin not configured) Would push to {len(subs)} device(s): {title}")
-        return {"sent": len(subs), "simulated": True}
+        logger.error(
+            f"[WebPush Configuration Error] Firebase Admin SDK or credentials not configured. "
+            f"Cannot deliver Web Push notifications to {len(unique_subs)} device(s)."
+        )
+        return {
+            "sent": 0,
+            "failed": len(unique_subs),
+            "simulated": True,
+            "error": "Firebase Admin SDK not configured",
+        }
 
     try:
         from firebase_admin import messaging
     except Exception as e:
         logger.warning(f"firebase_admin.messaging import error: {e}")
-        return {"sent": 0, "failed": len(subs)}
+        return {"sent": 0, "failed": len(unique_subs), "error": str(e)}
+
+    # Ensure canonical URL for FCM options link
+    public_base = get_app_public_url()
+    full_action_url = action_url if action_url.startswith("http") else f"{public_base}{action_url}"
 
     sent_count = 0
     failed_count = 0
     invalid_tokens = []
 
-    for sub in subs:
+    for sub in unique_subs:
         token = sub.get("token")
         if not token:
             continue
@@ -1480,15 +1501,15 @@ async def send_fcm_web_push(
                     tag=tag or "meribaari-queue",
                     renotify=True,
                     require_interaction=True,
-                    custom_data={"url": action_url, **(extra_data or {})},
+                    custom_data={"url": action_url, "full_url": full_action_url, **(extra_data or {})},
                 ),
-                fcm_options=messaging.WebpushFCMOptions(link=action_url),
+                fcm_options=messaging.WebpushFCMOptions(link=full_action_url),
                 headers={"Urgency": "high", "TTL": "86400"},
             )
             msg = messaging.Message(
                 token=token,
                 notification=messaging.Notification(title=title, body=body),
-                data={"title": title, "body": body, "url": action_url, **(extra_data or {})},
+                data={"title": title, "body": body, "url": action_url, "full_url": full_action_url, **(extra_data or {})},
                 webpush=webpush_config,
             )
             messaging.send(msg)
@@ -1515,6 +1536,7 @@ async def send_fcm_web_push(
             logger.warning(f"Error marking invalid push tokens: {e}")
 
     return {"sent": sent_count, "failed": failed_count}
+
 
 
 async def send_push(recipients: List[str], data: dict, idempotency_key: Optional[str] = None) -> None:
@@ -1593,15 +1615,17 @@ async def send_welcome_status_if_needed(
     """
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        query: dict = {
-            "patient_id": user_id,
-            "date": today,
-            "status": {"$in": ["booked", "arrived", "in_consultation"]},
-        }
+        query: dict = {}
         if appointment_id:
-            query = {"id": appointment_id, "patient_id": user_id}
+            query["id"] = appointment_id
         elif secure_token:
-            query = {"secure_token": secure_token, "patient_id": user_id}
+            query["secure_token"] = secure_token
+        else:
+            query = {
+                "patient_id": user_id,
+                "date": today,
+                "status": {"$in": ["booked", "arrived", "in_consultation"]},
+            }
 
         appt = await db.appointments.find_one(query)
         if not appt:
@@ -1629,8 +1653,9 @@ async def send_welcome_status_if_needed(
             f"Updated: {time_str}",
             "Tap to view live queue.",
         ]
+        recipients = [r for r in [appt.get("patient_id"), appt.get("id"), user_id] if r and r != "emergency"]
         await send_fcm_web_push(
-            recipients=[user_id],
+            recipients=recipients,
             title=f"{hospital_name} — MeriBaari",
             body="\n".join(body_lines),
             action_url=target_url,
@@ -1693,8 +1718,9 @@ async def notify_queue_movement(doctor_id: str) -> None:
                 ]
                 sec_token = current_in_consultation.get("secure_token")
                 target_url = f"/appointment/{sec_token}" if sec_token else "/patient/queue"
+                recipients = [r for r in [current_in_consultation.get("patient_id"), current_in_consultation.get("id")] if r and r != "emergency"]
                 await send_fcm_web_push(
-                    recipients=[current_in_consultation["patient_id"]],
+                    recipients=recipients,
                     title="MeriBaari — Queue Update",
                     body="\n".join(body_lines),
                     action_url=target_url,
@@ -1770,8 +1796,9 @@ async def notify_queue_movement(doctor_id: str) -> None:
             ])
 
             if should_send:
+                recipients = [r for r in [pid, appt.get("id")] if r and r != "emergency"]
                 await send_fcm_web_push(
-                    recipients=[pid],
+                    recipients=recipients,
                     title="MeriBaari — Queue Update",
                     body="\n".join(body_lines),
                     action_url=target_url,
@@ -1871,8 +1898,8 @@ async def notify_timing_adjusted(doctor_id: str, date: str, new_start_time: str,
             recipients = []
             if pid and pid != "emergency":
                 recipients.append(pid)
-            if a.get("secure_token"):
-                recipients.append(f"token_{a['secure_token']}")
+            if a.get("id"):
+                recipients.append(a["id"])
             if not recipients:
                 continue
 
@@ -1920,7 +1947,8 @@ async def notify_appointment_cancelled(appt: dict) -> None:
     """Notify patient when an appointment is cancelled."""
     try:
         pid = appt.get("patient_id")
-        if not pid or pid == "emergency":
+        recipients = [r for r in [pid, appt.get("id")] if r and r != "emergency"]
+        if not recipients:
             return
         doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0})
         hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
@@ -1932,7 +1960,7 @@ async def notify_appointment_cancelled(appt: dict) -> None:
             f"Updated: {time_str}",
         ]
         await send_fcm_web_push(
-            recipients=[pid],
+            recipients=recipients,
             title=f"{hospital_name} — MeriBaari",
             body="\n".join(body_lines),
             action_url="/patient/history",
@@ -1945,7 +1973,7 @@ async def notify_appointment_cancelled(appt: dict) -> None:
 
 @api_router.post("/push/subscribe")
 async def push_subscribe(body: PushSubscribeBody, user: Optional[dict] = Depends(get_current_user_optional)):
-    """Register or refresh a device FCM Web Push token for the authenticated patient or walk-in patient."""
+    """Register or refresh a device FCM Web Push token for the authenticated patient or guest appointment-token holder."""
     token = body.token.strip()
     if not token:
         raise HTTPException(status_code=400, detail="Token is required")
@@ -1953,18 +1981,40 @@ async def push_subscribe(body: PushSubscribeBody, user: Optional[dict] = Depends
     now = now_iso()
     user_id = user["id"] if user else None
     target_appt = None
-    if body.appointment_token:
-        target_appt = await db.appointments.find_one({"secure_token": body.appointment_token})
-    elif body.appointment_id:
-        target_appt = await db.appointments.find_one({"id": body.appointment_id})
 
+    if body.appointment_token:
+        # Validate guest access token against database
+        clean_token = body.appointment_token.strip()
+        target_appt = await db.appointments.find_one({"secure_token": clean_token})
+        if not target_appt:
+            raise HTTPException(status_code=404, detail="Invalid appointment token")
+        if target_appt.get("status") == "cancelled":
+            raise HTTPException(status_code=410, detail="Appointment has been cancelled")
+    elif body.appointment_id:
+        # If no appointment_token, caller must be authenticated to associate by appointment_id
+        if not user:
+            raise HTTPException(status_code=401, detail="Authentication or valid appointment token required to subscribe.")
+        target_appt = await db.appointments.find_one({"id": body.appointment_id})
+        if not target_appt:
+            raise HTTPException(status_code=404, detail="Appointment not found")
+        if user.get("role") == "patient":
+            user_phone = normalize_mobile(user.get("mobile") or user.get("phone") or "")
+            appt_phone = normalize_mobile(target_appt.get("patient_mobile") or "")
+            is_owner = (target_appt.get("patient_id") == user["id"]) or (bool(user_phone) and user_phone == appt_phone)
+            if not is_owner:
+                raise HTTPException(status_code=403, detail="Forbidden: You do not own this appointment.")
+    elif not user:
+        raise HTTPException(status_code=401, detail="Authentication or appointment token required to subscribe.")
+
+    # Determine user_id to store
     if not user_id and target_appt:
-        user_id = target_appt.get("patient_id") or target_appt["id"]
+        user_id = target_appt.get("patient_id") or f"guest_{target_appt['id']}"
     if not user_id:
         user_id = f"device_{token[:16]}"
 
     appt_id_to_store = target_appt["id"] if target_appt else body.appointment_id
 
+    # Deduplicated per device token by MongoDB unique index {"token": 1}
     doc = {
         "user_id": user_id,
         "token": token,
@@ -1982,7 +2032,7 @@ async def push_subscribe(body: PushSubscribeBody, user: Optional[dict] = Depends
     )
 
     # If the patient enabled notifications after booking, send one current appointment status notification
-    if user_id and not user_id.startswith("device_"):
+    if appt_id_to_store:
         asyncio.create_task(
             send_welcome_status_if_needed(
                 user_id,
@@ -1993,6 +2043,7 @@ async def push_subscribe(body: PushSubscribeBody, user: Optional[dict] = Depends
         )
 
     return {"ok": True, "status": "subscribed"}
+
 
 
 @api_router.post("/push/unsubscribe")
@@ -2891,28 +2942,79 @@ async def my_appointments(user: dict = Depends(require_role("patient"))):
 
 
 @api_router.get("/appointments/by-token/{token}")
-async def get_appointment_by_token(token: str, user: dict = Depends(get_current_user)):
+async def get_appointment_by_token(token: str, user: Optional[dict] = Depends(get_current_user_optional)):
     """Fetch appointment details and latest queue stats by secure random token.
-    Validates server-side that the authenticated patient owns the appointment.
+    - If user is authenticated as owner or clinic staff, returns full details.
+    - If accessed as a guest (e.g. walk-in patient via SMS link), validates the high-entropy
+      access token and returns ONLY minimal non-PII queue details (token number, doctor name,
+      date, slot, status, and ETA stats). Does NOT expose patient names, phone numbers,
+      symptoms, prescriptions, or other patients' details.
+    - Rejects invalid, expired, or cancelled tokens.
     """
-    appt = await db.appointments.find_one({"secure_token": token}, {"_id": 0})
-    if not appt:
-        raise HTTPException(status_code=404, detail="Appointment not found")
+    clean_token = token.strip() if token else ""
+    if not clean_token or len(clean_token) < 8:
+        raise HTTPException(status_code=404, detail="Invalid appointment token")
 
-    # Authorize: if patient, must match user id or normalized mobile
-    if user.get("role") == "patient":
+    appt = await db.appointments.find_one({"secure_token": clean_token}, {"_id": 0})
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found or link has expired")
+
+    # Reject revoked/cancelled tokens
+    if appt.get("status") == "cancelled":
+        raise HTTPException(status_code=410, detail="This appointment was cancelled")
+
+    # Reject expired completed appointments from previous dates
+    today_str = get_ist_now().strftime("%Y-%m-%d")
+    appt_date = appt.get("date")
+    if appt_date and appt_date < today_str and appt.get("status") == "completed":
+        raise HTTPException(status_code=410, detail="This appointment link has expired")
+
+    # Determine caller authorization
+    is_staff = bool(user and user.get("role") in ("receptionist", "doctor", "admin", "owner", "developer"))
+    is_authenticated_patient = bool(user and user.get("role") == "patient")
+    is_owner = False
+
+    if is_authenticated_patient:
         user_phone = normalize_mobile(user.get("mobile") or user.get("phone") or "")
         appt_phone = normalize_mobile(appt.get("patient_mobile") or "")
-        is_owner = (appt.get("patient_id") == user["id"]) or (user_phone and user_phone == appt_phone)
-        if not is_owner:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to view this appointment.")
+        is_owner = (appt.get("patient_id") == user["id"]) or (bool(user_phone) and user_phone == appt_phone)
 
+    # Calculate queue stats (non-PII queue statistics)
     eta_data = await calculate_appointment_eta(appt)
+
+    # If clinic staff or verified owner, return full record
+    if is_staff or is_owner:
+        return {
+            "ok": True,
+            "appointment": appt,
+            "queue": eta_data,
+            "is_guest": False,
+        }
+
+    # If guest (unauthenticated walk-in or other caller with token):
+    # Return MINIMAL NON-PII queue representation.
+    # Exclude patient name, mobile, symptoms, prescription, medical notes, etc.
+    minimal_appt = {
+        "id": appt.get("id"),
+        "token_number": appt.get("token_number"),
+        "secure_token": appt.get("secure_token"),
+        "doctor_id": appt.get("doctor_id"),
+        "doctor_name": appt.get("doctor_name"),
+        "hospital_id": appt.get("hospital_id"),
+        "date": appt.get("date"),
+        "slot": appt.get("slot"),
+        "status": appt.get("status"),
+        "created_at": appt.get("created_at"),
+        "is_guest": True,
+    }
+
     return {
         "ok": True,
-        "appointment": appt,
+        "appointment": minimal_appt,
         "queue": eta_data,
+        "is_guest": True,
     }
+
 
 
 @api_router.get("/appointments/{appt_id}/queue")
@@ -3762,25 +3864,28 @@ async def complete_consultation(body: QueueActionBody, user: dict = Depends(requ
         }}
     )
 
-    # Deactivate push subscriptions for this completed appointment so queue notifications stop
-    await db.push_subscriptions.update_many({"appointment_id": appt["id"]}, {"$set": {"active": False}})
-
     # Notify completed patient once that their consultation is complete
     pid = appt.get("patient_id")
-    if pid and pid != "emergency":
+    recipients = [r for r in [pid, appt["id"]] if r and r != "emergency"]
+    if recipients:
         doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "full_name": 1, "hospital_name": 1, "clinic_name": 1})
         hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
         sec_token = appt.get("secure_token")
         action_url = f"/appointment/{sec_token}" if sec_token else "/patient/history"
-        asyncio.create_task(
-            send_fcm_web_push(
-                recipients=[pid, appt["id"]],
+        try:
+            await send_fcm_web_push(
+                recipients=recipients,
                 title=f"{hospital_name} — Consultation Complete",
                 body="Your consultation is complete. Thank you for visiting!",
                 action_url=action_url,
                 tag=f"meribaari-complete-{appt['id']}",
             )
-        )
+        except Exception as e:
+            logger.warning(f"Error sending completion push (non-fatal): {e}")
+
+    # Deactivate push subscriptions for this completed appointment so subsequent queue notifications stop
+    await db.push_subscriptions.update_many({"appointment_id": appt["id"]}, {"$set": {"active": False}})
+
 
     # Check if remaining queue for today is complete
     appt_date = appt.get("date") or get_ist_now().strftime("%Y-%m-%d")
@@ -3859,11 +3964,16 @@ async def reception_cancel_appointment(body: QueueActionBody, user: dict = Depen
             "updated_at": now,
         }}
     )
-    await db.push_subscriptions.update_many({"appointment_id": appt["id"]}, {"$set": {"active": False}})
     await broadcast_doctor_update(appt["doctor_id"], "cancelled")
-    asyncio.create_task(notify_appointment_cancelled(appt))
+    try:
+        await notify_appointment_cancelled(appt)
+    except Exception as e:
+        logger.warning(f"Failed to send cancellation push (non-fatal): {e}")
+
+    await db.push_subscriptions.update_many({"appointment_id": appt["id"]}, {"$set": {"active": False}})
     asyncio.create_task(notify_queue_movement(appt["doctor_id"]))
     return {"ok": True, "message": "Appointment cancelled successfully"}
+
 
 
 @api_router.post("/reception/reschedule")

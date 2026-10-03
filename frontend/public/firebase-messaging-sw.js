@@ -26,20 +26,41 @@ try {
 
 let messaging = null;
 try {
-  if (firebase && firebase.messaging && firebase.messaging.isSupported()) {
+  if (typeof firebase !== 'undefined' && firebase.messaging && firebase.messaging.isSupported()) {
     messaging = firebase.messaging();
   }
 } catch (e) {
   console.log('[MeriBaari SW] Firebase messaging initialization skipped:', e);
 }
 
+// Validates destination URL to allow ONLY trusted same-origin destinations
+function getTrustedDestinationUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') {
+    return new URL('/patient/queue', self.location.origin).href;
+  }
+  try {
+    if (rawUrl.startsWith('/')) {
+      return new URL(rawUrl, self.location.origin).href;
+    }
+    const parsed = new URL(rawUrl);
+    if (parsed.origin === self.location.origin) {
+      return parsed.href;
+    }
+    console.warn('[MeriBaari SW] Blocked non-same-origin destination URL:', rawUrl);
+    return new URL('/patient/queue', self.location.origin).href;
+  } catch {
+    return new URL('/patient/queue', self.location.origin).href;
+  }
+}
+
 // Background push notification handler via FCM SDK
+// Uses a single handler to prevent duplicate notifications
 if (messaging) {
   messaging.onBackgroundMessage((payload) => {
     const title = payload.notification?.title || payload.data?.title || 'MeriBaari — Live Queue Update';
     const body = payload.notification?.body || payload.data?.body || 'Your appointment queue status has updated.';
-    const actionUrl = payload.data?.url || '/patient/queue';
-    const tag = payload.data?.tag || 'meribaari-queue';
+    const actionUrl = payload.data?.url || payload.data?.full_url || '/patient/queue';
+    const tag = payload.data?.tag || payload.notification?.tag || 'meribaari-queue';
 
     const options = {
       body: body,
@@ -57,56 +78,57 @@ if (messaging) {
 
     return self.registration.showNotification(title, options);
   });
-}
+} else {
+  // Fallback push handler: ONLY registered if FCM messaging SDK was not initialized
+  self.addEventListener('push', (event) => {
+    if (!event.data) return;
+    try {
+      const json = event.data.json();
+      const title = json.notification?.title || json.data?.title || 'MeriBaari — Live Queue Update';
+      const body = json.notification?.body || json.data?.body || '';
+      const actionUrl = json.data?.url || json.url || '/patient/queue';
+      const tag = json.data?.tag || 'meribaari-queue';
 
-// Standard Web Push fallback handler
-self.addEventListener('push', (event) => {
-  if (!event.data) return;
-  try {
-    const json = event.data.json();
-    const title = json.notification?.title || json.data?.title || 'MeriBaari — Live Queue Update';
-    const body = json.notification?.body || json.data?.body || '';
-    const actionUrl = json.data?.url || json.url || '/patient/queue';
-    const tag = json.data?.tag || 'meribaari-queue';
-
-    const options = {
-      body: body,
-      icon: '/assets/images/icon.png',
-      badge: '/assets/images/favicon.png',
-      tag: tag,
-      renotify: true,
-      requireInteraction: true,
-      vibrate: [200, 100, 200],
-      data: {
-        url: actionUrl,
-        ...json.data,
-      },
-    };
-
-    event.waitUntil(self.registration.showNotification(title, options));
-  } catch {
-    const text = event.data.text();
-    event.waitUntil(
-      self.registration.showNotification('MeriBaari Live Queue', {
-        body: text,
+      const options = {
+        body: body,
         icon: '/assets/images/icon.png',
         badge: '/assets/images/favicon.png',
-        data: { url: '/patient/queue' },
-      })
-    );
-  }
-});
+        tag: tag,
+        renotify: true,
+        requireInteraction: true,
+        vibrate: [200, 100, 200],
+        data: {
+          url: actionUrl,
+          ...json.data,
+        },
+      };
 
-// Notification click event: focus or open the live queue page
+      event.waitUntil(self.registration.showNotification(title, options));
+    } catch {
+      const text = event.data.text();
+      event.waitUntil(
+        self.registration.showNotification('MeriBaari Live Queue', {
+          body: text,
+          icon: '/assets/images/icon.png',
+          badge: '/assets/images/favicon.png',
+          data: { url: '/patient/queue' },
+        })
+      );
+    }
+  });
+}
+
+// Notification click event: focus or open the live queue page with trusted same-origin validation
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const targetUrl = event.notification.data?.url || '/patient/queue';
+  const rawUrl = event.notification.data?.url || event.notification.data?.full_url || '/patient/queue';
+  const targetUrl = getTrustedDestinationUrl(rawUrl);
 
   event.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
       // 1. Check if a tab with this exact URL is already open
       for (const client of windowClients) {
-        if (client.url && client.url.includes(targetUrl) && 'focus' in client) {
+        if (client.url === targetUrl && 'focus' in client) {
           return client.focus();
         }
       }

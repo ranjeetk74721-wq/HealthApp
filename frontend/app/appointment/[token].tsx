@@ -69,17 +69,7 @@ export default function DynamicAppointmentScreen() {
     }
   }, []);
 
-  // If not authenticated after auth is loaded, redirect to login
-  useEffect(() => {
-    if (authLoading) return;
-    if (!authToken || !user) {
-      router.replace({
-        pathname: "/login",
-        params: { redirect: `/appointment/${token}` },
-      } as any);
-    }
-  }, [authLoading, authToken, user, token, router]);
-
+  // Fetch appointment data on load for both authenticated patients and guest walk-in patients
   const loadAppointment = useCallback(
     async (silent = false) => {
       if (!token) return;
@@ -102,17 +92,13 @@ export default function DynamicAppointmentScreen() {
         if (!isMounted.current) return;
         setIsStale(true);
         const msg = err.message || "";
-        if (msg.includes("401") || msg.includes("Not authenticated")) {
-          router.replace({
-            pathname: "/login",
-            params: { redirect: `/appointment/${token}` },
-          } as any);
-          return;
-        }
-        if (msg.includes("403")) {
+        if (msg.includes("410")) {
+          setErrorStatus(410);
+          setErrorMessage("This appointment link has expired or was cancelled.");
+        } else if (msg.includes("403")) {
           setErrorStatus(403);
           setErrorMessage(
-            "Access Denied: This appointment is linked to another patient account."
+            "Access Denied: This appointment link is not authorized."
           );
         } else if (msg.includes("404")) {
           setErrorStatus(404);
@@ -127,19 +113,20 @@ export default function DynamicAppointmentScreen() {
         }
       }
     },
-    [token, router]
+    [token]
   );
 
-  // Fetch data on load
+  // Fetch data on initial load once auth status is determined
   useEffect(() => {
     isMounted.current = true;
-    if (authToken && user && token) {
+    if (!authLoading && token) {
       loadAppointment();
     }
     return () => {
       isMounted.current = false;
     };
-  }, [authToken, user, token, loadAppointment]);
+  }, [authLoading, token, loadAppointment]);
+
 
   // WebSocket for live updates
   useEffect(() => {

@@ -225,7 +225,8 @@ class TestQueueMovementAndTurnAlerts:
 
             assert mock_push.called
             call_kwargs = mock_push.call_args[1]
-            assert call_kwargs["recipients"] == ["patient-turn"]
+            assert "patient-turn" in call_kwargs["recipients"]
+            assert "a-called" in call_kwargs["recipients"]
             assert "🎉 It's your turn now!" in call_kwargs["body"]
             assert "/appointment/token_turn_xyz" in call_kwargs["action_url"]
 
@@ -343,9 +344,11 @@ class TestDoctorStatusAndCancellationAlerts:
 
             assert mock_push.called
             call_kwargs = mock_push.call_args[1]
-            assert call_kwargs["recipients"] == ["patient-c"]
+            assert "patient-c" in call_kwargs["recipients"]
+            assert "appt-cancel-1" in call_kwargs["recipients"]
             assert "Your appointment (Token #8) with Dr. Mariya has been cancelled." in call_kwargs["body"]
             assert call_kwargs["action_url"] == "/patient/history"
+
 
 
 class TestTokenDeactivationOnUnregister:
@@ -377,3 +380,212 @@ class TestTokenDeactivationOnUnregister:
             call_args = mock_db.push_subscriptions.update_many.call_args[0]
             assert call_args[0] == {"token": {"$in": ["expired_token_123"]}}
             assert call_args[1]["$set"]["active"] is False
+
+
+class TestTokenDeduplicationAndErrorHandling:
+    @pytest.mark.asyncio
+    async def test_duplicate_device_tokens_sent_only_once(self, monkeypatch):
+        """When multiple subscription records share the same device token, send only 1 FCM message."""
+        subs = [
+            {"token": "same_device_token_abc", "user_id": "u1", "platform": "web"},
+            {"token": "same_device_token_abc", "user_id": "u1", "platform": "web"},
+            {"token": "distinct_device_token_xyz", "user_id": "u1", "platform": "web"},
+        ]
+
+        mock_db = MockDB()
+        mock_db.push_subscriptions._find_data = subs
+        monkeypatch.setattr(server, "db", mock_db)
+        monkeypatch.setattr(server, "FIREBASE_ADMIN_AVAILABLE", True)
+
+        with patch("server.init_firebase_admin_if_available"), \
+             patch("firebase_admin.messaging.send", return_value="projects/test/messages/msg123") as mock_send:
+
+            res = await send_fcm_web_push(
+                recipients=["u1"],
+                title="Test Title",
+                body="Test Body",
+            )
+
+            # Exactly 2 sends (not 3) because same_device_token_abc is deduplicated
+            assert mock_send.call_count == 2
+            assert res["sent"] == 2
+            assert res["failed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_firebase_admin_returns_error_and_zero_sent(self, monkeypatch):
+        """When Firebase Admin SDK or credentials are missing, never report success and return sent: 0."""
+        subs = [
+            {"token": "token_1", "user_id": "u1", "platform": "web"},
+            {"token": "token_2", "user_id": "u1", "platform": "web"},
+        ]
+
+        mock_db = MockDB()
+        mock_db.push_subscriptions._find_data = subs
+        monkeypatch.setattr(server, "db", mock_db)
+        monkeypatch.setattr(server, "FIREBASE_ADMIN_AVAILABLE", False)
+
+        with patch("server.init_firebase_admin_if_available"):
+            res = await send_fcm_web_push(
+                recipients=["u1"],
+                title="Unconfigured Test",
+                body="Should not report success",
+            )
+
+            assert res["sent"] == 0
+            assert res["failed"] == 2
+            assert res["simulated"] is True
+            assert "error" in res
+
+
+class TestGuestWalkInSecureAccess:
+    @pytest.mark.asyncio
+    async def test_guest_walk_in_receives_only_minimal_non_pii_data(self, monkeypatch):
+        """Unauthenticated guest opening secure token link receives token, ETA, status, but NO PII."""
+        appt = {
+            "id": "appt-guest-1",
+            "secure_token": "valid_secure_token_12345",
+            "token_number": 14,
+            "doctor_id": "doc-mariya",
+            "doctor_name": "Dr. Mariya Khan",
+            "hospital_id": "hosp-1",
+            "date": "2026-10-03",
+            "slot": "Walk-in",
+            "status": "arrived",
+            "patient_name": "Ranjeet Kumar",
+            "patient_mobile": "+919876543210",
+            "symptoms": "High fever and cough",
+            "prescription": "Paracetamol 500mg",
+            "medical_notes": "Internal clinical private note",
+            "created_at": "2026-10-03T10:00:00Z",
+        }
+
+        mock_db = MockDB()
+        mock_db.appointments._find_one_data = appt
+        monkeypatch.setattr(server, "db", mock_db)
+        monkeypatch.setattr(server, "calculate_appointment_eta", AsyncMock(return_value={
+            "currently_serving": 10,
+            "expected_turn_time": "11:30 AM – 11:45 AM",
+            "patients_ahead": 3,
+            "your_token": 14,
+        }))
+
+        from server import get_appointment_by_token
+
+        # Unauthenticated guest call (user=None)
+        res = await get_appointment_by_token(token="valid_secure_token_12345", user=None)
+
+        assert res["ok"] is True
+        assert res["is_guest"] is True
+        guest_appt = res["appointment"]
+
+        # Minimal queue details must be present
+        assert guest_appt["token_number"] == 14
+        assert guest_appt["doctor_name"] == "Dr. Mariya Khan"
+        assert guest_appt["status"] == "arrived"
+        assert guest_appt["secure_token"] == "valid_secure_token_12345"
+
+        # PII MUST be excluded
+        assert "patient_name" not in guest_appt
+        assert "patient_mobile" not in guest_appt
+        assert "symptoms" not in guest_appt
+        assert "prescription" not in guest_appt
+        assert "medical_notes" not in guest_appt
+
+    @pytest.mark.asyncio
+    async def test_authenticated_owner_receives_full_details(self, monkeypatch):
+        """Authenticated owner of appointment receives full record."""
+        appt = {
+            "id": "appt-owner-1",
+            "secure_token": "valid_secure_token_owner",
+            "patient_id": "patient-user-123",
+            "patient_name": "Ranjeet Kumar",
+            "patient_mobile": "+919876543210",
+            "doctor_name": "Dr. Mariya Khan",
+            "token_number": 5,
+            "status": "booked",
+            "symptoms": "High fever",
+            "date": "2026-10-03",
+        }
+
+        mock_db = MockDB()
+        mock_db.appointments._find_one_data = appt
+        monkeypatch.setattr(server, "db", mock_db)
+        monkeypatch.setattr(server, "calculate_appointment_eta", AsyncMock(return_value={"patients_ahead": 2}))
+
+        from server import get_appointment_by_token
+
+        owner_user = {"id": "patient-user-123", "role": "patient", "mobile": "+919876543210"}
+        res = await get_appointment_by_token(token="valid_secure_token_owner", user=owner_user)
+
+        assert res["ok"] is True
+        assert res["is_guest"] is False
+        assert res["appointment"]["patient_name"] == "Ranjeet Kumar"
+        assert res["appointment"]["symptoms"] == "High fever"
+
+    @pytest.mark.asyncio
+    async def test_cancelled_appointment_returns_410_gone(self, monkeypatch):
+        """Cancelled appointment access token must return 410."""
+        from fastapi import HTTPException
+        appt = {
+            "id": "appt-cancelled",
+            "secure_token": "token_cancelled_xyz",
+            "status": "cancelled",
+        }
+        mock_db = MockDB()
+        mock_db.appointments._find_one_data = appt
+        monkeypatch.setattr(server, "db", mock_db)
+
+        from server import get_appointment_by_token
+
+        with pytest.raises(HTTPException) as exc:
+            await get_appointment_by_token(token="token_cancelled_xyz", user=None)
+        assert exc.value.status_code == 410
+
+
+class TestPushSubscribeAuthorization:
+    @pytest.mark.asyncio
+    async def test_guest_subscription_with_valid_token_allowed(self, monkeypatch):
+        """Guest holding valid appointment_token can subscribe without login."""
+        appt = {
+            "id": "appt-walkin-sub",
+            "secure_token": "tok_sub_valid_123",
+            "status": "arrived",
+            "patient_id": "patient_walkin_id",
+        }
+        mock_db = MockDB()
+        mock_db.appointments._find_one_data = appt
+        monkeypatch.setattr(server, "db", mock_db)
+        monkeypatch.setattr(server, "send_welcome_status_if_needed", AsyncMock())
+
+        from server import push_subscribe, PushSubscribeBody
+
+        body = PushSubscribeBody(
+            token="device_fcm_token_999",
+            appointment_token="tok_sub_valid_123",
+        )
+        res = await push_subscribe(body, user=None)
+
+        assert res["ok"] is True
+        assert res["status"] == "subscribed"
+        mock_db.push_subscriptions.update_one.assert_called_once()
+        set_dict = mock_db.push_subscriptions.update_one.call_args[0][1]["$set"]
+        assert set_dict["appointment_id"] == "appt-walkin-sub"
+        assert set_dict["active"] is True
+
+    @pytest.mark.asyncio
+    async def test_guest_subscription_without_token_rejected_401(self, monkeypatch):
+        """Unauthenticated caller attempting to subscribe with raw appointment_id without token must be rejected."""
+        from fastapi import HTTPException
+        mock_db = MockDB()
+        monkeypatch.setattr(server, "db", mock_db)
+
+        from server import push_subscribe, PushSubscribeBody
+
+        body = PushSubscribeBody(
+            token="device_fcm_token_fake",
+            appointment_id="raw_guessed_id",
+        )
+        with pytest.raises(HTTPException) as exc:
+            await push_subscribe(body, user=None)
+        assert exc.value.status_code == 401
+

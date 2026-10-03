@@ -118,7 +118,7 @@ def get_brevo_sender() -> str:
 
 def get_app_public_url() -> str:
     """Retrieve public frontend URL for dynamic appointment links."""
-    return os.environ.get("APP_PUBLIC_URL", "https://health-at0ltu9id-mariya12.vercel.app").rstrip("/")
+    return os.environ.get("APP_PUBLIC_URL", "https://www.meribaariapp.in").rstrip("/")
 
 
 def mask_phone_for_logging(phone: str) -> str:

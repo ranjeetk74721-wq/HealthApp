@@ -18,4 +18,10 @@ services:
         value: "1"           # Hide dev OTP in production
       - key: EMERGENT_PUSH_KEY
         sync: false          # Set in Render dashboard if push is enabled
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false          # Set in Render dashboard as secret — never commit credentials
+      - key: APP_PUBLIC_URL
+        value: https://www.meribaariapp.in
+      - key: QUEUE_ETA_CHANGE_THRESHOLD_MINUTES
+        value: "10"
     healthCheckPath: /health
