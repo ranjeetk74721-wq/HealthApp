@@ -6,7 +6,8 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
-import { api, getBackendWebSocketBase } from "@/src/api/client";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { api, getApiBase, getBackendWebSocketBase } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import CalendarSummary from "@/src/components/CalendarSummary";
@@ -77,6 +78,7 @@ export default function ReceptionistDashboard() {
   const [addLoading, setAddLoading] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
   const [addToast, setAddToast] = useState<string | null>(null);
+  const [exportLoading, setExportLoading] = useState(false);
 
   // View completed toggle
   const [showCompleted, setShowCompleted] = useState(false);
@@ -123,24 +125,22 @@ export default function ReceptionistDashboard() {
   const load = useCallback(async (silent = false, bypassCache = false) => {
     const shouldBypass = silent || bypassCache;
     try {
-      const [docs, sum] = await Promise.all([
-        api.get("/reception/doctors", { bypassCache: shouldBypass }),
-        api.get("/appointments/calendar-summary", { bypassCache: shouldBypass }).catch(() => []),
-      ]);
+      const docs = await api.get("/reception/doctors", { bypassCache: shouldBypass });
       setDoctors(docs);
-      setSummaryData(sum || []);
       const doctorId = selectedDocRef.current || (docs[0]?.id ?? null);
       if (doctorId && !selectedDocRef.current) {
         setSelectedDoc(doctorId);
         selectedDocRef.current = doctorId;
       }
       if (doctorId) {
-        const [q, sessRes] = await Promise.all([
+        const [q, sessRes, sum] = await Promise.all([
           api.get(`/reception/queue?doctor_id=${doctorId}&date=${selectedDate}`, { bypassCache: shouldBypass }),
           api.get(`/doctor/${doctorId}/session?date=${selectedDate}`, { bypassCache: shouldBypass }).catch(() => null),
+          api.get(`/appointments/calendar-summary?doctor_id=${doctorId}`, { bypassCache: shouldBypass }).catch(() => []),
         ]);
         setQueue(q || []);
         if (sessRes?.session) setDocSession(sessRes.session);
+        setSummaryData(sum || []);
       }
       const nowStr = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true });
       setLastUpdated(nowStr);
@@ -160,6 +160,7 @@ export default function ReceptionistDashboard() {
   // WebSocket — re-subscribe when selected doctor changes
   useEffect(() => {
     if (!selectedDoc) return;
+    load(true, true);
 
     if (wsRef.current) { try { wsRef.current.close(); } catch { /* ignore */ } wsRef.current = null; }
 
@@ -338,6 +339,45 @@ export default function ReceptionistDashboard() {
     } catch (err: any) {
       setAddToast(err.message || "Could not send link");
       setTimeout(() => setAddToast(null), 3500);
+    }
+  };
+
+  const handleDownloadExcel = async () => {
+    if (!selectedDoc) {
+      Alert.alert("Doctor Required", "Please select a doctor to download the Excel report.");
+      return;
+    }
+    setExportLoading(true);
+    try {
+      const token = await AsyncStorage.getItem("cq_token");
+      const url = `${getApiBase()}/reception/export-excel?doctor_id=${selectedDoc}&date=${selectedDate}`;
+      if (Platform.OS === "web") {
+        const response = await fetch(url, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (!response.ok) {
+          throw new Error("Failed to export Excel report");
+        }
+        const blob = await response.blob();
+        const blobUrl = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        const targetDoc = doctors.find((d) => d.id === selectedDoc);
+        const docName = (targetDoc?.full_name || "Doctor").replace(/[^\w\-]/g, "_");
+        a.download = `ClinicQueue_Report_${docName}_${selectedDate}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(blobUrl);
+        setAddToast("Excel report downloaded");
+        setTimeout(() => setAddToast(null), 3000);
+      } else {
+        Alert.alert("Notice", "Excel report download is optimized for web browser.");
+      }
+    } catch (err: any) {
+      Alert.alert("Export Error", err?.message || "Failed to download Excel report");
+    } finally {
+      setExportLoading(false);
     }
   };
 
@@ -551,14 +591,31 @@ export default function ReceptionistDashboard() {
               {activeQueue.length} patient(s) waiting / consulting
             </Text>
           </View>
-          <Pressable
-            onPress={() => load(true, true)}
-            style={styles.refreshBtn}
-            testID="manual-refresh-btn"
-          >
-            <Ionicons name="refresh" size={16} color={colors.brandPrimary} />
-            <Text style={styles.refreshBtnText}>Sync</Text>
-          </Pressable>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+            <Pressable
+              onPress={handleDownloadExcel}
+              disabled={exportLoading}
+              style={[styles.exportBtn, exportLoading && { opacity: 0.6 }]}
+              testID="export-excel-btn"
+            >
+              {exportLoading ? (
+                <ActivityIndicator size="small" color="#0F766E" />
+              ) : (
+                <>
+                  <Ionicons name="download-outline" size={15} color="#0F766E" />
+                  <Text style={styles.exportBtnText}>Excel</Text>
+                </>
+              )}
+            </Pressable>
+            <Pressable
+              onPress={() => load(true, true)}
+              style={styles.refreshBtn}
+              testID="manual-refresh-btn"
+            >
+              <Ionicons name="refresh" size={16} color={colors.brandPrimary} />
+              <Text style={styles.refreshBtnText}>Sync</Text>
+            </Pressable>
+          </View>
         </View>
 
         {activeQueue.length === 0 ? (
@@ -601,6 +658,23 @@ export default function ReceptionistDashboard() {
                     {a.slot} · <Text style={{ fontWeight: "600" }}>{a.status.replace("_", " ").toUpperCase()}</Text>
                     {a.consultation_started_at ? ` · Started ${formatTime(a.consultation_started_at)}` : ""}
                   </Text>
+                  {a.expected_turn_time ? (
+                    <View style={styles.etaRow}>
+                      <Ionicons
+                        name={a.is_estimate_pending ? "alert-circle-outline" : "time-outline"}
+                        size={13}
+                        color={a.is_estimate_pending ? "#D97706" : colors.brandPrimary}
+                      />
+                      <Text
+                        style={[
+                          styles.etaText,
+                          a.is_estimate_pending && { color: "#D97706", fontWeight: "600" },
+                        ]}
+                      >
+                        {a.is_estimate_pending ? a.expected_turn_time : `Expected: ${a.expected_turn_time}`}
+                      </Text>
+                    </View>
+                  ) : null}
                   {a.symptoms ? <Text style={styles.symptoms} numberOfLines={1}>💊 {a.symptoms}</Text> : null}
                 </View>
 
@@ -785,23 +859,7 @@ export default function ReceptionistDashboard() {
           })
         )}
 
-        {/* 3. Calendar / Date Selection placed BELOW the patient list (Requirement 5) */}
-        <View style={styles.calendarSection}>
-          <View style={styles.sectionHeaderRow}>
-            <View>
-              <Text style={styles.sectionTitle}>Daily Patient Calendar</Text>
-              <Text style={styles.sectionSub}>Selected Date: <Text style={{ fontWeight: "700", color: colors.brandPrimary }}>{selectedDate}</Text></Text>
-            </View>
-          </View>
-          <CalendarSummary
-            summaryData={summaryData}
-            onSelectDate={(date) => {
-              setSelectedDate(date);
-            }}
-          />
-        </View>
-
-        {/* 4. Completed / History Records Section (Preserving history, Requirement 1) */}
+        {/* Lower-Page Order 1: Completed / History Records Section (Requirement 5) */}
         <View style={styles.historySection}>
           <Pressable
             onPress={() => setShowCompleted(!showCompleted)}
@@ -846,6 +904,28 @@ export default function ReceptionistDashboard() {
               )}
             </View>
           )}
+        </View>
+
+        {/* Lower-Page Order 2: Daily Patient Calendar immediately above footer (Requirement 5) */}
+        <View style={styles.calendarSection}>
+          <View style={styles.sectionHeaderRow}>
+            <View>
+              <Text style={styles.sectionTitle}>Daily Patient Calendar</Text>
+              <Text style={styles.sectionSub}>Selected Date: <Text style={{ fontWeight: "700", color: colors.brandPrimary }}>{selectedDate}</Text></Text>
+            </View>
+          </View>
+          <CalendarSummary
+            summaryData={summaryData}
+            selectedDate={selectedDate}
+            onSelectDate={(date) => {
+              setSelectedDate(date);
+            }}
+          />
+        </View>
+
+        {/* Lower-Page Order 3: Footer (Requirement 5) */}
+        <View style={styles.dashboardFooter}>
+          <Text style={styles.dashboardFooterText}>MeriBaari Healthcare · Clinic Queue Management</Text>
         </View>
       </ScrollView>
 
@@ -1304,6 +1384,43 @@ const styles = StyleSheet.create({
   emergencyInput: { borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, padding: spacing.md, fontSize: font.base, color: colors.onSurface },
   emergencyBtn: { backgroundColor: colors.error, borderRadius: radius.md, padding: spacing.lg, alignItems: "center", marginTop: spacing.md },
   emergencyBtnText: { color: "#fff", fontSize: font.lg, fontWeight: "700" },
+  exportBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: "#CCFBF1",
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 6,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    borderColor: "#99F6E4",
+  },
+  exportBtnText: {
+    fontSize: font.xs,
+    fontWeight: "700",
+    color: "#0F766E",
+  },
+  etaRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    marginTop: 2,
+  },
+  etaText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: colors.brandPrimary,
+  },
+  dashboardFooter: {
+    paddingVertical: spacing.lg,
+    paddingBottom: 80,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  dashboardFooterText: {
+    fontSize: 11,
+    color: colors.muted,
+  },
   toast: { position: "absolute", bottom: 100, left: 20, right: 20, backgroundColor: colors.success, padding: spacing.md, borderRadius: radius.md, flexDirection: "row", alignItems: "center", gap: spacing.sm, elevation: 5 },
   toastText: { color: "#fff", fontWeight: "600", flex: 1 },
 });

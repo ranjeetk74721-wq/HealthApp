@@ -9,7 +9,7 @@ if env_path.exists():
 
 if "BACKEND_TEST_MONGO_URL" in os.environ:
     os.environ["MONGO_URL"] = os.environ["BACKEND_TEST_MONGO_URL"]
-elif not os.environ.get("MONGO_URL"):
+else:
     os.environ["MONGO_URL"] = "mongodb://127.0.0.1:27017"
 
 os.environ["DB_NAME"] = "clinicqueue_test"

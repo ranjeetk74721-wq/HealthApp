@@ -1,4 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, Request, Response
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -358,6 +359,7 @@ class Appointment(BaseModel):
 
 class QueueActionBody(BaseModel):
     appointment_id: str
+    reason: Optional[str] = None
 
 
 class ReorderBody(BaseModel):
@@ -1257,9 +1259,11 @@ async def calculate_appointment_eta(appt: dict) -> dict:
             except Exception:
                 rem_current = max(1, per // 2)
 
+    has_consultation_occurred = bool(completed_count > 0 or current is not None or session.get("actual_start_time"))
     session_status = session.get("status", "not_started")
     if current is not None or session.get("actual_start_time"):
-        session_status = "in_consultation"
+        if session_status != "paused":
+            session_status = "in_consultation"
     elif doc_status in ("paused", "unavailable"):
         session_status = doc_status
 
@@ -1268,7 +1272,7 @@ async def calculate_appointment_eta(appt: dict) -> dict:
         eta_minutes = 0
     elif my_position > 0:
         if doc_status == "unavailable" or session_status == "unavailable":
-            # Requirement: If doctor return time is unknown, show "Doctor unavailable — estimate pending" instead of inventing an ETA
+            # Requirement: If doctor return time is unknown, show "Doctor unavailable — estimate pending"
             expected_turn_time = "Doctor unavailable — estimate pending"
             is_estimate_pending = True
             is_delayed_awaited = True
@@ -1277,46 +1281,71 @@ async def calculate_appointment_eta(appt: dict) -> dict:
             exp_resume_str = session.get("expected_resume_time")
             resume_dt = parse_time_to_ist_dt(appt_date, exp_resume_str) if exp_resume_str else None
             if resume_dt and resume_dt > ist_now:
-                patient_offset = max(0, (my_position - (1 if current else 0))) * per
-                patient_start_dt = resume_dt + timedelta(minutes=patient_offset)
-                patient_end_dt = patient_start_dt + timedelta(minutes=max(per, 30))
+                pos = len(active_ahead)
+                if not has_consultation_occurred:
+                    if pos == 0:
+                        patient_start_dt = resume_dt
+                        patient_end_dt = resume_dt + timedelta(minutes=10)
+                    else:
+                        patient_start_dt = resume_dt + timedelta(minutes=10 + (pos - 1) * 20)
+                        patient_end_dt = patient_start_dt + timedelta(minutes=20)
+                else:
+                    patient_start_dt = resume_dt + timedelta(minutes=pos * 20)
+                    patient_end_dt = patient_start_dt + timedelta(minutes=20)
                 expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
                 eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60))
             else:
-                expected_turn_time = "Doctor paused—resume time awaited"
+                expected_turn_time = "Doctor paused — resume time awaited"
                 is_delayed_awaited = True
+                is_estimate_pending = True
                 eta_minutes = 0
-        elif session_status == "not_started":
+        elif not has_consultation_occurred:
             exp_start_str = session.get("expected_start_time") or session.get("original_start_time") or "10:00 AM"
             start_dt = parse_time_to_ist_dt(appt_date, exp_start_str)
+            if not start_dt:
+                start_dt = ist_now
             is_today = (appt_date == ist_now.strftime("%Y-%m-%d"))
 
-            if is_today and start_dt and ist_now > start_dt:
+            is_first_eligible = (len(active_ahead) == 0)
+            if is_today and start_dt < ist_now:
                 expected_turn_time = "Doctor delayed—updated time awaited"
                 is_delayed_awaited = True
                 is_estimate_pending = True
                 eta_minutes = 0
-            elif start_dt:
-                patient_offset = max(0, my_position - 1) * per
-                patient_start_dt = start_dt + timedelta(minutes=patient_offset)
-                patient_end_dt = patient_start_dt + timedelta(minutes=max(per, 30))
+            elif is_first_eligible:
+                # Requirement 4: First eligible waiting token gets initial expected consultation window of exactly 10 minutes from configured start time
+                patient_start_dt = start_dt
+                patient_end_dt = start_dt + timedelta(minutes=10)
                 expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
-                if is_today:
-                    eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60))
-                else:
-                    eta_minutes = max(0, (my_position - 1) * per)
+                eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60)) if is_today else 0
             else:
-                eta_minutes = (my_position - 1) * per
-                future_dt = ist_now + timedelta(minutes=eta_minutes)
-                end_dt = future_dt + timedelta(minutes=max(per, 30))
-                expected_turn_time = format_expected_time_range(future_dt, end_dt)
+                # Remaining waiting tokens sequenced with 20-minute gap/consultation window
+                pos = len(active_ahead)
+                patient_start_dt = start_dt + timedelta(minutes=10 + (pos - 1) * 20)
+                patient_end_dt = patient_start_dt + timedelta(minutes=20)
+                expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
+                eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60)) if is_today else 0
         else:
-            # Active in_consultation queue
-            patient_offset = (rem_current if current else 0) + max(0, len(active_ahead)) * per
-            eta_minutes = max(0, patient_offset)
-            future_dt = ist_now + timedelta(minutes=eta_minutes)
-            end_dt = future_dt + timedelta(minutes=max(per, 30))
-            expected_turn_time = format_expected_time_range(future_dt, end_dt)
+            # Active in_consultation queue: driven by actual consultation events and progression
+            if current:
+                started_iso = current.get("started_at")
+                elapsed_min = 0
+                if started_iso:
+                    try:
+                        st_dt = datetime.fromisoformat(started_iso.replace("Z", "+00:00")).astimezone(timezone(timedelta(hours=5, minutes=30)))
+                        elapsed_min = max(0, int((ist_now - st_dt).total_seconds() / 60))
+                    except Exception:
+                        pass
+                rem_current = max(1, 20 - elapsed_min)
+                base_dt = ist_now + timedelta(minutes=rem_current)
+            else:
+                base_dt = ist_now
+
+            pos = len(active_ahead)
+            patient_start_dt = base_dt + timedelta(minutes=pos * 20)
+            patient_end_dt = patient_start_dt + timedelta(minutes=20)
+            expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
+            eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60))
     elif appt.get("slot") and appt.get("slot") != "Walk-in":
         slot_str = appt.get("slot", "")
         expected_turn_time = format_12hr_time(slot_str) or None
@@ -2926,29 +2955,32 @@ async def calendar_summary(
     doctor_id: Optional[str] = None,
     user: dict = Depends(get_current_user)
 ):
-    query = {}
+    query: dict = {"status": {"$ne": "cancelled"}}
     if doctor_id:
         query["doctor_id"] = doctor_id
-    elif user["role"] == "doctor":
+    elif user.get("role") == "doctor":
         doc = await db.doctors.find_one({"user_id": user["id"]})
         if doc:
             query["doctor_id"] = doc["id"]
+    elif user.get("hospital_id"):
+        docs = await db.doctors.find({"hospital_id": user["hospital_id"]}, {"id": 1}).to_list(None)
+        valid_doc_ids = [d["id"] for d in docs]
+        query["doctor_id"] = {"$in": valid_doc_ids}
 
-    appts = await db.appointments.find(query, {"_id": 0}).to_list(1000)
+    appts = await db.appointments.find(query, {"_id": 0, "date": 1, "token_number": 1, "status": 1}).to_list(2000)
 
     summary_map = {}
     for a in appts:
         dt = a.get("date")
-        if not dt:
+        if not dt or a.get("status") == "cancelled":
             continue
         if dt not in summary_map:
             summary_map[dt] = {"date": dt, "patient_count": 0, "tokens": []}
-        if a.get("status") != "cancelled":
-            summary_map[dt]["patient_count"] += 1
-            if a.get("token_number") is not None:
-                summary_map[dt]["tokens"].append(a["token_number"])
+        summary_map[dt]["patient_count"] += 1
+        if a.get("token_number") is not None:
+            summary_map[dt]["tokens"].append(a["token_number"])
 
-    res = list(summary_map.values())
+    res = [item for item in summary_map.values() if item["patient_count"] > 0]
     res.sort(key=lambda x: x["date"])
     return res
 
@@ -3627,6 +3659,20 @@ async def reception_queue(
             if not any(a["id"] == ca["id"] for a in appts):
                 appts.insert(0, ca)
 
+    # Enrich active appointments with real-time dynamic ETAs
+    for a in appts:
+        if a.get("status") in ("booked", "arrived", "in_consultation", "skipped"):
+            try:
+                eta_data = await calculate_appointment_eta(a)
+                a["expected_turn_time"] = eta_data.get("expected_turn_time")
+                a["expected_time"] = eta_data.get("expected_turn_time")
+                a["eta_minutes"] = eta_data.get("eta_minutes", 0)
+                a["patients_ahead"] = eta_data.get("patients_ahead", 0)
+                a["is_estimate_pending"] = eta_data.get("is_estimate_pending", False)
+                a["is_delayed_awaited"] = eta_data.get("is_delayed_awaited", False)
+            except Exception:
+                pass
+
     return appts
 
 
@@ -3796,16 +3842,28 @@ async def reception_cancel_appointment(body: QueueActionBody, user: dict = Depen
     if not appt:
         raise HTTPException(status_code=404, detail="Not found")
 
+    if appt.get("status") == "completed":
+        raise HTTPException(status_code=400, detail="Cannot cancel an already completed consultation")
+    if appt.get("status") == "in_consultation":
+        raise HTTPException(status_code=400, detail="Cannot cancel an appointment currently in consultation")
+
     now = now_iso()
+    reason = body.reason or "Cancelled by reception"
     await db.appointments.update_one(
         {"id": body.appointment_id},
-        {"$set": {"status": "cancelled", "cancelled_at": now, "updated_at": now}}
+        {"$set": {
+            "status": "cancelled",
+            "cancelled_at": now,
+            "cancellation_reason": reason,
+            "cancelled_by": user.get("id"),
+            "updated_at": now,
+        }}
     )
     await db.push_subscriptions.update_many({"appointment_id": appt["id"]}, {"$set": {"active": False}})
     await broadcast_doctor_update(appt["doctor_id"], "cancelled")
     asyncio.create_task(notify_appointment_cancelled(appt))
     asyncio.create_task(notify_queue_movement(appt["doctor_id"]))
-    return {"ok": True}
+    return {"ok": True, "message": "Appointment cancelled successfully"}
 
 
 @api_router.post("/reception/reschedule")
@@ -4146,6 +4204,188 @@ async def reception_send_appointment_link(
         "sms_text": sms_res.get("sms_text"),
         "appointment_link": dynamic_link,
     }
+
+
+# ============ EXCEL REPORT EXPORT ENDPOINT ============
+@api_router.get("/reception/export-excel")
+@api_router.get("/api/reception/export-excel")
+async def reception_export_excel(
+    doctor_id: Optional[str] = None,
+    date: Optional[str] = None,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer")),
+):
+    """Database-backed Excel report export for receptionist (Requirement 8)."""
+    import io
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    today = get_ist_now().strftime("%Y-%m-%d")
+    target_date = date or today
+
+    q: dict = {"date": target_date}
+    if user.get("hospital_id"):
+        docs = await db.doctors.find({"hospital_id": user["hospital_id"]}, {"id": 1}).to_list(None)
+        valid_doc_ids = [d["id"] for d in docs]
+        if doctor_id:
+            if doctor_id not in valid_doc_ids:
+                raise HTTPException(status_code=403, detail="Doctor does not belong to your clinic")
+            q["doctor_id"] = doctor_id
+        else:
+            q["doctor_id"] = {"$in": valid_doc_ids}
+    elif doctor_id:
+        q["doctor_id"] = doctor_id
+
+    appts = await db.appointments.find(q, {"_id": 0}).sort([("token_number", 1)]).to_list(2000)
+
+    doc_name = "All_Doctors"
+    clinic_name = "Clinic"
+    if doctor_id:
+        doc_obj = await db.doctors.find_one({"id": doctor_id}, {"_id": 0, "full_name": 1, "hospital_name": 1, "clinic_name": 1})
+        if doc_obj:
+            doc_name = doc_obj.get("full_name") or "Doctor"
+            clinic_name = doc_obj.get("hospital_name") or doc_obj.get("clinic_name") or "MeriBaari Clinic"
+    elif user.get("hospital_id"):
+        hosp = await db.hospitals.find_one({"id": user["hospital_id"]}, {"_id": 0, "name": 1})
+        if hosp:
+            clinic_name = hosp.get("name") or "MeriBaari Clinic"
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Appointments Report"
+
+    header_fill = PatternFill(start_color="0F766E", end_color="0F766E", fill_type="solid")
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    data_font = Font(name="Calibri", size=10)
+    center_align = Alignment(horizontal="center", vertical="center")
+    left_align = Alignment(horizontal="left", vertical="center")
+    thin_border = Border(
+        left=Side(style="thin", color="CBD5E1"),
+        right=Side(style="thin", color="CBD5E1"),
+        top=Side(style="thin", color="CBD5E1"),
+        bottom=Side(style="thin", color="CBD5E1"),
+    )
+
+    headers = [
+        "Booking Date",
+        "Appointment ID",
+        "Token #",
+        "Patient Name",
+        "Mobile Number",
+        "Age",
+        "Gender",
+        "Doctor Name",
+        "Clinic / Hospital",
+        "Booking Source",
+        "Status",
+        "Recorded ETA / Expected Window",
+        "Consultation Started",
+        "Consultation Completed",
+        "Consultation Duration",
+        "Cancellation Timestamp",
+        "Cancellation Reason",
+    ]
+
+    ws.append(headers)
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center_align
+
+    def calc_duration(start_val, end_val):
+        if not start_val or not end_val or start_val == "Unavailable" or end_val == "Unavailable":
+            return "Unavailable"
+        try:
+            def parse_time(v):
+                s = str(v).strip()
+                if "T" in s:
+                    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                m = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)$", s, re.I)
+                if m:
+                    h, mi, meridiem = int(m.group(1)), int(m.group(2)), m.group(3).upper()
+                    if meridiem == "PM" and h < 12: h += 12
+                    if meridiem == "AM" and h == 12: h = 0
+                    return datetime(2000, 1, 1, h, mi)
+                return None
+            t1 = parse_time(start_val)
+            t2 = parse_time(end_val)
+            if t1 and t2:
+                mins = max(0, int((t2 - t1).total_seconds() / 60))
+                return f"{mins} mins"
+        except Exception:
+            pass
+        return "Unavailable"
+
+    if not appts:
+        ws.append(["No appointment records found for this date", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""])
+    else:
+        for r_idx, a in enumerate(appts, start=2):
+            source = "Walk-in (Reception)" if (a.get("slot") == "Walk-in" or a.get("added_by_reception")) else "Online App Booking"
+            status_label = str(a.get("status", "booked")).replace("_", " ").title()
+            eta_val = str(a.get("expected_turn_time") or a.get("expected_time") or a.get("slot") or "Unavailable")
+            start_val = str(a.get("consultation_started_at") or a.get("started_at") or "Unavailable")
+            end_val = str(a.get("consultation_completed_at") or a.get("completed_at") or "Unavailable")
+            duration_val = calc_duration(a.get("consultation_started_at") or a.get("started_at"), a.get("consultation_completed_at") or a.get("completed_at"))
+            cancel_time = str(a.get("cancelled_at") or "Unavailable")
+            cancel_reason = str(a.get("cancellation_reason") or "Unavailable")
+
+            row_data = [
+                str(a.get("date") or target_date),
+                str(a.get("id") or ""),
+                int(a.get("token_number", 0)),
+                str(a.get("patient_name") or ""),
+                str(a.get("patient_mobile") or ""),
+                str(a.get("age") or "Unavailable"),
+                str(a.get("gender") or "Unavailable"),
+                str(a.get("doctor_name") or doc_name),
+                clinic_name,
+                source,
+                status_label,
+                eta_val,
+                start_val,
+                end_val,
+                duration_val,
+                cancel_time,
+                cancel_reason,
+            ]
+            ws.append(row_data)
+
+            row_fill = PatternFill(start_color="F8FAFC" if r_idx % 2 == 0 else "FFFFFF", fill_type="solid")
+            for c_idx in range(1, len(headers) + 1):
+                cell = ws.cell(row=r_idx, column=c_idx)
+                cell.font = data_font
+                cell.border = thin_border
+                cell.fill = row_fill
+                if c_idx in (1, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16):
+                    cell.alignment = center_align
+                else:
+                    cell.alignment = left_align
+
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            val_str = str(cell.value or "")
+            if len(val_str) > max_len:
+                max_len = len(val_str)
+        ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+
+    clean_doc = re.sub(r"[^\w\-]", "_", doc_name)
+    filename = f"ClinicQueue_Report_{clean_doc}_{target_date}.xlsx"
+    return Response(
+        content=stream.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
+
 
 
 # ============ DEV TEST SMS & DELIVERY STATUS ENDPOINTS ============

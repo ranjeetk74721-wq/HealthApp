@@ -11,12 +11,29 @@ interface DaySummary {
 
 interface CalendarSummaryProps {
   summaryData: DaySummary[];
+  selectedDate?: string;
   onSelectDate?: (date: string) => void;
 }
 
-export default function CalendarSummary({ summaryData, onSelectDate }: CalendarSummaryProps) {
+export default function CalendarSummary({ summaryData, selectedDate: propSelectedDate, onSelectDate }: CalendarSummaryProps) {
   const [currentMonthDate, setCurrentMonthDate] = useState(new Date());
-  const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split("T")[0]);
+  const [selectedDate, setSelectedDate] = useState<string>(
+    propSelectedDate || new Date().toLocaleDateString("en-CA")
+  );
+
+  React.useEffect(() => {
+    if (propSelectedDate && propSelectedDate !== selectedDate) {
+      setSelectedDate(propSelectedDate);
+      const parts = propSelectedDate.split("-");
+      if (parts.length === 3) {
+        const y = parseInt(parts[0], 10);
+        const m = parseInt(parts[1], 10) - 1;
+        if (!isNaN(y) && !isNaN(m)) {
+          setCurrentMonthDate(new Date(y, m, 1));
+        }
+      }
+    }
+  }, [propSelectedDate, selectedDate]);
 
   const mapByDate = (summaryData || []).reduce((acc, item) => {
     acc[item.date] = item;

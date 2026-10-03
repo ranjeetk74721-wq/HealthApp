@@ -115,22 +115,22 @@ class TestDoctorSessionRecalculation:
         ]
         mock_db.appointments.find.return_value = MockCursor(appts)
 
-        # Patient 1 ETA should start at 11:00 AM
+        # Patient 1 ETA should start at 11:00 AM (10-minute initial window per Req 4)
         eta1 = await calculate_appointment_eta(appts[0])
-        assert eta1["expected_turn_time"] == "11:00 AM – 11:30 AM"
+        assert eta1["expected_turn_time"] == "11:00 AM – 11:10 AM"
         assert eta1["my_position"] == 1
         assert eta1["is_delayed"] is True
         assert eta1["is_delayed_awaited"] is False
         assert "Doctor ke consultation start hone mein deri hai" in eta1["delay_notice"]
 
-        # Patient 2 ETA should start at 11:15 AM
+        # Patient 2 ETA should start at 11:10 AM (20-minute gap window per Req 4)
         eta2 = await calculate_appointment_eta(appts[1])
-        assert eta2["expected_turn_time"] == "11:15 AM – 11:45 AM"
+        assert eta2["expected_turn_time"] == "11:10 AM – 11:30 AM"
         assert eta2["my_position"] == 2
 
-        # Patient 3 ETA should start at 11:30 AM
+        # Patient 3 ETA should start at 11:30 AM (20-minute gap window per Req 4)
         eta3 = await calculate_appointment_eta(appts[2])
-        assert eta3["expected_turn_time"] == "11:30 AM – 12:00 PM"
+        assert eta3["expected_turn_time"] == "11:30 AM – 11:50 AM"
         assert eta3["my_position"] == 3
 
     @pytest.mark.asyncio

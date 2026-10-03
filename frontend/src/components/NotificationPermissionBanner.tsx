@@ -179,7 +179,7 @@ export default function NotificationPermissionBanner({
             1. ब्राउज़र के एड्रेस बार (URL) के पास ताला 🔒 या सेटिंग्स आइकन पर टैप करें।
           </Text>
           <Text style={styles.helpStep}>
-            2. "Permissions" या "Notifications" को <Text style={{ fontWeight: "700" }}>Allow (अनुमति दें)</Text> करें।
+            2. &quot;Permissions&quot; या &quot;Notifications&quot; को <Text style={{ fontWeight: "700" }}>Allow (अनुमति दें)</Text> करें।
           </Text>
           <Text style={styles.helpStep}>
             3. इसके बाद पेज को रीफ़्रेश (Refresh) करें।
@@ -212,7 +212,7 @@ export default function NotificationPermissionBanner({
             1. Safari के नीचे शेयर बटन <Text style={{ fontWeight: "700" }}>Share ⎋</Text> दबाएं।
           </Text>
           <Text style={styles.helpStep}>
-            2. नीचे स्क्रॉल करके <Text style={{ fontWeight: "700" }}>'Add to Home Screen' (होम स्क्रीन में जोड़ें)</Text> चुनें।
+            2. नीचे स्क्रॉल करके <Text style={{ fontWeight: "700" }}>&apos;Add to Home Screen&apos; (होम स्क्रीन में जोड़ें)</Text> चुनें।
           </Text>
           <Text style={styles.helpStep}>
             3. होम स्क्रीन पर बने MeriBaari आइकन से खोलें और कतार नोटिफिकेशन चालू करें।

@@ -118,10 +118,9 @@ export default function DoctorTimingAdjustmentModal({
         reason: reason.trim() || undefined,
       };
 
+      payload.new_start_time = targetTime;
       if (selectedMinutes) {
         payload.delay_minutes = selectedMinutes;
-      } else {
-        payload.new_start_time = targetTime;
       }
 
       const res = await api.post(`/doctor/${doctorId}/session/adjust-timing`, payload);

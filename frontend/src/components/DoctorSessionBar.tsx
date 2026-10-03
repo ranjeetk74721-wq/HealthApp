@@ -26,6 +26,7 @@ export default function DoctorSessionBar({
   const [timingModalOpen, setTimingModalOpen] = useState(false);
   const [pauseModalOpen, setPauseModalOpen] = useState(false);
   const [startingSession, setStartingSession] = useState(false);
+  const [endingSession, setEndingSession] = useState(false);
 
   if (!session) return null;
 
@@ -63,8 +64,6 @@ export default function DoctorSessionBar({
       );
     }
   };
-
-  const [endingSession, setEndingSession] = useState(false);
 
   const handleEndSession = async () => {
     const confirmEnd = () => {
@@ -109,32 +108,38 @@ export default function DoctorSessionBar({
         <View
           style={[
             styles.statusBadge,
-            status === "in_consultation"
+            status === "in_consultation" || status === "in_progress"
               ? styles.statusInConsult
               : status === "paused"
               ? styles.statusPaused
-              : status === "completed"
+              : status === "resumed"
+              ? { backgroundColor: "#DCFCE7", borderColor: "#86EFAC" }
+              : status === "completed" || status === "ended"
               ? styles.statusCompleted
               : styles.statusNotStarted,
           ]}
         >
           <Ionicons
             name={
-              status === "in_consultation"
+              status === "in_consultation" || status === "in_progress"
                 ? "play-circle"
                 : status === "paused"
                 ? "pause-circle"
-                : status === "completed"
+                : status === "resumed"
+                ? "refresh-circle"
+                : status === "completed" || status === "ended"
                 ? "checkmark-circle"
                 : "time"
             }
             size={14}
             color={
-              status === "in_consultation"
+              status === "in_consultation" || status === "in_progress"
                 ? "#065F46"
                 : status === "paused"
                 ? "#92400E"
-                : status === "completed"
+                : status === "resumed"
+                ? "#059669"
+                : status === "completed" || status === "ended"
                 ? "#475569"
                 : "#9A3412"
             }
@@ -142,21 +147,25 @@ export default function DoctorSessionBar({
           <Text
             style={[
               styles.statusBadgeText,
-              status === "in_consultation"
+              status === "in_consultation" || status === "in_progress"
                 ? { color: "#065F46" }
                 : status === "paused"
                 ? { color: "#92400E" }
-                : status === "completed"
+                : status === "resumed"
+                ? { color: "#059669" }
+                : status === "completed" || status === "ended"
                 ? { color: "#475569" }
                 : { color: "#9A3412" },
             ]}
           >
-            {status === "in_consultation"
-              ? "In Consultation"
+            {status === "in_consultation" || status === "in_progress"
+              ? "In Progress"
               : status === "paused"
               ? "Paused"
-              : status === "completed"
-              ? "Completed"
+              : status === "resumed"
+              ? "Resumed"
+              : status === "completed" || status === "ended"
+              ? "Ended"
               : "Not Started"}
           </Text>
         </View>
