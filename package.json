@@ -1,0 +1,9 @@
+{
+  "name": "dr-mariya-healthapp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dr Mariya HealthApp Monorepo",
+  "scripts": {
+    "build": "npm run --prefix frontend build"
+  }
+}
