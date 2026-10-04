@@ -137,6 +137,7 @@ export const api = {
   get: (p: string, opts?: RequestOpts) => request(p, { method: "GET", ...opts }),
   post: (p: string, body?: any, opts?: RequestOpts) => request(p, { method: "POST", body: body !== undefined ? JSON.stringify(body) : undefined, ...opts }),
   put: (p: string, body?: any, opts?: RequestOpts) => request(p, { method: "PUT", body: body !== undefined ? JSON.stringify(body) : undefined, ...opts }),
+  patch: (p: string, body?: any, opts?: RequestOpts) => request(p, { method: "PATCH", body: body !== undefined ? JSON.stringify(body) : undefined, ...opts }),
   del: (p: string, opts?: RequestOpts) => request(p, { method: "DELETE", ...opts }),
   delete: (p: string, opts?: RequestOpts) => request(p, { method: "DELETE", ...opts }),
 };

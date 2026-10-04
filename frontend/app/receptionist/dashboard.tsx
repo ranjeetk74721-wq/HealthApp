@@ -12,6 +12,8 @@ import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import CalendarSummary from "@/src/components/CalendarSummary";
 import DoctorSessionBar from "@/src/components/DoctorSessionBar";
+import PatientDetailsModal from "@/src/components/PatientDetailsModal";
+import { printPatientList } from "@/src/utils/printPatientList";
 
 const POLL_INTERVAL_MS = 10_000;
 const GENDERS = ["Male", "Female", "Other"];
@@ -37,6 +39,8 @@ export default function ReceptionistDashboard() {
   const [selectedDate, setSelectedDate] = useState<string>(
     new Date().toLocaleDateString("en-CA")
   );
+  const [selectedPatientAppt, setSelectedPatientAppt] = useState<any | null>(null);
+  const [queueFilter, setQueueFilter] = useState<"all" | "active" | "completed">("all");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
@@ -481,6 +485,37 @@ export default function ReceptionistDashboard() {
   );
   const completedQueue = queue.filter((q) => q.status === "completed");
 
+  const displayedQueue =
+    queueFilter === "completed"
+      ? completedQueue
+      : queueFilter === "all"
+      ? queue.filter((q) => q.status !== "cancelled")
+      : activeQueue;
+
+  const handlePrintPatientList = () => {
+    const curDoc = doctors.find((d) => d.id === selectedDoc);
+    const docName = curDoc?.full_name || "Doctor";
+    const clinicName = curDoc?.hospital_name || curDoc?.clinic_name || (user as any)?.hospital_name || "MeriBaari Clinic";
+
+    let patientsToPrint = queue.filter((q) => q.status !== "cancelled");
+    let filterLabel = "All Patients";
+    if (queueFilter === "active") {
+      patientsToPrint = activeQueue;
+      filterLabel = "Active Patients (Waiting & Consulting)";
+    } else if (queueFilter === "completed") {
+      patientsToPrint = completedQueue;
+      filterLabel = "Completed Patients";
+    }
+
+    printPatientList({
+      hospitalName: clinicName,
+      doctorName: docName,
+      date: selectedDate,
+      filterLabel,
+      patients: patientsToPrint,
+    });
+  };
+
   const stats = {
     total: queue.filter((q) => q.status !== "cancelled").length,
     active: activeQueue.length,
@@ -585,13 +620,21 @@ export default function ReceptionistDashboard() {
         <View style={styles.sectionHeaderRow}>
           <View>
             <Text style={styles.sectionTitle}>
-              Active Queue · {selectedDate}
+              Patient Queue · {selectedDate}
             </Text>
             <Text style={styles.sectionSub}>
-              {activeQueue.length} patient(s) waiting / consulting
+              {displayedQueue.length} patient(s) · Tap any patient to view or edit details
             </Text>
           </View>
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <Pressable
+              onPress={handlePrintPatientList}
+              style={styles.printBtn}
+              testID="reception-print-patient-list-btn"
+            >
+              <Ionicons name="print-outline" size={15} color={colors.brandPrimary} />
+              <Text style={styles.printBtnText}>Print Patient List</Text>
+            </Pressable>
             <Pressable
               onPress={handleDownloadExcel}
               disabled={exportLoading}
@@ -618,65 +661,113 @@ export default function ReceptionistDashboard() {
           </View>
         </View>
 
-        {activeQueue.length === 0 ? (
+        {/* ── Queue Filter Tabs ── */}
+        <View style={styles.filterChipsRow}>
+          <Pressable
+            testID="reception-filter-all"
+            onPress={() => setQueueFilter("all")}
+            style={[styles.filterChip, queueFilter === "all" && styles.filterChipActive]}
+          >
+            <Text style={[styles.filterChipText, queueFilter === "all" && styles.filterChipTextActive]}>
+              All ({queue.filter((q) => q.status !== "cancelled").length})
+            </Text>
+          </Pressable>
+          <Pressable
+            testID="reception-filter-active"
+            onPress={() => setQueueFilter("active")}
+            style={[styles.filterChip, queueFilter === "active" && styles.filterChipActive]}
+          >
+            <Text style={[styles.filterChipText, queueFilter === "active" && styles.filterChipTextActive]}>
+              Active ({activeQueue.length})
+            </Text>
+          </Pressable>
+          <Pressable
+            testID="reception-filter-completed"
+            onPress={() => setQueueFilter("completed")}
+            style={[styles.filterChip, queueFilter === "completed" && styles.filterChipActive]}
+          >
+            <Text style={[styles.filterChipText, queueFilter === "completed" && styles.filterChipTextActive]}>
+              Completed ({completedQueue.length})
+            </Text>
+          </Pressable>
+        </View>
+
+        {displayedQueue.length === 0 ? (
           <View style={styles.empty}>
             <Ionicons name="people-outline" size={44} color={colors.muted} />
-            <Text style={styles.emptyText}>No active patients waiting. Tap &quot;+ Add Patient&quot; to register a walk-in.</Text>
+            <Text style={styles.emptyText}>No patients match the selected filter for {selectedDate}. Tap &quot;+ Add Patient&quot; to register a walk-in.</Text>
           </View>
         ) : (
-          activeQueue.map((a) => {
+          displayedQueue.map((a) => {
             const isConsulting = a.status === "in_consultation";
             const isSkipped = a.status === "skipped";
             const isArrived = a.status === "arrived";
             const isBooked = a.status === "booked";
+            const isCompleted = a.status === "completed";
             const isItemBusy = actionLoadingId === a.id;
 
             return (
-              <View key={a.id} style={[styles.apptCard, isConsulting && styles.apptCardConsulting]}>
-                <View style={[styles.tokenBubble, isConsulting && { backgroundColor: colors.brandPrimary }]}>
-                  <Text style={[styles.tokenText, isConsulting && { color: colors.onBrandPrimary }]}>
-                    #{a.token_number}
-                  </Text>
-                </View>
-
-                <View style={{ flex: 1 }}>
-                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                    <Text style={styles.apptName}>{a.patient_name}</Text>
-                    {isConsulting && (
-                      <View style={styles.consultingBadge}>
-                        <Text style={styles.consultingBadgeText}>CONSULTING</Text>
-                      </View>
-                    )}
-                    {isSkipped && (
-                      <View style={styles.skippedBadge}>
-                        <Text style={styles.skippedBadgeText}>SKIPPED</Text>
-                      </View>
-                    )}
+              <View key={a.id} style={[styles.apptCard, isConsulting && styles.apptCardConsulting, isCompleted && { opacity: 0.8 }]}>
+                {/* Clickable Patient Info Area */}
+                <Pressable
+                  testID={`reception-patient-row-${a.id}`}
+                  onPress={() => setSelectedPatientAppt(a)}
+                  style={styles.patientInfoPressable}
+                >
+                  <View style={[styles.tokenBubble, isConsulting && { backgroundColor: colors.brandPrimary }, isCompleted && { backgroundColor: colors.surfaceTertiary }]}>
+                    <Text style={[styles.tokenText, isConsulting && { color: colors.onBrandPrimary }, isCompleted && { color: colors.onSurfaceSecondary }]}>
+                      #{a.token_number}
+                    </Text>
                   </View>
 
-                  <Text style={styles.apptMeta}>
-                    {a.slot} · <Text style={{ fontWeight: "600" }}>{a.status.replace("_", " ").toUpperCase()}</Text>
-                    {a.consultation_started_at ? ` · Started ${formatTime(a.consultation_started_at)}` : ""}
-                  </Text>
-                  {a.expected_turn_time ? (
-                    <View style={styles.etaRow}>
-                      <Ionicons
-                        name={a.is_estimate_pending ? "alert-circle-outline" : "time-outline"}
-                        size={13}
-                        color={a.is_estimate_pending ? "#D97706" : colors.brandPrimary}
-                      />
-                      <Text
-                        style={[
-                          styles.etaText,
-                          a.is_estimate_pending && { color: "#D97706", fontWeight: "600" },
-                        ]}
-                      >
-                        {a.is_estimate_pending ? a.expected_turn_time : `Expected: ${a.expected_turn_time}`}
-                      </Text>
+                  <View style={{ flex: 1 }}>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                      <Text style={styles.apptName}>{a.patient_name}</Text>
+                      <Ionicons name="information-circle-outline" size={14} color={colors.brandPrimary} />
+                      {isConsulting && (
+                        <View style={styles.consultingBadge}>
+                          <Text style={styles.consultingBadgeText}>CONSULTING</Text>
+                        </View>
+                      )}
+                      {isSkipped && (
+                        <View style={styles.skippedBadge}>
+                          <Text style={styles.skippedBadgeText}>SKIPPED</Text>
+                        </View>
+                      )}
+                      {isCompleted && (
+                        <View style={[styles.consultingBadge, { backgroundColor: colors.success }]}>
+                          <Text style={[styles.consultingBadgeText, { color: "#fff" }]}>COMPLETED</Text>
+                        </View>
+                      )}
                     </View>
-                  ) : null}
-                  {a.symptoms ? <Text style={styles.symptoms} numberOfLines={1}>💊 {a.symptoms}</Text> : null}
-                </View>
+
+                    <Text style={styles.apptMeta}>
+                      {a.slot} · <Text style={{ fontWeight: "600" }}>{a.status.replace("_", " ").toUpperCase()}</Text>
+                      {a.consultation_started_at ? ` · Started ${formatTime(a.consultation_started_at)}` : ""}
+                    </Text>
+                    {a.patient_mobile ? (
+                      <Text style={styles.patientContactMeta}>📞 {a.patient_mobile}</Text>
+                    ) : null}
+                    {a.expected_turn_time && !isCompleted ? (
+                      <View style={styles.etaRow}>
+                        <Ionicons
+                          name={a.is_estimate_pending ? "alert-circle-outline" : "time-outline"}
+                          size={13}
+                          color={a.is_estimate_pending ? "#D97706" : colors.brandPrimary}
+                        />
+                        <Text
+                          style={[
+                            styles.etaText,
+                            a.is_estimate_pending && { color: "#D97706", fontWeight: "600" },
+                          ]}
+                        >
+                          {a.is_estimate_pending ? a.expected_turn_time : `Expected: ${a.expected_turn_time}`}
+                        </Text>
+                      </View>
+                    ) : null}
+                    {a.symptoms ? <Text style={styles.symptoms} numberOfLines={1}>💊 {a.symptoms}</Text> : null}
+                  </View>
+                </Pressable>
 
                 {/* Patient-specific utility icons (SMS link & Transfer) */}
                 <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginRight: 4 }}>
@@ -885,21 +976,32 @@ export default function ReceptionistDashboard() {
                 <Text style={styles.historyEmptyText}>No consultations completed yet today.</Text>
               ) : (
                 completedQueue.map((item) => (
-                  <View key={item.id} style={styles.historyItemCard}>
+                  <Pressable
+                    key={item.id}
+                    testID={`reception-completed-row-${item.id}`}
+                    onPress={() => setSelectedPatientAppt(item)}
+                    style={styles.historyItemCard}
+                  >
                     <View style={styles.historyToken}>
                       <Text style={styles.historyTokenText}>#{item.token_number}</Text>
                     </View>
                     <View style={{ flex: 1 }}>
-                      <Text style={styles.historyPatientName}>{item.patient_name}</Text>
+                      <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                        <Text style={styles.historyPatientName}>{item.patient_name}</Text>
+                        <Ionicons name="information-circle-outline" size={13} color={colors.brandPrimary} />
+                      </View>
                       <Text style={styles.historyTimeText}>
                         Started: {formatTime(item.consultation_started_at || item.started_at)} · Completed: {formatTime(item.consultation_completed_at || item.completed_at)}
                       </Text>
+                      {item.patient_mobile ? (
+                        <Text style={styles.patientContactMeta}>📞 {item.patient_mobile}</Text>
+                      ) : null}
                     </View>
                     <View style={styles.completedBadge}>
                       <Ionicons name="checkmark-done" size={14} color="#065F46" />
                       <Text style={styles.completedBadgeText}>Completed</Text>
                     </View>
-                  </View>
+                  </Pressable>
                 ))
               )}
             </View>
@@ -1122,12 +1224,79 @@ export default function ReceptionistDashboard() {
           </Pressable>
         </Pressable>
       </Modal>
+
+      {/* ── Patient Details View / Edit Modal ── */}
+      <PatientDetailsModal
+        visible={!!selectedPatientAppt}
+        appointment={selectedPatientAppt}
+        onClose={() => setSelectedPatientAppt(null)}
+        onUpdated={(updated) => {
+          setQueue((prev) =>
+            prev.map((a) => (a.id === updated.id ? { ...a, ...updated } : a))
+          );
+          setSelectedPatientAppt(updated);
+        }}
+      />
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.surfaceSecondary },
+  printBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 7,
+    borderRadius: radius.md,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.brandPrimary,
+  },
+  printBtnText: {
+    fontSize: font.sm,
+    fontWeight: "600",
+    color: colors.brandPrimary,
+  },
+  filterChipsRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginVertical: spacing.xs,
+    flexWrap: "wrap",
+  },
+  filterChip: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: 6,
+    borderRadius: radius.pill,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  filterChipActive: {
+    backgroundColor: colors.brandSecondary,
+    borderColor: colors.brandPrimary,
+  },
+  filterChipText: {
+    fontSize: font.xs,
+    fontWeight: "600",
+    color: colors.onSurfaceSecondary,
+  },
+  filterChipTextActive: {
+    color: colors.brandPrimary,
+    fontWeight: "700",
+  },
+  patientInfoPressable: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+  },
+  patientContactMeta: {
+    fontSize: 11,
+    color: colors.muted,
+    marginTop: 2,
+  },
   offlineBanner: {
     backgroundColor: "#DC2626",
     flexDirection: "row",

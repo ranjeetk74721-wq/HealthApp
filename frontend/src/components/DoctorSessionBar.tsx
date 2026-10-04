@@ -32,8 +32,9 @@ export default function DoctorSessionBar({
 
   const status = session.status || "not_started";
   const origStart = session.original_start_time || "10:00 AM";
-  const expStart = session.expected_start_time || origStart;
-  const isDelayed = expStart !== origStart || Boolean(session.delay_reason);
+  const isUnconfirmed = Boolean(session.return_time_unconfirmed);
+  const expStart = isUnconfirmed ? "Time Awaited" : (session.expected_start_time || origStart);
+  const isDelayed = isUnconfirmed || expStart !== origStart || Boolean(session.delay_reason);
   const actualStart = session.actual_start_time;
   const isPaused = status === "paused";
 
@@ -100,7 +101,7 @@ export default function DoctorSessionBar({
       {/* Top row: Status, Times & Badges */}
       <View style={styles.topRow}>
         <View style={styles.titleWrap}>
-          <Text style={styles.sessionTitle}>Doctor Session Timing</Text>
+          <Text style={styles.sessionTitle}>Doctor Availability & Session Timing</Text>
           <Text style={styles.doctorSub}>{doctorName} · {session.date || "Today"}</Text>
         </View>
 
@@ -112,8 +113,10 @@ export default function DoctorSessionBar({
               ? styles.statusInConsult
               : status === "paused"
               ? styles.statusPaused
-              : status === "resumed"
-              ? { backgroundColor: "#DCFCE7", borderColor: "#86EFAC" }
+              : isUnconfirmed
+              ? { backgroundColor: "#FFEDD5", borderColor: "#FDBA74" }
+              : isDelayed
+              ? { backgroundColor: "#FEF3C7", borderColor: "#FCD34D" }
               : status === "completed" || status === "ended"
               ? styles.statusCompleted
               : styles.statusNotStarted,
@@ -125,8 +128,10 @@ export default function DoctorSessionBar({
                 ? "play-circle"
                 : status === "paused"
                 ? "pause-circle"
-                : status === "resumed"
-                ? "refresh-circle"
+                : isUnconfirmed
+                ? "alert-circle"
+                : isDelayed
+                ? "time"
                 : status === "completed" || status === "ended"
                 ? "checkmark-circle"
                 : "time"
@@ -137,8 +142,10 @@ export default function DoctorSessionBar({
                 ? "#065F46"
                 : status === "paused"
                 ? "#92400E"
-                : status === "resumed"
-                ? "#059669"
+                : isUnconfirmed
+                ? "#C2410C"
+                : isDelayed
+                ? "#B45309"
                 : status === "completed" || status === "ended"
                 ? "#475569"
                 : "#9A3412"
@@ -151,8 +158,10 @@ export default function DoctorSessionBar({
                 ? { color: "#065F46" }
                 : status === "paused"
                 ? { color: "#92400E" }
-                : status === "resumed"
-                ? { color: "#059669" }
+                : isUnconfirmed
+                ? { color: "#C2410C" }
+                : isDelayed
+                ? { color: "#B45309" }
                 : status === "completed" || status === "ended"
                 ? { color: "#475569" }
                 : { color: "#9A3412" },
@@ -162,8 +171,10 @@ export default function DoctorSessionBar({
               ? "In Progress"
               : status === "paused"
               ? "Paused"
-              : status === "resumed"
-              ? "Resumed"
+              : isUnconfirmed
+              ? "Delayed (Time Awaited)"
+              : isDelayed
+              ? "Delayed"
               : status === "completed" || status === "ended"
               ? "Ended"
               : "Not Started"}
@@ -184,15 +195,17 @@ export default function DoctorSessionBar({
           <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
             <Text style={styles.infoLabel}>Expected Start</Text>
             {isDelayed && (
-              <View style={styles.delayedPill}>
-                <Text style={styles.delayedPillText}>DELAYED</Text>
+              <View style={[styles.delayedPill, isUnconfirmed && { backgroundColor: "#FFEDD5" }]}>
+                <Text style={[styles.delayedPillText, isUnconfirmed && { color: "#C2410C" }]}>
+                  {isUnconfirmed ? "TIME AWAITED" : "DELAYED"}
+                </Text>
               </View>
             )}
           </View>
           <Text
             style={[
               styles.infoVal,
-              isDelayed && { color: "#D97706", fontWeight: "800" },
+              isDelayed && { color: isUnconfirmed ? "#C2410C" : "#D97706", fontWeight: "800" },
             ]}
           >
             {expStart}
@@ -218,12 +231,12 @@ export default function DoctorSessionBar({
         ) : null}
       </View>
 
-      {/* Delay / Pause Reason Banner */}
+      {/* Patient-Visible Delay / Pause Reason Banner */}
       {isDelayed && session.delay_reason ? (
         <View style={styles.reasonBanner}>
           <Ionicons name="alert-circle-outline" size={16} color="#B45309" />
           <Text style={styles.reasonText}>
-            Reason: <Text style={{ fontWeight: "600" }}>{session.delay_reason}</Text>
+            Patient-Visible Reason: <Text style={{ fontWeight: "700" }}>{session.delay_reason}</Text>
           </Text>
         </View>
       ) : null}

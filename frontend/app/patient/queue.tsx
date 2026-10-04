@@ -242,34 +242,67 @@ export default function PatientQueue() {
           </View>
         )}
 
-        {/* Doctor Timing Adjustment & Delay Banner */}
-        {data.is_delayed_awaited && (
-          <View style={[styles.statusBanner, { backgroundColor: "#FEF3C7", borderColor: "#F59E0B" }]}>
-            <Ionicons name="time" size={20} color="#D97706" />
-            <View style={{ flex: 1 }}>
-              <Text style={{ fontWeight: "700", color: "#92400E", fontSize: font.sm }}>
-                Doctor delayed — updated time awaited
+        {/* Doctor Availability & Delay Banner */}
+        {!isServing && !isDone && (data.is_delayed_awaited || data.return_time_unconfirmed || data.is_delayed || data.delay_reason) ? (
+          (data.is_delayed_awaited || data.return_time_unconfirmed) ? (
+            <View style={[styles.statusBanner, { backgroundColor: "#FEF3C7", borderColor: "#F59E0B", flexDirection: "column", alignItems: "stretch", gap: 6 }]}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <Ionicons name="time" size={20} color="#D97706" />
+                <View style={{ flex: 1 }}>
+                  <Text style={{ fontWeight: "700", color: "#92400E", fontSize: font.sm }}>
+                    Doctor Availability: Delayed (Time Awaited)
+                  </Text>
+                  <Text style={{ fontSize: 11, color: "#B45309", fontWeight: "600" }}>
+                    डॉक्टर के आने में देरी · समय की प्रतीक्षा है
+                  </Text>
+                </View>
+              </View>
+              {data.delay_reason ? (
+                <View style={{ backgroundColor: "#FDE68A", paddingHorizontal: spacing.sm, paddingVertical: 4, borderRadius: radius.sm, alignSelf: "flex-start" }}>
+                  <Text style={{ fontSize: font.xs, fontWeight: "700", color: "#78350F" }}>
+                    Reason: {data.delay_reason}
+                  </Text>
+                </View>
+              ) : null}
+              <Text style={{ color: "#92400E", fontSize: font.xs, lineHeight: 18, marginTop: 2 }}>
+                {data.delay_reason ? `${data.delay_reason}. ` : "Doctor is attending an emergency. "}
+                The consultation resume time is not yet confirmed. Your estimated turn time will update once the clinic confirms availability.
               </Text>
-              <Text style={{ color: "#B45309", fontSize: font.xs, marginTop: 2 }}>
-                डॉक्टर के परामर्श शुरू होने में देरी है—नए समय की प्रतीक्षा है। Live queue will update automatically once consultation begins.
+              <Text style={{ color: "#B45309", fontSize: 11, lineHeight: 16 }}>
+                डॉक्टर के परामर्श शुरू होने में देरी है—समय अभी तय नहीं है। क्लिनिक द्वारा उपलब्धता की पुष्टि होते ही आपका समय अपडेट हो जाएगा।
               </Text>
             </View>
-          </View>
-        )}
-
-        {data.delay_notice && !data.is_delayed_awaited && (
-          <View style={[styles.statusBanner, { backgroundColor: "#EFF6FF", borderColor: "#3B82F6" }]}>
-            <Ionicons name="information-circle" size={20} color="#2563EB" />
-            <View style={{ flex: 1 }}>
-              <Text style={{ fontWeight: "700", color: "#1E40AF", fontSize: font.sm }}>
-                Doctor Timing Adjusted
-              </Text>
-              <Text style={{ color: "#1E3A8A", fontSize: font.xs, marginTop: 2 }}>
-                {data.delay_notice}
-              </Text>
+          ) : (
+            <View style={[styles.statusBanner, { backgroundColor: "#EFF6FF", borderColor: "#3B82F6", flexDirection: "column", alignItems: "stretch", gap: 6 }]}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <Ionicons name="information-circle" size={20} color="#2563EB" />
+                <View style={{ flex: 1 }}>
+                  <Text style={{ fontWeight: "700", color: "#1E40AF", fontSize: font.sm }}>
+                    Doctor Availability: Delayed
+                  </Text>
+                  <Text style={{ fontSize: 11, color: "#1D4ED8", fontWeight: "600" }}>
+                    डॉक्टर के परामर्श शुरू होने में देरी
+                  </Text>
+                </View>
+              </View>
+              {data.delay_reason ? (
+                <View style={{ backgroundColor: "#DBEAFE", paddingHorizontal: spacing.sm, paddingVertical: 4, borderRadius: radius.sm, alignSelf: "flex-start" }}>
+                  <Text style={{ fontSize: font.xs, fontWeight: "700", color: "#1E3A8A" }}>
+                    Reason: {data.delay_reason}
+                  </Text>
+                </View>
+              ) : null}
+              <View style={{ backgroundColor: "#FFFFFF", padding: spacing.sm, borderRadius: radius.sm, borderWidth: 1, borderColor: "#BFDBFE" }}>
+                <Text style={{ fontSize: font.xs, color: "#1E40AF", fontWeight: "600" }}>
+                  Expected consultation start: <Text style={{ fontWeight: "800", color: "#1D4ED8" }}>{data.expected_start_time || "11:30 AM"}</Text>
+                </Text>
+                <Text style={{ fontSize: font.xs, color: "#1E40AF", fontWeight: "600", marginTop: 2 }}>
+                  Your estimated turn: <Text style={{ fontWeight: "800", color: colors.brandPrimary }}>{formatExpectedTimeRange(data.expected_turn_time || "Calculating...")}</Text>
+                </Text>
+              </View>
             </View>
-          </View>
-        )}
+          )
+        ) : null}
 
         <NotificationPermissionBanner
           appointmentId={appt?.id}

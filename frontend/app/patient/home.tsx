@@ -151,11 +151,25 @@ export default function PatientHome() {
           <Pressable testID="upcoming-appointment-card" onPress={() => router.push("/patient/queue")} style={styles.upcomingWrap}>
             <Image source={{ uri: "https://images.pexels.com/photos/8459996/pexels-photo-8459996.jpeg?auto=compress&cs=tinysrgb&w=800" }} style={styles.upcomingBg} />
             <LinearGradient colors={["rgba(3, 105, 161, 0.85)", "rgba(3, 105, 161, 0.95)"]} style={styles.upcomingOverlay}>
-              <Text style={styles.upcomingLabel}>UPCOMING APPOINTMENT</Text>
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                <Text style={styles.upcomingLabel}>UPCOMING APPOINTMENT</Text>
+                {(upcoming.is_delayed || upcoming.is_delayed_awaited || upcoming.return_time_unconfirmed) && (
+                  <View style={{ backgroundColor: "#FEF3C7", paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 }}>
+                    <Text style={{ fontSize: 10, fontWeight: "700", color: "#92400E" }}>
+                      {upcoming.is_delayed_awaited || upcoming.return_time_unconfirmed ? "DELAYED (TIME AWAITED)" : "DELAYED"}
+                    </Text>
+                  </View>
+                )}
+              </View>
               <Text style={styles.upcomingName}>{upcoming.doctor_name}</Text>
               <Text style={styles.upcomingMeta}>
-                Token #{upcoming.token_number} · Expected: {formatExpectedTimeRange(upcoming.expected_turn_time || upcoming.slot || "As per live queue")}
+                Token #{upcoming.token_number} · {upcoming.is_delayed_awaited || upcoming.return_time_unconfirmed ? "Time Awaited (समय प्रतीक्षित)" : `Expected: ${formatExpectedTimeRange(upcoming.expected_turn_time || upcoming.slot || "As per live queue")}`}
               </Text>
+              {upcoming.delay_reason && (
+                <Text style={{ color: "#FEF3C7", fontSize: 11, fontWeight: "600", marginTop: 2 }} numberOfLines={1}>
+                  Notice: {upcoming.delay_reason}
+                </Text>
+              )}
               <View style={styles.upcomingCta}>
                 <Text style={styles.upcomingCtaText}>अपनी बारी देखे</Text>
                 <Ionicons name="arrow-forward" size={16} color={colors.onBrandPrimary} />

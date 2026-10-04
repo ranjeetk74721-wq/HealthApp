@@ -264,6 +264,25 @@ export default function DynamicAppointmentScreen() {
   const myPosition = queueData?.my_position ?? -1;
   const status = apptData?.status || "booked";
 
+  const formatTurnTimeDisplay = (rawTimeStr: string) => {
+    if (!rawTimeStr) return "Calculating...";
+    // Keep individual time like "1:12 PM" together using non-breaking space
+    return rawTimeStr.replace(/(\d{1,2}:\d{2})\s*(AM|PM)/gi, "$1\u00A0$2");
+  };
+
+  const displayTime = queueData?.is_delayed_awaited
+    ? "Time Awaited"
+    : formatTurnTimeDisplay(expectedTurnTime);
+
+  const patientsAhead =
+    queueData?.patients_ahead != null
+      ? queueData.patients_ahead
+      : myPosition > 0
+      ? myPosition - 1
+      : myPosition === 0
+      ? 0
+      : null;
+
   return (
     <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
       <ScrollView
@@ -342,60 +361,101 @@ export default function DynamicAppointmentScreen() {
           appointmentToken={apptData?.secure_token || token}
         />
 
-        {/* Doctor Timing Adjustment & Delay Banner */}
-        {queueData?.is_delayed_awaited && (
-          <View style={[styles.infoBox, { backgroundColor: "#FEF3C7", borderColor: "#F59E0B", borderWidth: 1 }]}>
-            <Ionicons name="time" size={20} color="#D97706" />
-            <View style={{ flex: 1 }}>
-              <Text style={{ fontWeight: "700", color: "#92400E", fontSize: font.sm }}>
-                Doctor delayed — updated time awaited
+        {/* Doctor Availability & Delay Banner */}
+        {status !== "in_consultation" && status !== "completed" && (queueData?.is_delayed_awaited || queueData?.return_time_unconfirmed || queueData?.is_delayed || queueData?.delay_reason) ? (
+          (queueData?.is_delayed_awaited || queueData?.return_time_unconfirmed) ? (
+            <View style={[styles.infoBox, { backgroundColor: "#FEF3C7", borderColor: "#F59E0B", borderWidth: 1.5, flexDirection: "column", alignItems: "stretch", gap: 6 }]}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <Ionicons name="time" size={20} color="#D97706" />
+                <View style={{ flex: 1 }}>
+                  <Text style={{ fontWeight: "700", color: "#92400E", fontSize: font.sm }}>
+                    Doctor Availability: Delayed (Time Awaited)
+                  </Text>
+                  <Text style={{ fontSize: 11, color: "#B45309", fontWeight: "600" }}>
+                    डॉक्टर के आने में देरी · समय की प्रतीक्षा है
+                  </Text>
+                </View>
+              </View>
+              {queueData?.delay_reason ? (
+                <View style={{ backgroundColor: "#FDE68A", paddingHorizontal: spacing.sm, paddingVertical: 4, borderRadius: radius.sm, alignSelf: "flex-start" }}>
+                  <Text style={{ fontSize: font.xs, fontWeight: "700", color: "#78350F" }}>
+                    Reason: {queueData.delay_reason}
+                  </Text>
+                </View>
+              ) : null}
+              <Text style={{ color: "#92400E", fontSize: font.xs, lineHeight: 18, marginTop: 2 }}>
+                {queueData?.delay_reason ? `${queueData.delay_reason}. ` : "Doctor is attending an emergency. "}
+                The consultation resume time is not yet confirmed. Your estimated turn time will update once the clinic confirms availability.
               </Text>
-              <Text style={{ color: "#B45309", fontSize: font.xs, marginTop: 2 }}>
-                डॉक्टर के परामर्श शुरू होने में देरी है—नए समय की प्रतीक्षा है। Live queue will update automatically once consultation begins.
+              <Text style={{ color: "#B45309", fontSize: 11, lineHeight: 16 }}>
+                डॉक्टर के परामर्श शुरू होने में देरी है—समय अभी तय नहीं है। क्लिनिक द्वारा उपलब्धता की पुष्टि होते ही आपका समय अपडेट हो जाएगा।
               </Text>
             </View>
-          </View>
-        )}
-
-        {queueData?.delay_notice && !queueData?.is_delayed_awaited && (
-          <View style={[styles.infoBox, { backgroundColor: "#EFF6FF", borderColor: "#3B82F6", borderWidth: 1 }]}>
-            <Ionicons name="information-circle" size={20} color="#2563EB" />
-            <View style={{ flex: 1 }}>
-              <Text style={{ fontWeight: "700", color: "#1E40AF", fontSize: font.sm }}>
-                Doctor Timing Adjusted
-              </Text>
-              <Text style={{ color: "#1E3A8A", fontSize: font.xs, marginTop: 2 }}>
-                {queueData.delay_notice}
-              </Text>
+          ) : (
+            <View style={[styles.infoBox, { backgroundColor: "#EFF6FF", borderColor: "#3B82F6", borderWidth: 1.5, flexDirection: "column", alignItems: "stretch", gap: 6 }]}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <Ionicons name="information-circle" size={20} color="#2563EB" />
+                <View style={{ flex: 1 }}>
+                  <Text style={{ fontWeight: "700", color: "#1E40AF", fontSize: font.sm }}>
+                    Doctor Availability: Delayed
+                  </Text>
+                  <Text style={{ fontSize: 11, color: "#1D4ED8", fontWeight: "600" }}>
+                    डॉक्टर के परामर्श शुरू होने में देरी
+                  </Text>
+                </View>
+              </View>
+              {queueData?.delay_reason ? (
+                <View style={{ backgroundColor: "#DBEAFE", paddingHorizontal: spacing.sm, paddingVertical: 4, borderRadius: radius.sm, alignSelf: "flex-start" }}>
+                  <Text style={{ fontSize: font.xs, fontWeight: "700", color: "#1E3A8A" }}>
+                    Reason: {queueData.delay_reason}
+                  </Text>
+                </View>
+              ) : null}
+              <View style={{ backgroundColor: "#FFFFFF", padding: spacing.sm, borderRadius: radius.sm, borderWidth: 1, borderColor: "#BFDBFE" }}>
+                <Text style={{ fontSize: font.xs, color: "#1E40AF", fontWeight: "600" }}>
+                  Expected consultation start: <Text style={{ fontWeight: "800", color: "#1D4ED8" }}>{queueData?.expected_start_time || "11:30 AM"}</Text>
+                </Text>
+                <Text style={{ fontSize: font.xs, color: "#1E40AF", fontWeight: "600", marginTop: 2 }}>
+                  Your estimated turn: <Text style={{ fontWeight: "800", color: colors.brandPrimary }}>{expectedTurnTime}</Text>
+                </Text>
+              </View>
             </View>
-          </View>
-        )}
+          )
+        ) : null}
 
         {/* Live Token & ETA Hero */}
         <View style={styles.heroCard}>
-          <Text style={styles.heroLabel}>YOUR TOKEN NUMBER</Text>
+          {/* Top Section */}
+          <Text style={styles.heroLabel}>आपका टोकन नंबर</Text>
           <Text style={styles.tokenBig}>#{tokenNumber}</Text>
           <Text style={styles.patientName}>Patient: {apptData?.patient_name}</Text>
 
-          <View style={styles.heroDivider} />
-
-          <View style={styles.kpiGrid}>
-            <View style={styles.kpiItem}>
-              <Text style={styles.kpiCaption}>Now Serving</Text>
-              <Text style={styles.kpiValue}>
+          {/* Queue Details — 3 columns in 1 horizontal row */}
+          <View style={styles.queueDetailsRow}>
+            {/* Left Column: Currently Serving */}
+            <View style={styles.colLeft}>
+              <Text style={styles.colLabel}>{"अभी कितना नंबर\nचल रहा है"}</Text>
+              <Text style={styles.colValue}>
                 {currentServing ? `#${currentServing}` : "Waiting"}
               </Text>
             </View>
-            <View style={styles.kpiItem}>
-              <Text style={styles.kpiCaption}>Estimated Turn</Text>
-              <Text style={[styles.kpiValue, { color: colors.brandPrimary }]} testID="expected-turn-time">
-                {queueData?.is_delayed_awaited ? "Time Awaited" : expectedTurnTime}
+
+            {/* Center Column: Estimated Turn Time */}
+            <View style={styles.colCenter}>
+              <Text style={styles.colLabel}>{"आपके नंबर का\nअनुमानित समय"}</Text>
+              <Text
+                style={[styles.colValue, styles.colValueHighlight]}
+                testID="expected-turn-time"
+              >
+                {displayTime}
               </Text>
             </View>
-            <View style={styles.kpiItem}>
-              <Text style={styles.kpiCaption}>Ahead in Queue</Text>
-              <Text style={styles.kpiValue}>
-                {myPosition > 0 ? `${myPosition - 1} patients` : myPosition === 0 ? "You're next!" : "—"}
+
+            {/* Right Column: Patients Ahead */}
+            <View style={styles.colRight}>
+              <Text style={styles.colLabel}>{"आपसे पहले\nमरीज"}</Text>
+              <Text style={styles.colValue}>
+                {patientsAhead !== null ? patientsAhead : "—"}
               </Text>
             </View>
           </View>
@@ -539,7 +599,8 @@ const styles = StyleSheet.create({
   heroCard: {
     backgroundColor: colors.surface,
     borderRadius: radius.lg,
-    padding: spacing.xl,
+    paddingVertical: spacing.lg,
+    paddingHorizontal: spacing.md,
     alignItems: "center",
     borderWidth: 1,
     borderColor: colors.brandSecondary,
@@ -550,45 +611,65 @@ const styles = StyleSheet.create({
     elevation: 3,
   },
   heroLabel: {
-    fontSize: font.xs,
+    fontSize: 13,
     fontWeight: "700",
-    letterSpacing: 1.2,
     color: colors.muted,
+    textAlign: "center",
   },
   tokenBig: {
-    fontSize: 54,
+    fontSize: 50,
     fontWeight: "800",
     color: colors.brandPrimary,
-    marginVertical: spacing.xs,
+    marginVertical: 4,
+    textAlign: "center",
   },
   patientName: {
     fontSize: font.base,
     fontWeight: "600",
     color: colors.onSurfaceSecondary,
+    textAlign: "center",
+    marginBottom: spacing.lg,
   },
-  heroDivider: {
-    width: "100%",
-    height: 1,
-    backgroundColor: colors.divider,
-    marginVertical: spacing.lg,
-  },
-  kpiGrid: {
+  queueDetailsRow: {
     flexDirection: "row",
     width: "100%",
-    justifyContent: "space-around",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
   },
-  kpiItem: {
+  colLeft: {
+    flex: 1,
     alignItems: "center",
+    paddingHorizontal: 2,
   },
-  kpiCaption: {
-    fontSize: font.xs,
+  colCenter: {
+    flex: 1.4,
+    alignItems: "center",
+    paddingHorizontal: 4,
+  },
+  colRight: {
+    flex: 1,
+    alignItems: "center",
+    paddingHorizontal: 2,
+  },
+  colLabel: {
+    fontSize: 11,
+    lineHeight: 16,
     color: colors.muted,
-    marginBottom: 4,
+    textAlign: "center",
+    fontWeight: "600",
+    minHeight: 32,
+    marginBottom: 6,
   },
-  kpiValue: {
-    fontSize: font.lg,
+  colValue: {
+    fontSize: font.base,
     fontWeight: "700",
     color: colors.onSurface,
+    textAlign: "center",
+  },
+  colValueHighlight: {
+    color: colors.brandPrimary,
+    fontSize: font.sm,
+    lineHeight: 18,
   },
   infoBox: {
     flexDirection: "row",

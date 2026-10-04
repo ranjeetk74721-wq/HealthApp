@@ -12,6 +12,8 @@ import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import CalendarSummary from "@/src/components/CalendarSummary";
 import DoctorSessionBar from "@/src/components/DoctorSessionBar";
+import PatientDetailsModal from "@/src/components/PatientDetailsModal";
+import { printPatientList } from "@/src/utils/printPatientList";
 
 const POLL_INTERVAL_MS = 20_000;
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024; // 5 MB limit
@@ -42,6 +44,13 @@ export default function DoctorDashboard() {
   const [appts, setAppts]     = useState<any[]>([]);
   const [summaryData, setSummaryData] = useState<any[]>([]);
   const [receptionists, setReceptionists] = useState<any[]>([]);
+  const [selectedPatientAppt, setSelectedPatientAppt] = useState<any | null>(null);
+  const [selectedDate, setSelectedDate] = useState<string>(
+    new Date().toLocaleDateString("en-CA")
+  );
+  const selectedDateRef = useRef(selectedDate);
+  useEffect(() => { selectedDateRef.current = selectedDate; }, [selectedDate]);
+  const [filterStatus, setFilterStatus] = useState<"all" | "pending" | "completed">("all");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [prescOpen, setPrescOpen] = useState<any | null>(null);
@@ -73,20 +82,21 @@ export default function DoctorDashboard() {
   const load = useCallback(async (silent = false, bypassCache = false) => {
     const shouldBypass = silent || bypassCache;
     try {
+      const targetDate = selectedDateRef.current;
       const [d, a, sum, recs] = await Promise.all([
         api.get("/doctor/dashboard", { bypassCache: shouldBypass }),
-        api.get("/doctor/appointments", { bypassCache: shouldBypass }),
+        api.get(`/doctor/appointments?date=${targetDate}`, { bypassCache: shouldBypass }),
         api.get("/appointments/calendar-summary", { bypassCache: shouldBypass }).catch(() => []),
         api.get("/doctor/receptionists", { bypassCache: shouldBypass }).catch(() => []),
       ]);
       setData(d);
-      setAppts(a);
+      setAppts(a || []);
       setSummaryData(sum || []);
       setReceptionists(recs || []);
 
       const docId = d?.doctor?.id;
       if (docId) {
-        api.get(`/doctor/${docId}/session`, { bypassCache: shouldBypass })
+        api.get(`/doctor/${docId}/session?date=${targetDate}`, { bypassCache: shouldBypass })
           .then((res) => { if (res?.session) setDocSession(res.session); })
           .catch(() => {});
       }
@@ -303,10 +313,35 @@ export default function DoctorDashboard() {
   }
 
   const currentMode = data.status;
+  const filteredAppts = appts.filter((a) => {
+    if (filterStatus === "pending") return ["booked", "arrived", "in_consultation"].includes(a.status);
+    if (filterStatus === "completed") return a.status === "completed";
+    return true;
+  });
+
   const nextPatient =
     appts.find((a) => a.status === "in_consultation") ||
     appts.find((a) => a.status === "arrived") ||
     appts.find((a) => a.status === "booked");
+
+  const handlePrintPatientList = () => {
+    const clinicTitle = data?.doctor?.hospital_name || data?.doctor?.clinic_name || "MeriBaari Clinic";
+    const docTitle = data?.doctor?.full_name || user?.full_name || "Doctor";
+    const filterLabel =
+      filterStatus === "all"
+        ? "All Patients"
+        : filterStatus === "pending"
+        ? "Pending Patients"
+        : "Completed Patients";
+
+    printPatientList({
+      hospitalName: clinicTitle,
+      doctorName: docTitle,
+      date: selectedDate,
+      filterLabel,
+      patients: filteredAppts,
+    });
+  };
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
@@ -374,7 +409,15 @@ export default function DoctorDashboard() {
 
         {/* ── View-Only Calendar Summary ── */}
         <Text style={styles.sectionTitle}>Daily Patient Calendar</Text>
-        <CalendarSummary summaryData={summaryData} />
+        <CalendarSummary
+          summaryData={summaryData}
+          selectedDate={selectedDate}
+          onSelectDate={(date) => {
+            setSelectedDate(date);
+            selectedDateRef.current = date;
+            load(true, true);
+          }}
+        />
 
         {/* ── Receptionist Management ── */}
         <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: spacing.md }}>
@@ -403,9 +446,20 @@ export default function DoctorDashboard() {
         {/* ── Next patient card ── */}
         {nextPatient && (
           <View style={styles.nextCard}>
-            <Text style={styles.nextLabel}>NEXT PATIENT</Text>
-            <Text style={styles.nextName}>{nextPatient.patient_name}</Text>
-            <Text style={styles.nextMeta}>Token #{nextPatient.token_number} · {nextPatient.slot} · {nextPatient.status.replace("_", " ")}</Text>
+            <Pressable
+              testID="doctor-next-patient-clickable"
+              onPress={() => setSelectedPatientAppt(nextPatient)}
+              style={{ cursor: "pointer" } as any}
+            >
+              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+                <Text style={styles.nextLabel}>NEXT PATIENT</Text>
+                <Text style={styles.viewDetailsHint}>View / Edit Details →</Text>
+              </View>
+              <Text style={styles.nextName}>{nextPatient.patient_name}</Text>
+              <Text style={styles.nextMeta}>
+                Token #{nextPatient.token_number} · {nextPatient.slot} · {nextPatient.status.replace("_", " ")}
+              </Text>
+            </Pressable>
             {nextPatient.status !== "in_consultation" ? (
               <Pressable testID="call-next-btn" onPress={() => doAction("/reception/start_consultation", nextPatient.id)} style={styles.callBtn}>
                 <Ionicons name="mic" size={18} color={colors.brandPrimary} />
@@ -420,30 +474,105 @@ export default function DoctorDashboard() {
           </View>
         )}
 
+        {/* ── Patient queue section header with Print button ── */}
+        <View style={styles.sectionHeaderRow}>
+          <View>
+            <Text style={styles.sectionTitle}>
+              Today&apos;s Schedule · {selectedDate}
+            </Text>
+            <Text style={styles.sectionSub}>
+              {filteredAppts.length} patient(s) · Tap any patient to view or edit details
+            </Text>
+          </View>
+
+          <Pressable
+            testID="doctor-print-patient-list-btn"
+            onPress={handlePrintPatientList}
+            style={styles.printBtn}
+          >
+            <Ionicons name="print-outline" size={16} color={colors.brandPrimary} />
+            <Text style={styles.printBtnText}>Print Patient List</Text>
+          </Pressable>
+        </View>
+
+        {/* ── Filter Tabs ── */}
+        <View style={styles.filterChipsRow}>
+          <Pressable
+            testID="doctor-filter-all"
+            onPress={() => setFilterStatus("all")}
+            style={[styles.filterChip, filterStatus === "all" && styles.filterChipActive]}
+          >
+            <Text style={[styles.filterChipText, filterStatus === "all" && styles.filterChipTextActive]}>
+              All ({appts.length})
+            </Text>
+          </Pressable>
+          <Pressable
+            testID="doctor-filter-pending"
+            onPress={() => setFilterStatus("pending")}
+            style={[styles.filterChip, filterStatus === "pending" && styles.filterChipActive]}
+          >
+            <Text style={[styles.filterChipText, filterStatus === "pending" && styles.filterChipTextActive]}>
+              Pending ({appts.filter((a) => ["booked", "arrived", "in_consultation"].includes(a.status)).length})
+            </Text>
+          </Pressable>
+          <Pressable
+            testID="doctor-filter-completed"
+            onPress={() => setFilterStatus("completed")}
+            style={[styles.filterChip, filterStatus === "completed" && styles.filterChipActive]}
+          >
+            <Text style={[styles.filterChipText, filterStatus === "completed" && styles.filterChipTextActive]}>
+              Completed ({appts.filter((a) => a.status === "completed").length})
+            </Text>
+          </Pressable>
+        </View>
+
         {/* ── Schedule list ── */}
-        <Text style={styles.sectionTitle}>Today&apos;s Schedule</Text>
-        {appts.length === 0 ? (
-          <View style={styles.empty}><Text style={styles.emptyText}>No patients scheduled today</Text></View>
+        {filteredAppts.length === 0 ? (
+          <View style={styles.empty}>
+            <Ionicons name="people-outline" size={40} color={colors.muted} />
+            <Text style={styles.emptyText}>No patients match the selected filter for {selectedDate}</Text>
+          </View>
         ) : (
-          appts.map((a) => {
+          filteredAppts.map((a) => {
             const statusColor = STATUS_COLORS[a.status] || colors.muted;
             const availableActions = rowActions.filter((ra) => ra.showOn.includes(a.status));
             const isDone = a.status === "completed";
             return (
               <View key={a.id} style={[styles.apptCard, isDone && { opacity: 0.6 }]}>
-                <View style={[styles.tokenBubble, a.status === "in_consultation" && { backgroundColor: colors.brandPrimary }]}>
-                  <Text style={[styles.tokenText, a.status === "in_consultation" && { color: colors.onBrandPrimary }]}>#{a.token_number}</Text>
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.apptName}>{a.patient_name}</Text>
-                  <View style={styles.metaRow}>
-                    <Text style={styles.apptMeta}>{a.slot}</Text>
-                    <View style={[styles.statusPill, { backgroundColor: statusColor + "22" }]}>
-                      <Text style={[styles.statusText, { color: statusColor }]}>{a.status.replace("_", " ")}</Text>
-                    </View>
+                {/* Clickable Patient Information Area */}
+                <Pressable
+                  testID={`doctor-patient-row-${a.id}`}
+                  onPress={() => setSelectedPatientAppt(a)}
+                  style={styles.patientInfoPressable}
+                >
+                  <View style={[styles.tokenBubble, a.status === "in_consultation" && { backgroundColor: colors.brandPrimary }]}>
+                    <Text style={[styles.tokenText, a.status === "in_consultation" && { color: colors.onBrandPrimary }]}>#{a.token_number}</Text>
                   </View>
-                  {a.symptoms ? <Text style={styles.symptoms} numberOfLines={1}>💊 {a.symptoms}</Text> : null}
-                </View>
+                  <View style={{ flex: 1 }}>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                      <Text style={styles.apptName}>{a.patient_name}</Text>
+                      <Ionicons name="information-circle-outline" size={14} color={colors.brandPrimary} />
+                    </View>
+                    <View style={styles.metaRow}>
+                      <Text style={styles.apptMeta}>{a.slot}</Text>
+                      <View style={[styles.statusPill, { backgroundColor: statusColor + "22" }]}>
+                        <Text style={[styles.statusText, { color: statusColor }]}>{a.status.replace("_", " ")}</Text>
+                      </View>
+                      {a.payment_status ? (
+                        <View style={[styles.statusPill, { backgroundColor: (a.payment_status === "paid" ? colors.success : colors.warning) + "22" }]}>
+                          <Text style={[styles.statusText, { color: a.payment_status === "paid" ? colors.success : colors.warning }]}>
+                            {a.payment_status.toUpperCase()}
+                          </Text>
+                        </View>
+                      ) : null}
+                    </View>
+                    {a.patient_mobile ? (
+                      <Text style={styles.contactMeta}>📞 {a.patient_mobile}</Text>
+                    ) : null}
+                    {a.symptoms ? <Text style={styles.symptoms} numberOfLines={1}>💊 {a.symptoms}</Text> : null}
+                  </View>
+                </Pressable>
+
                 <View style={styles.rowActions}>
                   {availableActions.map((act) => (
                     <Pressable
@@ -586,6 +715,19 @@ export default function DoctorDashboard() {
           </Pressable>
         </Pressable>
       </Modal>
+
+      {/* ── Patient Details View / Edit Modal ── */}
+      <PatientDetailsModal
+        visible={!!selectedPatientAppt}
+        appointment={selectedPatientAppt}
+        onClose={() => setSelectedPatientAppt(null)}
+        onUpdated={(updated) => {
+          setAppts((prev) =>
+            prev.map((a) => (a.id === updated.id ? { ...a, ...updated } : a))
+          );
+          setSelectedPatientAppt(updated);
+        }}
+      />
     </SafeAreaView>
   );
 }
@@ -609,9 +751,77 @@ const styles = StyleSheet.create({
   nextLabel: { fontSize: font.sm, color: colors.brandTertiary, fontWeight: "700", letterSpacing: 1 },
   nextName: { fontSize: font.xxl, fontWeight: "700", color: colors.onBrandPrimary, marginTop: 4 },
   nextMeta: { fontSize: font.base, color: colors.brandTertiary, textTransform: "capitalize" },
+  viewDetailsHint: { fontSize: font.xs, color: colors.brandTertiary, fontWeight: "600" },
   callBtn: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, backgroundColor: colors.onBrandPrimary, padding: spacing.md, borderRadius: radius.md, marginTop: spacing.md },
   callBtnText: { color: colors.brandPrimary, fontWeight: "700", fontSize: font.base },
   sectionTitle: { fontSize: font.lg, fontWeight: "700", color: colors.onSurface, marginTop: spacing.md },
+  sectionHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginTop: spacing.md,
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  sectionSub: {
+    fontSize: font.xs,
+    color: colors.muted,
+    marginTop: 2,
+  },
+  printBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 7,
+    borderRadius: radius.md,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.brandPrimary,
+  },
+  printBtnText: {
+    fontSize: font.sm,
+    fontWeight: "600",
+    color: colors.brandPrimary,
+  },
+  filterChipsRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginVertical: spacing.xs,
+    flexWrap: "wrap",
+  },
+  filterChip: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: 6,
+    borderRadius: radius.pill,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  filterChipActive: {
+    backgroundColor: colors.brandSecondary,
+    borderColor: colors.brandPrimary,
+  },
+  filterChipText: {
+    fontSize: font.xs,
+    fontWeight: "600",
+    color: colors.onSurfaceSecondary,
+  },
+  filterChipTextActive: {
+    color: colors.brandPrimary,
+    fontWeight: "700",
+  },
+  patientInfoPressable: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+  },
+  contactMeta: {
+    fontSize: 11,
+    color: colors.muted,
+    marginTop: 2,
+  },
   empty: { alignItems: "center", padding: spacing.xl },
   emptyText: { color: colors.muted },
   apptCard: { flexDirection: "row", alignItems: "center", gap: spacing.md, backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border },
