@@ -390,8 +390,9 @@ class PrescriptionBody(BaseModel):
 
 class DoctorTimingAdjustBody(BaseModel):
     date: Optional[str] = None  # YYYY-MM-DD, defaults to today in IST
-    new_start_time: Optional[str] = None  # e.g. "11:00 AM" or "11:30"
-    delay_minutes: Optional[int] = None  # shortcut: 15, 30, or 60 minutes
+    new_start_time: Optional[str] = None  # Expected availability: e.g. "11:00 AM" or "02:30 PM"
+    delay_minutes: Optional[int] = None   # Shortcut: +15/+30/+45/+60 min from original scheduled start
+    new_scheduled_start_time: Optional[str] = None  # Editable Scheduled Start: updates original_start_time and resets delay baseline (only before consultation begins)
     reason: Optional[str] = None
     expected_version: Optional[int] = None
     return_time_unconfirmed: Optional[bool] = False  # When True, return/delay time is unconfirmed
@@ -3581,7 +3582,7 @@ async def adjust_doctor_timing(
     body: DoctorTimingAdjustBody,
     user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer"))
 ):
-    """Receptionist or Doctor adjusts session expected start time with reason and audit history."""
+    """Receptionist or Doctor adjusts session expected start time and/or scheduled start with reason and audit history."""
     doc = await verify_doctor_session_access(doctor_id, user, write=True)
     session_date = body.date or get_ist_now().strftime("%Y-%m-%d")
     session = await get_or_create_doctor_session(doctor_id, session_date)
@@ -3590,21 +3591,42 @@ async def adjust_doctor_timing(
     if session.get("status") == "completed":
         raise HTTPException(status_code=400, detail="Cannot adjust timing for a completed session")
 
+    # ── Handle editable Scheduled Start (original_start_time) ─────────────────
+    # Only allowed before consultation has actually begun (no actual_start_time set).
+    new_scheduled = None
+    if body.new_scheduled_start_time:
+        if session.get("actual_start_time"):
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot change Scheduled Start after consultation has already begun. Use delay shortcuts to update the Expected time instead."
+            )
+        parsed_sched = parse_time_to_ist_dt(session_date, body.new_scheduled_start_time)
+        if not parsed_sched:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Scheduled Start format. Use 12-hour format like '10:00 AM' or '03:30 PM'."
+            )
+        new_scheduled = format_12hr_time(parsed_sched)
+
     # Determine revised expected start time
     current_expected = session.get("expected_start_time") or session.get("original_start_time") or "10:00 AM"
     is_unconfirmed = bool(body.return_time_unconfirmed or body.start_time_unconfirmed)
 
+    # Determine the baseline for shortcut calculations:
+    # use new_scheduled (if provided) or existing original_start_time
+    shortcut_base = new_scheduled or session.get("original_start_time") or "10:00 AM"
+
     if is_unconfirmed:
         revised_start_time = None
     elif body.delay_minutes:
-        # Shortcut: +15, +30, +60 minutes from original start time to avoid compounding repeatedly
-        base_time_str = session.get("original_start_time") or "10:00 AM"
-        base_dt = parse_time_to_ist_dt(session_date, base_time_str)
+        # Shortcut: +15/+30/+45/+60 minutes from scheduled start (never stacks/compounds)
+        base_dt = parse_time_to_ist_dt(session_date, shortcut_base)
         if not base_dt:
             base_dt = parse_time_to_ist_dt(session_date, "10:00 AM")
         revised_dt = base_dt + timedelta(minutes=body.delay_minutes)
         revised_start_time = format_12hr_time(revised_dt)
     elif body.new_start_time:
+        # Manually entered expected availability time (independent of shortcuts)
         parsed_dt = parse_time_to_ist_dt(session_date, body.new_start_time)
         if not parsed_dt:
             raise HTTPException(
@@ -3612,8 +3634,14 @@ async def adjust_doctor_timing(
                 detail="Invalid time format. Please provide a valid time (e.g. '11:00 AM' or '02:30 PM')"
             )
         revised_start_time = format_12hr_time(parsed_dt)
+    elif body.new_scheduled_start_time and not body.return_time_unconfirmed:
+        # Only scheduled start changed — sync expected_start_time to new scheduled start
+        # (no delay active unless reason is also provided)
+        revised_start_time = new_scheduled
     else:
-        raise HTTPException(status_code=400, detail="Either new_start_time, delay_minutes, or return_time_unconfirmed is required")
+        if not is_unconfirmed:
+            raise HTTPException(status_code=400, detail="Either new_start_time, delay_minutes, new_scheduled_start_time, or return_time_unconfirmed is required")
+        revised_start_time = None
 
     # Optimistic concurrency check to handle simultaneous edits
     current_version = int(session.get("version") or 1)
@@ -3627,6 +3655,8 @@ async def adjust_doctor_timing(
     history_entry = {
         "previous_time": current_expected,
         "revised_time": revised_start_time if not is_unconfirmed else "Return/Start time not confirmed",
+        "previous_scheduled": session.get("original_start_time"),
+        "new_scheduled": new_scheduled,
         "return_time_unconfirmed": is_unconfirmed,
         "start_time_unconfirmed": bool(body.start_time_unconfirmed),
         "reason": body.reason,
@@ -3643,6 +3673,10 @@ async def adjust_doctor_timing(
         "start_time_unconfirmed": bool(body.start_time_unconfirmed),
         "updated_at": now_iso(),
     }
+    # Update original_start_time (Scheduled Start) only if explicitly provided and session not yet started
+    if new_scheduled:
+        update_fields["original_start_time"] = new_scheduled
+
     if not is_unconfirmed:
         update_fields["expected_start_time"] = revised_start_time
     else:
@@ -3690,7 +3724,10 @@ async def adjust_doctor_timing(
     if update_res and "_id" in update_res:
         del update_res["_id"]
 
-    msg = "Doctor availability updated — return/start time not confirmed" if is_unconfirmed else f"Doctor expected start time updated to {revised_start_time}"
+    msg = "Doctor availability updated — return/start time not confirmed" if is_unconfirmed else (
+        f"Scheduled Start updated to {new_scheduled} — queue estimates recalculated" if new_scheduled and not body.new_start_time and not body.delay_minutes
+        else f"Doctor expected start time updated to {revised_start_time}"
+    )
 
     return {
         "ok": True,
