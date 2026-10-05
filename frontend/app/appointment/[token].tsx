@@ -266,13 +266,19 @@ export default function DynamicAppointmentScreen() {
 
   const formatTurnTimeDisplay = (rawTimeStr: string) => {
     if (!rawTimeStr) return "Calculating...";
-    // Keep individual time like "1:12 PM" together using non-breaking space
+    if (status === "in_consultation") return "Consultation in progress.";
+    if (status === "completed") return "Completed";
+    if (rawTimeStr.includes("–") || rawTimeStr.includes("-")) {
+      return `Estimated: ${rawTimeStr.replace(/(\d{1,2}:\d{2})\s*(AM|PM)/gi, "$1\u00A0$2")}`;
+    }
     return rawTimeStr.replace(/(\d{1,2}:\d{2})\s*(AM|PM)/gi, "$1\u00A0$2");
   };
 
-  const displayTime = queueData?.is_delayed_awaited
-    ? "Time Awaited"
-    : formatTurnTimeDisplay(expectedTurnTime);
+  const displayTime = status === "in_consultation"
+    ? "Consultation in progress."
+    : status === "completed"
+    ? "Completed"
+    : formatTurnTimeDisplay(expectedTurnTime || queueData?.expected_turn_time);
 
   const patientsAhead =
     queueData?.patients_ahead != null

@@ -219,7 +219,7 @@ class TestRequirement3RecalculateEstimatedTimes:
         mock_env.appointments.docs = [appt]
 
         eta = await calculate_appointment_eta(appt)
-        assert eta["expected_turn_time"] == "Doctor unavailable — estimate pending"
+        assert eta["expected_turn_time"] == "Doctor abhi available nahi hain. Naya anumanit samay confirm hote hi update hoga"
         assert eta["is_estimate_pending"] is True
         assert eta["your_token"] == 1
         assert eta["patients_ahead"] == 0

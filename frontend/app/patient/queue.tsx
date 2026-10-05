@@ -265,8 +265,11 @@ export default function PatientQueue() {
                 </View>
               ) : null}
               <Text style={{ color: "#92400E", fontSize: font.xs, lineHeight: 18, marginTop: 2 }}>
-                {data.delay_reason ? `${data.delay_reason}. ` : "Doctor is attending an emergency. "}
-                The consultation resume time is not yet confirmed. Your estimated turn time will update once the clinic confirms availability.
+                {data.expected_turn_time?.includes("Doctor abhi available") || data.expected_turn_time?.includes("Doctor ke consultation")
+                  ? data.expected_turn_time
+                  : (data.delay_reason
+                    ? `${data.delay_reason}. Doctor abhi available nahi hain. Naya anumanit samay confirm hote hi update hoga.`
+                    : "Doctor abhi available nahi hain. Naya anumanit samay confirm hote hi update hoga.")}
               </Text>
               <Text style={{ color: "#B45309", fontSize: 11, lineHeight: 16 }}>
                 डॉक्टर के परामर्श शुरू होने में देरी है—समय अभी तय नहीं है। क्लिनिक द्वारा उपलब्धता की पुष्टि होते ही आपका समय अपडेट हो जाएगा।
@@ -318,14 +321,14 @@ export default function PatientQueue() {
           </Text>
           <Text style={styles.heroExpectedTime} testID="expected-turn-time">
             {isServing
-              ? "Please head to the consultation room"
+              ? "Consultation in progress."
               : isDone
               ? "Consultation completed"
-              : data.is_estimate_pending
-              ? "Doctor unavailable — estimate pending"
-              : data.is_delayed_awaited
-              ? "Doctor delayed—updated time awaited"
-              : `Estimated Consultation: ${formatExpectedTimeRange(data.expected_turn_time || data.eta_minutes || "Calculating...")}`}
+              : data.expected_turn_time
+              ? (data.expected_turn_time.includes("–") || data.expected_turn_time.includes("-")
+                  ? `Estimated: ${formatExpectedTimeRange(data.expected_turn_time)}`
+                  : data.expected_turn_time)
+              : `Estimated: ${formatExpectedTimeRange(data.eta_minutes || "Calculating...")}`}
           </Text>
           {!isServing && !isDone && (
             <Text style={styles.heroSub}>

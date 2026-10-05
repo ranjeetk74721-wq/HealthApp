@@ -210,6 +210,7 @@ async def ensure_db_indexes():
             db.users.create_index([("role", 1)]),
             # appointments — most queries filter by doctor_id + date
             db.appointments.create_index([("doctor_id", 1), ("date", 1), ("status", 1)]),
+            db.appointments.create_index([("doctor_id", 1), ("date", 1), ("queue_order", 1), ("token_number", 1)]),
             db.appointments.create_index([("patient_id", 1), ("created_at", -1)]),
             db.appointments.create_index([("id", 1)], unique=True),
             db.appointments.create_index([("secure_token", 1)], unique=True, sparse=True),
@@ -393,7 +394,13 @@ class DoctorTimingAdjustBody(BaseModel):
     delay_minutes: Optional[int] = None  # shortcut: 15, 30, or 60 minutes
     reason: Optional[str] = None
     expected_version: Optional[int] = None
-    return_time_unconfirmed: Optional[bool] = False  # When True, return/start time is unconfirmed
+    return_time_unconfirmed: Optional[bool] = False  # When True, return/delay time is unconfirmed
+    start_time_unconfirmed: Optional[bool] = False  # When True, doctor consultation start time is not yet confirmed
+
+
+class CabinPresenceBody(BaseModel):
+    date: Optional[str] = None
+    doctor_in_cabin: bool
 
 
 class DoctorSessionStartBody(BaseModel):
@@ -1067,18 +1074,20 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-async def broadcast_doctor_update(doctor_id: str, event: str = "queue_update"):
+async def broadcast_doctor_update(doctor_id: str, event: str = "queue_update", notify_completed_appt_id: Optional[str] = None):
     """Broadcast to doctor channel + all patient appointment channels for that doctor today."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = get_ist_now().strftime("%Y-%m-%d")
     await manager.broadcast(f"doctor:{doctor_id}", {"type": event, "doctor_id": doctor_id, "ts": now_iso()})
     # Also notify individual patients
     try:
         appts = await db.appointments.find(
-            {"doctor_id": doctor_id, "date": today, "status": {"$nin": ["cancelled", "completed"]}},
+            {"doctor_id": doctor_id, "date": today, "status": {"$nin": ["cancelled"]}},
             {"_id": 0, "id": 1},
         ).to_list(500)
         for a in appts:
             await manager.broadcast(f"appt:{a['id']}", {"type": event, "doctor_id": doctor_id, "ts": now_iso()})
+        if notify_completed_appt_id:
+            await manager.broadcast(f"appt:{notify_completed_appt_id}", {"type": event, "doctor_id": doctor_id, "ts": now_iso()})
     except Exception as ex:
         pass
 
@@ -1211,6 +1220,9 @@ async def get_or_create_doctor_session(doctor_id: str, date: str) -> dict:
         "original_start_time": orig_start,
         "expected_start_time": orig_start,
         "actual_start_time": format_ist_12hr() if (has_in_consult or has_completed) else None,
+        "doctor_in_cabin": False,
+        "cabin_entered_at": None,
+        "start_time_unconfirmed": False,
         "status": init_status,
         "delay_reason": None,
         "paused_at": None,
@@ -1240,7 +1252,8 @@ async def calculate_appointment_eta(appt: dict) -> dict:
     # Exclude completed, cancelled, and skipped patients from active waiting-time calculation
     active = [a for a in all_appts if a.get("status") in ("booked", "arrived", "in_consultation")]
     current = next((a for a in all_appts if a.get("status") == "in_consultation"), None)
-    completed_count = len([a for a in all_appts if a.get("status") == "completed"])
+    completed_today = [a for a in all_appts if a.get("status") == "completed"]
+    completed_count = len(completed_today)
 
     my_token = appt.get("token_number", 0)
     my_order = appt.get("queue_order", my_token)
@@ -1277,8 +1290,10 @@ async def calculate_appointment_eta(appt: dict) -> dict:
     is_delayed_awaited = False
     is_estimate_pending = False
     return_time_unconfirmed = bool(session.get("return_time_unconfirmed"))
+    start_time_unconfirmed = bool(session.get("start_time_unconfirmed"))
     is_delayed = bool(
         return_time_unconfirmed
+        or start_time_unconfirmed
         or (
             session.get("expected_start_time")
             and session.get("original_start_time")
@@ -1288,61 +1303,44 @@ async def calculate_appointment_eta(appt: dict) -> dict:
     )
 
     ist_now = get_ist_now()
-
-    # Progress of current consultation
-    rem_current = per
-    if current:
-        started_iso = current.get("started_at")
-        if started_iso:
-            try:
-                st_dt = datetime.fromisoformat(started_iso.replace("Z", "+00:00")).astimezone(timezone(timedelta(hours=5, minutes=30)))
-                elapsed_min = max(0, int((ist_now - st_dt).total_seconds() / 60))
-                rem_current = max(1, per - elapsed_min)
-            except Exception:
-                rem_current = max(1, per // 2)
-
     has_consultation_occurred = bool(completed_count > 0 or current is not None or session.get("actual_start_time"))
     session_status = session.get("status", "not_started")
     if current is not None or session.get("actual_start_time"):
-        if session_status != "paused":
+        if session_status not in ("paused", "completed"):
             session_status = "in_consultation"
     elif doc_status in ("paused", "unavailable"):
         session_status = doc_status
 
-    if my_position == 0 and appt.get("status") == "in_consultation":
-        expected_turn_time = "Now"
+    WINDOW_WIDTH_MINUTES = 30
+
+    if appt.get("status") == "in_consultation":
+        expected_turn_time = "Consultation in progress."
         eta_minutes = 0
     elif my_position > 0:
         if doc_status == "unavailable" or session_status == "unavailable":
-            # If doctor return time is unknown, show "Doctor unavailable — estimate pending"
-            expected_turn_time = "Doctor unavailable — estimate pending"
+            expected_turn_time = "Doctor abhi available nahi hain. Naya anumanit samay confirm hote hi update hoga"
             is_estimate_pending = True
             is_delayed_awaited = True
             eta_minutes = 0
         elif return_time_unconfirmed:
-            expected_turn_time = "Doctor delayed—updated time awaited"
+            expected_turn_time = "Doctor abhi available nahi hain. Naya anumanit samay confirm hote hi update hoga"
             is_delayed_awaited = True
             is_estimate_pending = True
+            eta_minutes = 0
+        elif session_status == "completed":
+            expected_turn_time = "Consultation session ended"
             eta_minutes = 0
         elif session_status == "paused" or doc_status == "paused":
             exp_resume_str = session.get("expected_resume_time")
             resume_dt = parse_time_to_ist_dt(appt_date, exp_resume_str) if exp_resume_str else None
             if resume_dt and resume_dt > ist_now:
                 pos = len(active_ahead)
-                if not has_consultation_occurred:
-                    if pos == 0:
-                        patient_start_dt = resume_dt
-                        patient_end_dt = resume_dt + timedelta(minutes=10)
-                    else:
-                        patient_start_dt = resume_dt + timedelta(minutes=10 + (pos - 1) * 20)
-                        patient_end_dt = patient_start_dt + timedelta(minutes=20)
-                else:
-                    patient_start_dt = resume_dt + timedelta(minutes=pos * 20)
-                    patient_end_dt = patient_start_dt + timedelta(minutes=20)
+                patient_start_dt = resume_dt + timedelta(minutes=pos * per)
+                patient_end_dt = patient_start_dt + timedelta(minutes=WINDOW_WIDTH_MINUTES)
                 expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
                 eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60))
             else:
-                expected_turn_time = "Doctor paused — resume time awaited"
+                expected_turn_time = "Doctor abhi available nahi hain. Naya anumanit samay confirm hote hi update hoga"
                 is_delayed_awaited = True
                 is_estimate_pending = True
                 eta_minutes = 0
@@ -1353,27 +1351,28 @@ async def calculate_appointment_eta(appt: dict) -> dict:
                 start_dt = ist_now
             is_today = (appt_date == ist_now.strftime("%Y-%m-%d"))
 
-            is_first_eligible = (len(active_ahead) == 0)
-            if is_today and start_dt < ist_now:
-                expected_turn_time = "Doctor delayed—updated time awaited"
+            if start_time_unconfirmed or not session.get("expected_start_time"):
+                expected_turn_time = "Doctor ke consultation shuru karne ka samay abhi confirm nahi hai."
                 is_delayed_awaited = True
                 is_estimate_pending = True
                 eta_minutes = 0
-            elif is_first_eligible:
-                # Requirement: First eligible waiting token gets initial expected consultation window of exactly 10 minutes from configured start time
-                patient_start_dt = start_dt
-                patient_end_dt = start_dt + timedelta(minutes=10)
-                expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
-                eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60)) if is_today else 0
+            elif is_today and start_dt < ist_now:
+                # Do not display fabricated or expired consultation times
+                expected_turn_time = "Doctor ke consultation shuru karne ka samay abhi confirm nahi hai."
+                is_delayed_awaited = True
+                is_estimate_pending = True
+                eta_minutes = 0
             else:
-                # Remaining waiting tokens sequenced with 20-minute gap/consultation window
+                # Rolling 30-minute window for every waiting token:
+                # estimated start = planned session start + estimated duration of patients ahead
+                # estimated end = estimated start + 30 minutes
                 pos = len(active_ahead)
-                patient_start_dt = start_dt + timedelta(minutes=10 + (pos - 1) * 20)
-                patient_end_dt = patient_start_dt + timedelta(minutes=20)
+                patient_start_dt = start_dt + timedelta(minutes=pos * per)
+                patient_end_dt = patient_start_dt + timedelta(minutes=WINDOW_WIDTH_MINUTES)
                 expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
                 eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60)) if is_today else 0
         else:
-            # Active in_consultation queue: apply availability changes to subsequent waiting patients without rewriting active consultation start time
+            # Consultations have begun
             if current:
                 started_iso = current.get("started_at")
                 elapsed_min = 0
@@ -1383,20 +1382,33 @@ async def calculate_appointment_eta(appt: dict) -> dict:
                         elapsed_min = max(0, int((ist_now - st_dt).total_seconds() / 60))
                     except Exception:
                         pass
-                rem_current = max(1, 20 - elapsed_min)
+                rem_current = max(0, per - elapsed_min)
+                # Overrun protection: waiting estimates never remain in the past
                 base_dt = ist_now + timedelta(minutes=rem_current)
             else:
-                base_dt = ist_now
+                # Previous consultation finished, next waiting
+                if completed_today:
+                    last_comp = completed_today[-1]
+                    last_comp_time_str = last_comp.get("consultation_completed_at")
+                    last_comp_dt = parse_time_to_ist_dt(appt_date, last_comp_time_str) if last_comp_time_str else None
+                    if last_comp_dt and ist_now <= last_comp_dt + timedelta(minutes=1):
+                        base_dt = last_comp_dt
+                    else:
+                        base_dt = ist_now
+                else:
+                    act_start_str = session.get("actual_start_time")
+                    act_dt = parse_time_to_ist_dt(appt_date, act_start_str) if act_start_str else None
+                    base_dt = act_dt if (act_dt and ist_now <= act_dt + timedelta(minutes=1)) else ist_now
 
-            # If doctor updated expected consultation time to a later time
+            # Doctor timing delay adjustment
             if session.get("expected_start_time"):
                 exp_dt = parse_time_to_ist_dt(appt_date, session.get("expected_start_time"))
                 if exp_dt and exp_dt > base_dt:
                     base_dt = exp_dt
 
             pos = len(active_ahead)
-            patient_start_dt = base_dt + timedelta(minutes=pos * 20)
-            patient_end_dt = patient_start_dt + timedelta(minutes=20)
+            patient_start_dt = base_dt + timedelta(minutes=pos * per)
+            patient_end_dt = patient_start_dt + timedelta(minutes=WINDOW_WIDTH_MINUTES)
             expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
             eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60))
     elif appt.get("slot") and appt.get("slot") != "Walk-in":
@@ -1414,21 +1426,11 @@ async def calculate_appointment_eta(appt: dict) -> dict:
     elif not reason_clean.endswith("."):
         reason_clean = f"{reason_clean}."
 
-    if session_status in ("unavailable",):
-        delay_notice = "Doctor unavailable — estimate pending. डॉक्टर फिलहाल उपलब्ध नहीं हैं — समय की प्रतीक्षा है।"
-    elif return_time_unconfirmed or is_delayed_awaited:
-        # Unknown return time:
-        # “Doctor is attending an emergency. The consultation resume time is not yet confirmed. Your estimated turn time will update once the clinic confirms availability.”
-        delay_notice = (
-            f"{reason_clean} The consultation resume time is not yet confirmed. "
-            f"Your estimated turn time will update once the clinic confirms availability.\n"
-            f"Doctor delayed—updated time awaited. डॉक्टर के परामर्श शुरू होने में देरी है—नए समय की प्रतीक्षा है।"
-        )
-    elif is_delayed and expected_turn_time and expected_turn_time != "Calculating...":
-        # Known return time:
-        # “Doctor is attending an emergency.
-        # Expected consultation start: 11:30 AM.
-        # Your estimated turn: 12:10–12:20 PM.”
+    if session_status in ("unavailable",) or return_time_unconfirmed:
+        delay_notice = f"{reason_clean} Doctor abhi available nahi hain. Naya anumanit samay confirm hote hi update hoga"
+    elif start_time_unconfirmed or (not has_consultation_occurred and is_delayed_awaited):
+        delay_notice = f"{reason_clean} Doctor ke consultation shuru karne ka samay abhi confirm nahi hai."
+    elif is_delayed and expected_turn_time and expected_turn_time not in ("Calculating...", "Consultation in progress."):
         exp_time_val = session.get("expected_start_time") or session.get("original_start_time") or "10:00 AM"
         delay_notice = (
             f"{reason_clean}\n"
@@ -1445,18 +1447,15 @@ async def calculate_appointment_eta(appt: dict) -> dict:
                 f"Your estimated turn: {expected_turn_time}."
             )
         else:
-            delay_notice = (
-                f"{reason_clean} The consultation resume time is not yet confirmed. "
-                f"Your estimated turn time will update once the clinic confirms availability."
-            )
+            delay_notice = f"{reason_clean} Doctor abhi available nahi hain. Naya anumanit samay confirm hote hi update hoga"
     elif is_estimate_pending:
-        delay_notice = "Doctor unavailable — estimate pending. डॉक्टर फिलहाल उपलब्ध नहीं हैं — समय की प्रतीक्षा है।"
+        delay_notice = "Doctor abhi available nahi hain. Naya anumanit samay confirm hote hi update hoga"
 
     eta_label = expected_turn_time
     if expected_turn_time and ("AM" in expected_turn_time or "PM" in expected_turn_time):
         eta_label = f"Estimated {expected_turn_time}"
 
-    doctor_availability = "delayed_time_awaited" if return_time_unconfirmed else ("delayed" if is_delayed else doc_status)
+    doctor_availability = "delayed_time_awaited" if (return_time_unconfirmed or start_time_unconfirmed) else ("delayed" if is_delayed else doc_status)
 
     return {
         "your_token": appt.get("token_number"),
@@ -1473,10 +1472,13 @@ async def calculate_appointment_eta(appt: dict) -> dict:
         "doctor_status": doc_status,
         "doctor_availability": doctor_availability,
         "session_status": session_status,
+        "doctor_in_cabin": bool(session.get("doctor_in_cabin")),
+        "cabin_entered_at": session.get("cabin_entered_at"),
         "original_start_time": session.get("original_start_time"),
         "expected_start_time": session.get("expected_start_time"),
         "actual_start_time": session.get("actual_start_time"),
         "delay_reason": session.get("delay_reason"),
+        "start_time_unconfirmed": start_time_unconfirmed,
         "return_time_unconfirmed": return_time_unconfirmed,
         "is_delayed": is_delayed,
         "is_delayed_awaited": is_delayed_awaited,
@@ -3539,6 +3541,40 @@ async def get_doctor_session(
     }
 
 
+@api_router.post("/doctor/{doctor_id}/session/cabin-presence")
+async def update_cabin_presence(
+    doctor_id: str,
+    body: CabinPresenceBody,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer"))
+):
+    """Doctor or receptionist records whether doctor is physically in cabin (distinct from starting consultations)."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+    session_date = body.date or get_ist_now().strftime("%Y-%m-%d")
+    session = await get_or_create_doctor_session(doctor_id, session_date)
+
+    now_time = now_iso()
+    time_12 = format_ist_12hr()
+    update_fields = {
+        "doctor_in_cabin": body.doctor_in_cabin,
+        "cabin_entered_at": time_12 if body.doctor_in_cabin else None,
+        "updated_at": now_time,
+    }
+    updated = await db.doctor_sessions.find_one_and_update(
+        {"id": session["id"]},
+        {"$set": update_fields, "$inc": {"version": 1}},
+        return_document=pymongo.ReturnDocument.AFTER,
+    )
+    await broadcast_doctor_update(doctor_id, "cabin_presence_update")
+    if updated and "_id" in updated:
+        del updated["_id"]
+    return {
+        "ok": True,
+        "doctor_in_cabin": body.doctor_in_cabin,
+        "cabin_entered_at": update_fields["cabin_entered_at"],
+        "session": updated
+    }
+
+
 @api_router.post("/doctor/{doctor_id}/session/adjust-timing")
 async def adjust_doctor_timing(
     doctor_id: str,
@@ -3556,8 +3592,9 @@ async def adjust_doctor_timing(
 
     # Determine revised expected start time
     current_expected = session.get("expected_start_time") or session.get("original_start_time") or "10:00 AM"
+    is_unconfirmed = bool(body.return_time_unconfirmed or body.start_time_unconfirmed)
 
-    if body.return_time_unconfirmed:
+    if is_unconfirmed:
         revised_start_time = None
     elif body.delay_minutes:
         # Shortcut: +15, +30, +60 minutes from original start time to avoid compounding repeatedly
@@ -3589,8 +3626,9 @@ async def adjust_doctor_timing(
     # Prepare audit history entry
     history_entry = {
         "previous_time": current_expected,
-        "revised_time": revised_start_time if not body.return_time_unconfirmed else "Return time not confirmed",
-        "return_time_unconfirmed": bool(body.return_time_unconfirmed),
+        "revised_time": revised_start_time if not is_unconfirmed else "Return/Start time not confirmed",
+        "return_time_unconfirmed": is_unconfirmed,
+        "start_time_unconfirmed": bool(body.start_time_unconfirmed),
         "reason": body.reason,
         "changed_by": user.get("id"),
         "changed_by_name": user.get("full_name") or user.get("email"),
@@ -3601,11 +3639,14 @@ async def adjust_doctor_timing(
     # Atomically update session document
     update_fields: dict = {
         "delay_reason": body.reason,
-        "return_time_unconfirmed": bool(body.return_time_unconfirmed),
+        "return_time_unconfirmed": is_unconfirmed,
+        "start_time_unconfirmed": bool(body.start_time_unconfirmed),
         "updated_at": now_iso(),
     }
-    if not body.return_time_unconfirmed:
+    if not is_unconfirmed:
         update_fields["expected_start_time"] = revised_start_time
+    else:
+        update_fields["expected_start_time"] = None
 
     update_res = await db.doctor_sessions.find_one_and_update(
         {"id": session["id"], "version": current_version},
@@ -3649,7 +3690,7 @@ async def adjust_doctor_timing(
     if update_res and "_id" in update_res:
         del update_res["_id"]
 
-    msg = "Doctor availability updated — return time not confirmed" if body.return_time_unconfirmed else f"Doctor expected start time updated to {revised_start_time}"
+    msg = "Doctor availability updated — return/start time not confirmed" if is_unconfirmed else f"Doctor expected start time updated to {revised_start_time}"
 
     return {
         "ok": True,
@@ -4215,7 +4256,7 @@ async def complete_consultation(body: QueueActionBody, user: dict = Depends(requ
             {"$set": {"status": "completed", "updated_at": now}}
         )
 
-    await broadcast_doctor_update(appt["doctor_id"], "completed")
+    await broadcast_doctor_update(appt["doctor_id"], "completed", notify_completed_appt_id=appt["id"])
     asyncio.create_task(notify_queue_movement(appt["doctor_id"]))
     return {"ok": True}
 

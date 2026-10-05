@@ -88,26 +88,26 @@ async def test_first_token_10_minute_window_and_20_minute_subsequent(mock_db, mo
     ]
     mock_db.appointments.find.return_value = MockCursor(appts)
 
-    # Token 1 (first eligible waiting): exactly 10 min window: 12:00 PM – 12:10 PM
+    # Token 1 (first eligible waiting): exactly 30 min rolling window: 12:00 PM – 12:30 PM
     eta1 = await calculate_appointment_eta(appts[0])
-    assert eta1["expected_turn_time"] == "12:00 PM – 12:10 PM"
+    assert eta1["expected_turn_time"] == "12:00 PM – 12:30 PM"
     assert eta1["my_position"] == 1
 
-    # Token 2: 20 min gap window: 12:10 PM – 12:30 PM
+    # Token 2 (interval 20m): 12:20 PM – 12:50 PM
     eta2 = await calculate_appointment_eta(appts[1])
-    assert eta2["expected_turn_time"] == "12:10 PM – 12:30 PM"
+    assert eta2["expected_turn_time"] == "12:20 PM – 12:50 PM"
     assert eta2["my_position"] == 2
 
-    # Token 3: 20 min gap window: 12:30 PM – 12:50 PM
+    # Token 3 (interval 20m): 12:40 PM – 1:10 PM
     eta3 = await calculate_appointment_eta(appts[2])
-    assert eta3["expected_turn_time"] == "12:30 PM – 12:50 PM"
+    assert eta3["expected_turn_time"] == "12:40 PM – 1:10 PM"
     assert eta3["my_position"] == 3
 
 
 @pytest.mark.asyncio
 async def test_doctor_starting_30_minutes_late(mock_db, monkeypatch):
     """Requirement 2 & 4: Doctor delay of 30 minutes (starts at 12:30 PM):
-    First token shows 12:30 PM–12:40 PM, subsequent shows 12:40 PM–1:00 PM.
+    Every token gets a 30-minute window with 20-minute patient intervals.
     """
     tz_ist = timezone(timedelta(hours=5, minutes=30))
     fixed_now = datetime(2026, 10, 5, 12, 10, 0, tzinfo=tz_ist)
@@ -141,17 +141,17 @@ async def test_doctor_starting_30_minutes_late(mock_db, monkeypatch):
     mock_db.appointments.find.return_value = MockCursor(appts)
 
     eta1 = await calculate_appointment_eta(appts[0])
-    assert eta1["expected_turn_time"] == "12:30 PM – 12:40 PM"
+    assert eta1["expected_turn_time"] == "12:30 PM – 1:00 PM"
     assert eta1["is_delayed"] is True
 
     eta2 = await calculate_appointment_eta(appts[1])
-    assert eta2["expected_turn_time"] == "12:40 PM – 1:00 PM"
+    assert eta2["expected_turn_time"] == "12:50 PM – 1:20 PM"
 
 
 @pytest.mark.asyncio
 async def test_token1_cancellation_advances_initial_window_to_token2(mock_db, monkeypatch):
     """Requirement 4 & 7: If token 1 is cancelled before consultation starts,
-    initial 10-minute window applies to token 2.
+    initial 30-minute window applies to token 2.
     """
     tz_ist = timezone(timedelta(hours=5, minutes=30))
     fixed_now = datetime(2026, 10, 5, 11, 50, 0, tzinfo=tz_ist)
@@ -184,22 +184,22 @@ async def test_token1_cancellation_advances_initial_window_to_token2(mock_db, mo
     ]
     mock_db.appointments.find.return_value = MockCursor(appts)
 
-    # Token 2 is now first eligible waiting token: gets 12:00 PM – 12:10 PM
+    # Token 2 is now first eligible waiting token: gets 12:00 PM – 12:30 PM
     eta2 = await calculate_appointment_eta(appts[1])
-    assert eta2["expected_turn_time"] == "12:00 PM – 12:10 PM"
+    assert eta2["expected_turn_time"] == "12:00 PM – 12:30 PM"
     assert eta2["my_position"] == 1
 
-    # Token 3 is second eligible waiting token: gets 12:10 PM – 12:30 PM
+    # Token 3 is second eligible waiting token: gets 12:20 PM – 12:50 PM
     eta3 = await calculate_appointment_eta(appts[2])
-    assert eta3["expected_turn_time"] == "12:10 PM – 12:30 PM"
+    assert eta3["expected_turn_time"] == "12:20 PM – 12:50 PM"
     assert eta3["my_position"] == 2
 
 
 @pytest.mark.asyncio
 async def test_session_pause_and_resume(mock_db, monkeypatch):
     """Requirement 2 & 3:
-    - Pausing without resume time shows "Doctor paused — resume time awaited" and is_estimate_pending = True.
-    - Pausing with resume time recalculates slots from resume time (10 min for first waiting, 20 min subsequent).
+    - Pausing without resume time shows "Doctor abhi available nahi hain..." and is_estimate_pending = True.
+    - Pausing with resume time recalculates 30-minute windows from resume time.
     """
     tz_ist = timezone(timedelta(hours=5, minutes=30))
     fixed_now = datetime(2026, 10, 5, 13, 0, 0, tzinfo=tz_ist)
@@ -228,7 +228,7 @@ async def test_session_pause_and_resume(mock_db, monkeypatch):
     mock_db.appointments.find.return_value = MockCursor(appts)
 
     eta_paused = await calculate_appointment_eta(appts[0])
-    assert "Doctor paused" in eta_paused["expected_turn_time"]
+    assert "Doctor abhi available nahi hain" in eta_paused["expected_turn_time"]
     assert eta_paused["is_estimate_pending"] is True
 
     # Case B: Paused with resume time 2:00 PM (14:00)
@@ -246,10 +246,10 @@ async def test_session_pause_and_resume(mock_db, monkeypatch):
     mock_db.appointments.find.return_value = MockCursor(appts2)
 
     eta_resumed1 = await calculate_appointment_eta(appts2[0])
-    assert eta_resumed1["expected_turn_time"] == "2:00 PM – 2:10 PM"
+    assert eta_resumed1["expected_turn_time"] == "2:00 PM – 2:30 PM"
 
     eta_resumed2 = await calculate_appointment_eta(appts2[1])
-    assert eta_resumed2["expected_turn_time"] == "2:10 PM – 2:30 PM"
+    assert eta_resumed2["expected_turn_time"] == "2:20 PM – 2:50 PM"
 
 
 @pytest.mark.asyncio

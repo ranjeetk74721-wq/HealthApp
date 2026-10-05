@@ -1,0 +1,23 @@
+# robots.txt for MeriBaari (https://www.meribaariapp.in)
+User-agent: *
+Allow: /
+Allow: /about
+Allow: /contact
+Allow: /privacy
+Allow: /terms
+Allow: /privacy-notice
+Allow: /login
+Allow: /staff-login
+
+# Protect private, patient, and staff dashboards from search crawlers
+Disallow: /patient/
+Disallow: /appointment/
+Disallow: /doctor/
+Disallow: /receptionist/
+Disallow: /owner/
+Disallow: /admin/
+Disallow: /otp
+Disallow: /hospital-auth
+Disallow: /api/
+
+Sitemap: https://www.meribaariapp.in/sitemap.xml

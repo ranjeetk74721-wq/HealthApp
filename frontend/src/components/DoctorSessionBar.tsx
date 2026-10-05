@@ -27,8 +27,24 @@ export default function DoctorSessionBar({
   const [pauseModalOpen, setPauseModalOpen] = useState(false);
   const [startingSession, setStartingSession] = useState(false);
   const [endingSession, setEndingSession] = useState(false);
+  const [togglingCabin, setTogglingCabin] = useState(false);
 
   if (!session) return null;
+
+  const handleToggleCabinPresence = async () => {
+    setTogglingCabin(true);
+    try {
+      await api.post(`/doctor/${doctorId}/session/cabin-presence`, {
+        date: session.date,
+        doctor_in_cabin: !session.doctor_in_cabin,
+      });
+      onRefresh();
+    } catch (err: any) {
+      Alert.alert("Error", err.message || "Failed to update cabin presence");
+    } finally {
+      setTogglingCabin(false);
+    }
+  };
 
   const status = session.status || "not_started";
   const origStart = session.original_start_time || "10:00 AM";
@@ -229,6 +245,15 @@ export default function DoctorSessionBar({
             </Text>
           </View>
         ) : null}
+
+        {session.doctor_in_cabin ? (
+          <View style={[styles.infoBlock, { backgroundColor: "#ECFDF5", paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 }]}>
+            <Text style={[styles.infoLabel, { color: "#065F46" }]}>Cabin Status</Text>
+            <Text style={[styles.infoVal, { color: "#059669", fontWeight: "700" }]}>
+              In Cabin{session.cabin_entered_at ? ` (${session.cabin_entered_at})` : ""}
+            </Text>
+          </View>
+        ) : null}
       </View>
 
       {/* Patient-Visible Delay / Pause Reason Banner */}
@@ -254,6 +279,40 @@ export default function DoctorSessionBar({
       {/* Action Buttons: Visible text label below every action icon matching its actual function */}
       {canEdit && status !== "completed" ? (
         <View style={styles.actionsRow}>
+          {/* Doctor in Cabin Toggle Button */}
+          <Pressable
+            testID="doctor-cabin-presence-btn"
+            onPress={handleToggleCabinPresence}
+            disabled={isBusy || togglingCabin}
+            style={[
+              styles.actionColBtn,
+              session.doctor_in_cabin
+                ? { backgroundColor: "#ECFDF5", borderColor: "#6EE7B7" }
+                : {},
+              (isBusy || togglingCabin) && { opacity: 0.6 },
+            ]}
+          >
+            {togglingCabin ? (
+              <ActivityIndicator size="small" color={session.doctor_in_cabin ? "#059669" : colors.brandPrimary} />
+            ) : (
+              <>
+                <Ionicons
+                  name={session.doctor_in_cabin ? "shield-checkmark" : "enter-outline"}
+                  size={20}
+                  color={session.doctor_in_cabin ? "#059669" : colors.brandPrimary}
+                />
+                <Text
+                  style={[
+                    styles.actionColLabel,
+                    session.doctor_in_cabin ? { color: "#059669", fontWeight: "700" } : {},
+                  ]}
+                >
+                  {session.doctor_in_cabin ? "Doctor In Cabin" : "Mark In Cabin"}
+                </Text>
+              </>
+            )}
+          </Pressable>
+
           {/* Adjust Doctor Timing Button */}
           <Pressable
             testID="adjust-doctor-timing-btn"

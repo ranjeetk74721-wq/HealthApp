@@ -69,6 +69,16 @@ export default function PatientHome() {
       return;
     }
     try {
+      // 1. Fetch user's active booking immediately without waiting for directory search
+      api.get("/appointments/me", { bypassCache: force })
+        .then((appts) => {
+          if (Array.isArray(appts)) {
+            const upcomingAppt = appts.find((a: any) => ["booked", "arrived", "in_consultation"].includes(a.status));
+            setUpcoming(upcomingAppt || null);
+          }
+        })
+        .catch(() => {});
+
       let doctorUrl = "/doctors";
       const params: string[] = [];
       if (debouncedSearch) params.push(`search=${encodeURIComponent(debouncedSearch)}`);
@@ -76,19 +86,16 @@ export default function PatientHome() {
       if (selectedHospital) params.push(`hospital_id=${encodeURIComponent(selectedHospital)}`);
       if (params.length) doctorUrl += `?${params.join("&")}`;
 
-      // Parallel data fetching
-      const [docs, specs, appts, hosps] = await Promise.all([
+      // Parallel data fetching for directory
+      const [docs, specs, hosps] = await Promise.all([
         api.get(doctorUrl, { bypassCache: force }),
         api.get("/specialties", { bypassCache: force }).catch(() => []),
-        api.get("/appointments/me", { bypassCache: force }),
         api.get("/hospitals", { bypassCache: force }).catch(() => []),
       ]);
       setDoctors(docs);
       const mappedSpecs = Array.isArray(specs) ? specs.map((s: any) => typeof s === "string" ? { name: s } : s) : [];
       setSpecialties(mappedSpecs);
       setHospitals(Array.isArray(hosps) ? hosps : []);
-      const upcomingAppt = appts.find((a: any) => ["booked", "arrived", "in_consultation"].includes(a.status));
-      setUpcoming(upcomingAppt || null);
       lastFetchedAt.current = Date.now();
     } catch (e: any) {
       if (e?.message && (e.message.includes("401") || e.message.includes("authenticated") || e.message.includes("expired"))) {
@@ -210,8 +217,19 @@ export default function PatientHome() {
 
         <Text style={styles.sectionTitle}>Available Doctors</Text>
 
-        {loading ? (
-          <ActivityIndicator color={colors.brand} style={{ marginTop: spacing.xl }} />
+        {loading && doctors.length === 0 ? (
+          <View style={{ gap: spacing.md, marginTop: spacing.sm }}>
+            {[1, 2, 3].map((key) => (
+              <View key={key} style={[styles.doctorCard, { opacity: 0.6 }]}>
+                <View style={[styles.doctorPhoto, { backgroundColor: "#E2E8F0" }]} />
+                <View style={{ flex: 1, gap: 8 }}>
+                  <View style={{ width: "60%", height: 16, backgroundColor: "#E2E8F0", borderRadius: 4 }} />
+                  <View style={{ width: "40%", height: 12, backgroundColor: "#F1F5F9", borderRadius: 4 }} />
+                  <View style={{ width: "80%", height: 12, backgroundColor: "#F1F5F9", borderRadius: 4 }} />
+                </View>
+              </View>
+            ))}
+          </View>
         ) : doctors.length === 0 ? (
           <View style={styles.empty}><Text style={styles.emptyText}>No doctors match your search</Text></View>
         ) : (
