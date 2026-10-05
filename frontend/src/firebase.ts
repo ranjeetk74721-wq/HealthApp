@@ -1,4 +1,5 @@
-import { initializeApp, getApps, getApp } from "firebase/app";
+// Lazy-loaded Firebase implementation to reduce initial bundle size.
+// Firebase modules (~400-500 KB) are only loaded when phone OTP is actually used.
 import { Platform } from "react-native";
 
 const firebaseConfig = {
@@ -22,18 +23,20 @@ export function getFirebaseConfig() {
   return { ...firebaseConfig };
 }
 
-export function getFirebaseApp(): any {
+// Lazy load Firebase App
+export async function getFirebaseApp(): Promise<any> {
   if (!isFirebaseConfigured()) return null;
+  const { initializeApp, getApps, getApp } = await import("firebase/app");
   return getApps().length ? getApp() : initializeApp(firebaseConfig as any);
 }
 
-export function getFirebaseAuth(): any {
+// Lazy load Firebase Auth
+export async function getFirebaseAuth(): Promise<any> {
   if (!isFirebaseConfigured()) return null;
   if (cachedAuth) return cachedAuth;
   try {
-    const app = getApps().length ? getApp() : initializeApp(firebaseConfig as any);
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { getAuth } = require("firebase/auth");
+    const app = await getFirebaseApp();
+    const { getAuth } = await import("firebase/auth");
     cachedAuth = getAuth(app);
     return cachedAuth;
   } catch (err) {
@@ -44,18 +47,19 @@ export function getFirebaseAuth(): any {
 
 /**
  * Sends an SMS OTP to the given full phone number (e.g. +919876543210) via Firebase Phone Auth.
+ * Lazy loads Firebase Auth modules on first use.
  */
 export async function sendFirebasePhoneOtp(
   phoneNumber: string,
   elementId: string = "recaptcha-container"
 ): Promise<any> {
-  const auth = getFirebaseAuth();
+  const auth = await getFirebaseAuth();
   if (!auth) {
     throw new Error("Firebase is not configured. Please set Firebase environment variables.");
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { signInWithPhoneNumber, RecaptchaVerifier } = require("firebase/auth");
+  // Lazy load Firebase Auth phone modules
+  const { signInWithPhoneNumber, RecaptchaVerifier } = await import("firebase/auth");
 
   // Set up reCAPTCHA verifier on Web
   if (Platform.OS === "web") {
