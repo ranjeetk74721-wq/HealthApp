@@ -1,0 +1,6 @@
+python311.zip
+.
+site-packages
+Lib/site-packages
+import site
+

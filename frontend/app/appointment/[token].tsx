@@ -154,7 +154,11 @@ export default function DynamicAppointmentScreen() {
           timerRef.current = null;
         }
       };
-      ws.onmessage = () => {
+      ws.onmessage = (e: any) => {
+        try {
+          const msg = typeof e?.data === "string" ? JSON.parse(e.data) : e?.data;
+          if (msg?.type === "ping" || msg?.type === "pong" || msg?.type === "connected") return;
+        } catch {}
         if (isMounted.current) loadAppointment(true);
       };
       ws.onerror = () => {
