@@ -236,9 +236,16 @@ async def ensure_db_indexes():
             db.doctor_sessions.create_index([("id", 1)], unique=True),
             db.doctor_sessions.create_index([("doctor_id", 1), ("date", 1)]),
             db.doctor_sessions.create_index([("hospital_id", 1), ("date", 1)]),
-            # token sequences: atomic sequential numbering per hospital, doctor, and date
+            # token sequences: atomic sequential numbering per hospital, doctor, date, and session
             db.token_sequences.create_index([("id", 1)], unique=True),
             db.token_sequences.create_index([("hospital_id", 1), ("doctor_id", 1), ("date", 1)]),
+            # clinic_sessions: named consultation sessions per doctor per date (multi-session support)
+            db.clinic_sessions.create_index([("id", 1)], unique=True),
+            db.clinic_sessions.create_index([("doctor_id", 1), ("date", 1)]),
+            db.clinic_sessions.create_index([("hospital_id", 1), ("date", 1)]),
+            db.clinic_sessions.create_index([("doctor_id", 1), ("date", 1), ("session_number", 1)], unique=True),
+            # appointments: add session_id index for multi-session filtering
+            db.appointments.create_index([("doctor_id", 1), ("date", 1), ("session_id", 1), ("status", 1)]),
         )
     except Exception:
         pass
@@ -339,6 +346,7 @@ class AppointmentCreate(BaseModel):
     date: str  # YYYY-MM-DD
     slot: Optional[str] = "Token Booking"  # optional for backward compatibility
     payment_method: str = "pay_at_clinic"  # or "online"
+    session_id: Optional[str] = None  # clinic_sessions.id — if None, uses or creates default session
 
 
 class Appointment(BaseModel):
@@ -397,6 +405,7 @@ class DoctorTimingAdjustBody(BaseModel):
     expected_version: Optional[int] = None
     return_time_unconfirmed: Optional[bool] = False  # When True, return/delay time is unconfirmed
     start_time_unconfirmed: Optional[bool] = False  # When True, doctor consultation start time is not yet confirmed
+    session_id: Optional[str] = None  # clinic session ID for multi-session
 
 
 class CabinPresenceBody(BaseModel):
@@ -406,20 +415,24 @@ class CabinPresenceBody(BaseModel):
 
 class DoctorSessionStartBody(BaseModel):
     date: Optional[str] = None
+    session_id: Optional[str] = None  # clinic session ID for multi-session
 
 
 class DoctorSessionPauseBody(BaseModel):
     date: Optional[str] = None
     expected_resume_time: Optional[str] = None
     pause_reason: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class DoctorSessionResumeBody(BaseModel):
     date: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class DoctorSessionEndBody(BaseModel):
     date: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class DoctorAvailabilityBody(BaseModel):
@@ -465,6 +478,31 @@ class AddPatientBody(BaseModel):
     slot: Optional[str] = None
     date: Optional[str] = None  # YYYY-MM-DD, defaults to today
     payment_method: Optional[str] = "pay_at_clinic"
+    session_id: Optional[str] = None  # clinic_sessions.id — for multi-session support
+
+
+# ── Multi-Session Models ──────────────────────────────────────────────────────
+
+class ClinicSessionCreateBody(BaseModel):
+    """Create a named consultation session for a doctor on a specific date."""
+    doctor_id: str
+    date: Optional[str] = None          # YYYY-MM-DD, defaults to today IST
+    session_name: Optional[str] = None  # e.g. "Morning Session", "Evening OPD"
+    start_time: str                      # e.g. "10:00 AM"
+    end_time: str                        # e.g. "02:00 PM"
+
+
+class ClinicSessionUpdateBody(BaseModel):
+    """Update a named consultation session."""
+    session_name: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+
+
+class ClinicSessionCompleteBody(BaseModel):
+    """Mark a session as completed and optionally auto-download Excel."""
+    session_id: str
+    force: Optional[bool] = False  # Force complete even if patients remain
 
 
 # ---- Owner: Doctor management models ----
@@ -1127,22 +1165,43 @@ class PushUnsubscribeBody(BaseModel):
 
 async def allocate_next_token(hospital_id: Optional[str], doctor_id: str, appt_date: str) -> int:
     """
-    Atomically allocates sequential token (starting from 1) for a doctor on a specific date in Asia/Kolkata timezone.
-    Guarantees no duplicate tokens during simultaneous online bookings and walk-ins.
+    Atomically allocates sequential token (starting from 1) for a doctor on a specific date.
+    Used for backward-compatible (single-session) bookings. Delegates to per-session allocator with no session.
+    """
+    return await allocate_next_token_for_session(hospital_id, doctor_id, appt_date, session_id=None)
+
+
+async def allocate_next_token_for_session(
+    hospital_id: Optional[str],
+    doctor_id: str,
+    appt_date: str,
+    session_id: Optional[str],
+) -> int:
+    """
+    Atomically allocates a per-session sequential token starting at #1.
+    - If session_id is provided: tokens are isolated to that session (start fresh at #1).
+    - If session_id is None: falls back to the legacy per-day sequence (backward compat).
+    Guarantees no duplicates during simultaneous bookings via find_one_and_update + upsert.
     """
     if not hospital_id:
         doc = await db.doctors.find_one({"id": doctor_id}, {"_id": 0, "hospital_id": 1})
         hospital_id = (doc or {}).get("hospital_id") or "default"
 
-    seq_id = f"{hospital_id}_{doctor_id}_{appt_date}"
+    # Key includes session_id for per-session isolation; None → legacy per-day key
+    if session_id:
+        seq_id = f"{hospital_id}_{doctor_id}_{appt_date}_{session_id}"
+    else:
+        seq_id = f"{hospital_id}_{doctor_id}_{appt_date}"
 
-    # If sequence document does not exist, initialize last_token from existing max token in appointments
+    # Seed from existing max token in this session (safe for reopened sessions)
     existing_seq = await db.token_sequences.find_one({"id": seq_id})
     if existing_seq is None:
-        max_appt = await db.appointments.find(
-            {"doctor_id": doctor_id, "date": appt_date},
-            {"token_number": 1}
-        ).sort("token_number", -1).to_list(1)
+        filter_q: dict = {"doctor_id": doctor_id, "date": appt_date}
+        if session_id:
+            filter_q["session_id"] = session_id
+        else:
+            filter_q["session_id"] = {"$in": [None, ""]}  # legacy appointments have no session_id
+        max_appt = await db.appointments.find(filter_q, {"token_number": 1}).sort("token_number", -1).to_list(1)
         initial_val = max_appt[0]["token_number"] if max_appt and max_appt[0].get("token_number") else 0
         try:
             await db.token_sequences.update_one(
@@ -1152,6 +1211,7 @@ async def allocate_next_token(hospital_id: Optional[str], doctor_id: str, appt_d
                     "hospital_id": hospital_id,
                     "doctor_id": doctor_id,
                     "date": appt_date,
+                    "session_id": session_id,
                     "last_token": initial_val,
                     "created_at": now_iso(),
                 }},
@@ -1167,6 +1227,81 @@ async def allocate_next_token(hospital_id: Optional[str], doctor_id: str, appt_d
         return_document=pymongo.ReturnDocument.AFTER,
     )
     return int(res.get("last_token", 1))
+
+
+# ── Clinic Session (multi-session) helpers ────────────────────────────────────
+
+async def get_or_create_default_clinic_session(doctor_id: str, date: str, hospital_id: Optional[str] = None) -> dict:
+    """
+    Returns the first/default clinic session for a doctor+date.
+    Creates a default session if none exists (preserves backward compatibility for existing doctors).
+    """
+    existing = await db.clinic_sessions.find_one(
+        {"doctor_id": doctor_id, "date": date},
+        {"_id": 0},
+        sort=[("session_number", 1)],
+    )
+    if existing:
+        return existing
+
+    # First access — auto-create a default session from the doctor's configured timings
+    doctor = await db.doctors.find_one({"id": doctor_id}, {"_id": 0, "timings": 1, "hospital_id": 1, "full_name": 1})
+    timings_str = (doctor or {}).get("timings", "10:00 AM - 6:00 PM")
+    h_id = hospital_id or (doctor or {}).get("hospital_id") or "default"
+
+    # Extract start/end from timings like "10:00 AM - 4:00 PM"
+    start_time = extract_session_start_time(timings_str)
+    end_time = "6:00 PM"
+    parts = re.split(r"\s*[-–]\s*", timings_str)
+    if len(parts) >= 2:
+        raw_end = parts[-1].strip()
+        parsed_end = parse_time_to_ist_dt(date, raw_end)
+        if parsed_end:
+            end_time = format_12hr_time(parsed_end)
+
+    session_id = str(uuid.uuid4())
+    default_session = {
+        "id": session_id,
+        "doctor_id": doctor_id,
+        "hospital_id": h_id,
+        "date": date,
+        "session_number": 1,
+        "session_name": "Morning OPD",
+        "start_time": start_time,
+        "end_time": end_time,
+        "status": "not_started",
+        "actual_start_time": None,
+        "actual_end_time": None,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    try:
+        await db.clinic_sessions.update_one(
+            {"doctor_id": doctor_id, "date": date, "session_number": 1},
+            {"$setOnInsert": default_session},
+            upsert=True,
+        )
+    except Exception:
+        pass
+    saved = await db.clinic_sessions.find_one(
+        {"doctor_id": doctor_id, "date": date, "session_number": 1}, {"_id": 0}
+    )
+    return saved or default_session
+
+
+async def resolve_clinic_session_id(doctor_id: str, date: str, session_id: Optional[str], hospital_id: Optional[str] = None) -> Optional[str]:
+    """
+    If session_id is explicitly given, return it (after verifying it exists).
+    Otherwise return the default (first) session's ID for that doctor+date.
+    Returns None only if no sessions exist and default creation fails.
+    """
+    if session_id:
+        sess = await db.clinic_sessions.find_one({"id": session_id, "doctor_id": doctor_id})
+        if not sess:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        return session_id
+    default = await get_or_create_default_clinic_session(doctor_id, date, hospital_id)
+    return default.get("id")
 
 
 async def get_or_create_doctor_session(doctor_id: str, date: str) -> dict:
@@ -2899,25 +3034,39 @@ async def create_appointment(
     # Server-side rate limiting (IP and mobile separately)
     enforce_booking_rate_limit(request, patient_mobile)
 
-    # Server-side restriction: A single verified patient mobile number can book only ONE appointment within the same calendar day
+    # Server-side restriction: patient can book one appointment per session per day
+    # (multi-session: same patient can book different sessions on same day)
+    resolved_session_id = await resolve_clinic_session_id(body.doctor_id, body.date, body.session_id, doctor.get("hospital_id"))
+
     or_clauses = [{"patient_id": user["id"]}]
     if patient_mobile:
         or_clauses.append({"patient_mobile": patient_mobile})
         or_clauses.append({"patient_phone": patient_mobile})
-    
-    existing_appointment = await db.appointments.find_one({
+
+    dup_filter: dict = {
         "$or": or_clauses,
         "date": body.date,
-        "status": {"$in": ["booked", "arrived", "in_consultation", "completed", "skipped"]}
-    })
+        "status": {"$in": ["booked", "arrived", "in_consultation", "completed", "skipped"]},
+    }
+    if resolved_session_id:
+        dup_filter["session_id"] = resolved_session_id
+
+    existing_appointment = await db.appointments.find_one(dup_filter)
     if existing_appointment:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="You already have an active appointment for this doctor/session."
         )
 
-    # Atomically allocate sequential token number for this doctor and date
-    token_number = await allocate_next_token(doctor.get("hospital_id"), body.doctor_id, body.date)
+    # Fetch session name for display on patient screens
+    sess_name = None
+    if resolved_session_id:
+        cs = await db.clinic_sessions.find_one({"id": resolved_session_id}, {"_id": 0, "session_name": 1})
+        if cs:
+            sess_name = cs.get("session_name")
+
+    # Atomically allocate per-session sequential token
+    token_number = await allocate_next_token_for_session(doctor.get("hospital_id"), body.doctor_id, body.date, resolved_session_id)
     appt_id = str(uuid.uuid4())
     secure_token = secrets.token_urlsafe(16)
     doc = {
@@ -2932,6 +3081,8 @@ async def create_appointment(
         "patient_address": user.get("address"),
         "date": body.date,
         "slot": body.slot,
+        "session_id": resolved_session_id,
+        "session_name": sess_name,
         "token_number": token_number,
         "status": "booked",
         "payment_method": body.payment_method,
@@ -3542,7 +3693,515 @@ async def get_doctor_session(
     }
 
 
-@api_router.post("/doctor/{doctor_id}/session/cabin-presence")
+# ============ CLINIC SESSIONS (MULTI-SESSION) ============
+
+@api_router.get("/doctor/{doctor_id}/clinic-sessions")
+async def list_clinic_sessions(
+    doctor_id: str,
+    date: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """List all named consultation sessions for a doctor on a given date."""
+    await verify_doctor_session_access(doctor_id, user, write=False)
+    session_date = date or get_ist_now().strftime("%Y-%m-%d")
+
+    # Ensure at least the default session exists
+    await get_or_create_default_clinic_session(doctor_id, session_date)
+
+    sessions = await db.clinic_sessions.find(
+        {"doctor_id": doctor_id, "date": session_date},
+        {"_id": 0},
+    ).sort("session_number", 1).to_list(20)
+
+    # Enrich each session with live patient counts
+    for s in sessions:
+        sid = s["id"]
+        s["waiting_count"] = await db.appointments.count_documents({
+            "doctor_id": doctor_id, "date": session_date,
+            "session_id": sid, "status": {"$in": ["booked", "arrived"]},
+        })
+        s["in_consultation_count"] = await db.appointments.count_documents({
+            "doctor_id": doctor_id, "date": session_date,
+            "session_id": sid, "status": "in_consultation",
+        })
+        s["completed_count"] = await db.appointments.count_documents({
+            "doctor_id": doctor_id, "date": session_date,
+            "session_id": sid, "status": "completed",
+        })
+        s["total_count"] = await db.appointments.count_documents({
+            "doctor_id": doctor_id, "date": session_date,
+            "session_id": sid, "status": {"$nin": ["cancelled"]},
+        })
+        # Pull the linked doctor_session timing/delay data
+        doctor_sess = await db.doctor_sessions.find_one(
+            {"id": f"{doctor_id}_{session_date}_{sid}"}, {"_id": 0}
+        )
+        if not doctor_sess:
+            # Fallback to legacy single-session record
+            doctor_sess = await db.doctor_sessions.find_one(
+                {"id": f"{doctor_id}_{session_date}"}, {"_id": 0}
+            )
+        s["doctor_session"] = doctor_sess
+
+    return {"ok": True, "sessions": sessions, "date": session_date}
+
+
+@api_router.post("/doctor/{doctor_id}/clinic-sessions")
+async def create_clinic_session(
+    doctor_id: str,
+    body: ClinicSessionCreateBody,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer")),
+):
+    """Create a new named consultation session for a doctor on a specific date."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+    session_date = body.date or get_ist_now().strftime("%Y-%m-%d")
+
+    # Validate times
+    start_dt = parse_time_to_ist_dt(session_date, body.start_time)
+    end_dt = parse_time_to_ist_dt(session_date, body.end_time)
+    if not start_dt:
+        raise HTTPException(status_code=400, detail=f"Invalid start_time: '{body.start_time}'. Use 12-hr format e.g. '03:00 PM'")
+    if not end_dt:
+        raise HTTPException(status_code=400, detail=f"Invalid end_time: '{body.end_time}'. Use 12-hr format e.g. '06:00 PM'")
+    if end_dt <= start_dt:
+        raise HTTPException(status_code=400, detail="end_time must be after start_time")
+
+    start_fmt = format_12hr_time(start_dt)
+    end_fmt = format_12hr_time(end_dt)
+
+    # Check for overlapping sessions
+    existing_sessions = await db.clinic_sessions.find(
+        {"doctor_id": doctor_id, "date": session_date, "status": {"$ne": "cancelled"}},
+        {"_id": 0},
+    ).to_list(20)
+
+    for es in existing_sessions:
+        es_start = parse_time_to_ist_dt(session_date, es.get("start_time", ""))
+        es_end = parse_time_to_ist_dt(session_date, es.get("end_time", ""))
+        if es_start and es_end:
+            # Overlap: new session starts before existing ends AND ends after existing starts
+            if start_dt < es_end and end_dt > es_start:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Session times overlap with existing session '{es.get('session_name', 'Session')}' ({es.get('start_time')} – {es.get('end_time')}). Choose non-overlapping times."
+                )
+
+    # Determine session number (next available)
+    max_sess = await db.clinic_sessions.find_one(
+        {"doctor_id": doctor_id, "date": session_date},
+        {"_id": 0, "session_number": 1},
+        sort=[("session_number", -1)],
+    )
+    next_num = (max_sess.get("session_number", 0) if max_sess else 0) + 1
+
+    doctor = await db.doctors.find_one({"id": doctor_id}, {"_id": 0, "hospital_id": 1})
+    h_id = (doctor or {}).get("hospital_id") or user.get("hospital_id") or "default"
+
+    session_id = str(uuid.uuid4())
+    session_name = (body.session_name or f"Session {next_num}").strip()
+
+    new_session = {
+        "id": session_id,
+        "doctor_id": doctor_id,
+        "hospital_id": h_id,
+        "date": session_date,
+        "session_number": next_num,
+        "session_name": session_name,
+        "start_time": start_fmt,
+        "end_time": end_fmt,
+        "status": "not_started",
+        "actual_start_time": None,
+        "actual_end_time": None,
+        "created_by": user.get("id"),
+        "created_by_role": user.get("role"),
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+    try:
+        await db.clinic_sessions.insert_one(new_session)
+    except pymongo.errors.DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="A session with this number already exists for this doctor and date.")
+
+    new_session.pop("_id", None)
+
+    # Create the linked doctor_session timing record for this clinic session
+    timing_session_id = f"{doctor_id}_{session_date}_{session_id}"
+    timing_session = {
+        "id": timing_session_id,
+        "doctor_id": doctor_id,
+        "hospital_id": h_id,
+        "date": session_date,
+        "clinic_session_id": session_id,
+        "original_start_time": start_fmt,
+        "expected_start_time": start_fmt,
+        "actual_start_time": None,
+        "doctor_in_cabin": False,
+        "cabin_entered_at": None,
+        "start_time_unconfirmed": False,
+        "status": "not_started",
+        "delay_reason": None,
+        "return_time_unconfirmed": False,
+        "paused_at": None,
+        "expected_resume_time": None,
+        "pause_reason": None,
+        "version": 1,
+        "history": [],
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    try:
+        await db.doctor_sessions.update_one(
+            {"id": timing_session_id},
+            {"$setOnInsert": timing_session},
+            upsert=True,
+        )
+    except Exception:
+        pass
+
+    await broadcast_doctor_update(doctor_id, "session_created")
+    return {"ok": True, "session": new_session}
+
+
+@api_router.put("/doctor/{doctor_id}/clinic-sessions/{session_id}")
+async def update_clinic_session(
+    doctor_id: str,
+    session_id: str,
+    body: ClinicSessionUpdateBody,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer")),
+):
+    """Update name and/or times of an existing consultation session (only before it starts)."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+
+    existing = await db.clinic_sessions.find_one({"id": session_id, "doctor_id": doctor_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if existing.get("status") in ("in_consultation", "completed"):
+        raise HTTPException(status_code=400, detail="Cannot edit a session that is in progress or completed")
+
+    session_date = existing["date"]
+    updates: dict = {"updated_at": now_iso()}
+
+    if body.session_name is not None:
+        updates["session_name"] = body.session_name.strip()
+
+    new_start = existing["start_time"]
+    new_end = existing["end_time"]
+
+    if body.start_time:
+        start_dt = parse_time_to_ist_dt(session_date, body.start_time)
+        if not start_dt:
+            raise HTTPException(status_code=400, detail=f"Invalid start_time: '{body.start_time}'")
+        new_start = format_12hr_time(start_dt)
+        updates["start_time"] = new_start
+
+    if body.end_time:
+        end_dt = parse_time_to_ist_dt(session_date, body.end_time)
+        if not end_dt:
+            raise HTTPException(status_code=400, detail=f"Invalid end_time: '{body.end_time}'")
+        new_end = format_12hr_time(end_dt)
+        updates["end_time"] = new_end
+
+    # Re-validate overlap if times changed
+    if body.start_time or body.end_time:
+        sd = parse_time_to_ist_dt(session_date, new_start)
+        ed = parse_time_to_ist_dt(session_date, new_end)
+        if sd and ed and ed <= sd:
+            raise HTTPException(status_code=400, detail="end_time must be after start_time")
+        others = await db.clinic_sessions.find(
+            {"doctor_id": doctor_id, "date": session_date, "id": {"$ne": session_id}, "status": {"$ne": "cancelled"}},
+            {"_id": 0},
+        ).to_list(20)
+        for es in others:
+            es_s = parse_time_to_ist_dt(session_date, es.get("start_time", ""))
+            es_e = parse_time_to_ist_dt(session_date, es.get("end_time", ""))
+            if es_s and es_e and sd and ed:
+                if sd < es_e and ed > es_s:
+                    raise HTTPException(status_code=409, detail=f"Times overlap with '{es.get('session_name', 'Session')}' ({es.get('start_time')} – {es.get('end_time')})")
+
+    await db.clinic_sessions.update_one({"id": session_id}, {"$set": updates})
+
+    # Sync timing record start_time if changed
+    if body.start_time:
+        timing_id = f"{doctor_id}_{session_date}_{session_id}"
+        await db.doctor_sessions.update_one(
+            {"id": timing_id, "actual_start_time": None},
+            {"$set": {"original_start_time": new_start, "expected_start_time": new_start, "updated_at": now_iso()}},
+        )
+
+    updated = await db.clinic_sessions.find_one({"id": session_id}, {"_id": 0})
+    await broadcast_doctor_update(doctor_id, "session_updated")
+    return {"ok": True, "session": updated}
+
+
+@api_router.delete("/doctor/{doctor_id}/clinic-sessions/{session_id}")
+async def delete_clinic_session(
+    doctor_id: str,
+    session_id: str,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer")),
+):
+    """Delete a session (only if no appointments are booked in it)."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+
+    existing = await db.clinic_sessions.find_one({"id": session_id, "doctor_id": doctor_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if existing.get("status") in ("in_consultation", "completed"):
+        raise HTTPException(status_code=400, detail="Cannot delete a session that is in progress or completed")
+
+    booked_count = await db.appointments.count_documents({
+        "doctor_id": doctor_id, "session_id": session_id,
+        "status": {"$nin": ["cancelled"]},
+    })
+    if booked_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete session with {booked_count} active appointment(s). Cancel all appointments first."
+        )
+
+    await db.clinic_sessions.delete_one({"id": session_id})
+    await db.doctor_sessions.delete_one({"id": f"{doctor_id}_{existing['date']}_{session_id}"})
+    await broadcast_doctor_update(doctor_id, "session_deleted")
+    return {"ok": True, "deleted": session_id}
+
+
+@api_router.post("/doctor/{doctor_id}/clinic-sessions/{session_id}/complete")
+async def complete_clinic_session(
+    doctor_id: str,
+    session_id: str,
+    body: ClinicSessionCompleteBody,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer")),
+):
+    """
+    Complete a named consultation session.
+    - Checks for remaining waiting/in-consultation patients unless force=True.
+    - Marks session as completed and generates an Excel report.
+    - Returns the Excel as a streaming download.
+    """
+    await verify_doctor_session_access(doctor_id, user, write=True)
+
+    sess = await db.clinic_sessions.find_one({"id": session_id, "doctor_id": doctor_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if sess.get("status") == "completed":
+        raise HTTPException(status_code=400, detail="Session is already completed")
+
+    session_date = sess["date"]
+
+    # Check for unresolved patients
+    if not body.force:
+        unresolved = await db.appointments.count_documents({
+            "doctor_id": doctor_id,
+            "session_id": session_id,
+            "status": {"$in": ["booked", "arrived", "in_consultation"]},
+        })
+        if unresolved > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{unresolved} patient(s) are still waiting or in consultation. Use force=true to complete anyway, or resolve them first."
+            )
+
+    # Mark session completed
+    actual_end = format_ist_12hr()
+    await db.clinic_sessions.update_one(
+        {"id": session_id},
+        {"$set": {"status": "completed", "actual_end_time": actual_end, "updated_at": now_iso()}},
+    )
+
+    # Mark the linked doctor_session timing record completed
+    timing_id = f"{doctor_id}_{session_date}_{session_id}"
+    await db.doctor_sessions.update_one(
+        {"id": timing_id},
+        {"$set": {"status": "completed", "ended_at": now_iso(), "updated_at": now_iso()}, "$inc": {"version": 1}},
+    )
+
+    await broadcast_doctor_update(doctor_id, "session_completed")
+
+    # Generate and stream Excel report
+    return await _generate_session_excel(doctor_id, session_id, session_date, sess)
+
+
+@api_router.get("/doctor/{doctor_id}/clinic-sessions/{session_id}/export-excel")
+async def export_clinic_session_excel(
+    doctor_id: str,
+    session_id: str,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer")),
+):
+    """Download the Excel report for a specific session (usable for retry after completion)."""
+    await verify_doctor_session_access(doctor_id, user, write=False)
+
+    sess = await db.clinic_sessions.find_one({"id": session_id, "doctor_id": doctor_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session_date = sess["date"]
+    return await _generate_session_excel(doctor_id, session_id, session_date, sess)
+
+
+async def _generate_session_excel(doctor_id: str, session_id: str, session_date: str, sess: dict) -> Response:
+    """Internal: generate a session-specific .xlsx report and return as a streaming Response."""
+    import io
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    doc_obj = await db.doctors.find_one({"id": doctor_id}, {"_id": 0, "full_name": 1, "clinic_name": 1, "hospital_name": 1})
+    doc_name = (doc_obj or {}).get("full_name") or "Doctor"
+    clinic_name = (doc_obj or {}).get("hospital_name") or (doc_obj or {}).get("clinic_name") or "MeriBaari Clinic"
+    session_name = sess.get("session_name") or f"Session {sess.get('session_number', 1)}"
+
+    appts = await db.appointments.find(
+        {"doctor_id": doctor_id, "date": session_date, "session_id": session_id},
+        {"_id": 0},
+    ).sort([("token_number", 1)]).to_list(2000)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Session Report"
+
+    # Styles
+    header_fill = PatternFill(start_color="0F766E", end_color="0F766E", fill_type="solid")
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    meta_font = Font(name="Calibri", size=10, bold=True)
+    data_font = Font(name="Calibri", size=10)
+    center_align = Alignment(horizontal="center", vertical="center")
+    left_align = Alignment(horizontal="left", vertical="center")
+    thin_border = Border(
+        left=Side(style="thin", color="CBD5E1"), right=Side(style="thin", color="CBD5E1"),
+        top=Side(style="thin", color="CBD5E1"), bottom=Side(style="thin", color="CBD5E1"),
+    )
+
+    # Metadata rows
+    meta_rows = [
+        ["Clinic / Hospital", clinic_name],
+        ["Doctor", doc_name],
+        ["Date", session_date],
+        ["Session", session_name],
+        ["Scheduled Timing", f"{sess.get('start_time', '')} – {sess.get('end_time', '')}"],
+        ["Actual Start", sess.get("actual_start_time") or "—"],
+        ["Actual End", sess.get("actual_end_time") or "—"],
+        ["Session Status", str(sess.get("status", "")).replace("_", " ").title()],
+        ["Report Generated", format_ist_12hr()],
+        [],
+    ]
+    for row in meta_rows:
+        ws.append(row)
+        if row:
+            ws.cell(row=ws.max_row, column=1).font = meta_font
+
+    # Totals
+    statuses = [a.get("status", "") for a in appts]
+    totals = {
+        "Booked": statuses.count("booked"),
+        "Arrived": statuses.count("arrived"),
+        "In Consultation": statuses.count("in_consultation"),
+        "Completed": statuses.count("completed"),
+        "Skipped": statuses.count("skipped"),
+        "Cancelled": statuses.count("cancelled"),
+        "Total": len(appts),
+    }
+    ws.append(["Summary"] + [f"{k}: {v}" for k, v in totals.items()])
+    ws.cell(row=ws.max_row, column=1).font = meta_font
+    ws.append([])
+
+    headers = [
+        "Token #", "Patient Name", "Mobile Number", "Age", "Gender", "Address",
+        "Booking Source", "Status", "Slot", "Session",
+        "Booking Time", "Consultation Started", "Consultation Completed",
+        "Duration (min)", "Payment Method", "Payment Status", "Amount (₹)",
+        "Prescription", "Cancellation Time", "Cancellation Reason",
+    ]
+    ws.append(headers)
+    hdr_row = ws.max_row
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=hdr_row, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center_align
+
+    def calc_duration_min(start_val, end_val):
+        if not start_val or not end_val:
+            return ""
+        try:
+            def _parse(v):
+                s = str(v).strip()
+                if "T" in s:
+                    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                m = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)$", s, re.I)
+                if m:
+                    h, mi, mer = int(m.group(1)), int(m.group(2)), m.group(3).upper()
+                    if mer == "PM" and h < 12: h += 12
+                    if mer == "AM" and h == 12: h = 0
+                    return datetime(2000, 1, 1, h, mi)
+                return None
+            t1, t2 = _parse(start_val), _parse(end_val)
+            if t1 and t2:
+                return max(0, int((t2 - t1).total_seconds() / 60))
+        except Exception:
+            pass
+        return ""
+
+    if not appts:
+        ws.append(["No appointments found for this session"] + [""] * (len(headers) - 1))
+    else:
+        for r_idx, a in enumerate(appts, start=hdr_row + 1):
+            source = "Walk-in (Reception)" if (a.get("slot") == "Walk-in" or a.get("added_by_reception")) else "Online Booking"
+            status_label = str(a.get("status", "")).replace("_", " ").title()
+            start_v = a.get("consultation_started_at") or a.get("started_at") or ""
+            end_v = a.get("consultation_completed_at") or a.get("completed_at") or ""
+            dur = calc_duration_min(start_v, end_v)
+            row_data = [
+                a.get("token_number", ""),
+                a.get("patient_name", ""),
+                a.get("patient_mobile", ""),
+                a.get("age", ""),
+                a.get("gender", ""),
+                a.get("patient_address", ""),
+                source,
+                status_label,
+                a.get("slot", ""),
+                session_name,
+                a.get("created_at", ""),
+                start_v,
+                end_v,
+                dur,
+                a.get("payment_method", ""),
+                a.get("payment_status", ""),
+                a.get("payment_amount", ""),
+                a.get("prescription", ""),
+                a.get("cancelled_at", ""),
+                a.get("cancellation_reason", ""),
+            ]
+            ws.append(row_data)
+            row_fill = PatternFill(start_color="F8FAFC" if r_idx % 2 == 0 else "FFFFFF", fill_type="solid")
+            for c_idx in range(1, len(headers) + 1):
+                cell = ws.cell(row=r_idx, column=c_idx)
+                cell.font = data_font
+                cell.border = thin_border
+                cell.fill = row_fill
+                cell.alignment = center_align if c_idx in (1, 4, 5, 7, 8, 12, 13, 14, 15, 16, 17) else left_align
+
+    for col in ws.columns:
+        max_len = max((len(str(cell.value or "")) for cell in col), default=8)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 3, 40)
+
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+
+    clean_doc = re.sub(r"[^\w\-]", "_", doc_name)
+    clean_sess = re.sub(r"[^\w\-]", "_", session_name)
+    filename = f"Meribaari_{clean_doc}_{session_date}_{clean_sess}.xlsx"
+    return Response(
+        content=stream.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
 async def update_cabin_presence(
     doctor_id: str,
     body: CabinPresenceBody,
@@ -3635,9 +4294,15 @@ async def adjust_doctor_timing(
             )
         revised_start_time = format_12hr_time(parsed_dt)
     elif body.new_scheduled_start_time and not body.return_time_unconfirmed:
-        # Only scheduled start changed — sync expected_start_time to new scheduled start
-        # (no delay active unless reason is also provided)
-        revised_start_time = new_scheduled
+        # If an active delay was already set on the session, preserve the active delay delta from new scheduled start
+        orig_dt = parse_time_to_ist_dt(session_date, session.get("original_start_time") or "10:00 AM")
+        exp_dt = parse_time_to_ist_dt(session_date, session.get("expected_start_time") or "10:00 AM")
+        if orig_dt and exp_dt and exp_dt > orig_dt and session.get("delay_reason"):
+            delay_delta = int((exp_dt - orig_dt).total_seconds() / 60)
+            new_sched_dt = parse_time_to_ist_dt(session_date, new_scheduled)
+            revised_start_time = format_12hr_time(new_sched_dt + timedelta(minutes=delay_delta)) if new_sched_dt else new_scheduled
+        else:
+            revised_start_time = new_scheduled
     else:
         if not is_unconfirmed:
             raise HTTPException(status_code=400, detail="Either new_start_time, delay_minutes, new_scheduled_start_time, or return_time_unconfirmed is required")
@@ -4493,23 +5158,41 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
 
         appt_date = getattr(body, "date", None) or get_ist_now().strftime("%Y-%m-%d")
 
-        # Atomic duplicate check
-        existing_appointment = await db.appointments.find_one({
-            "$or": [
-                {"patient_id": patient_id},
-                {"patient_mobile": mobile},
-            ],
+        # Atomic duplicate check — scoped to session when session_id is provided
+        session_id_requested = getattr(body, "session_id", None)
+
+        # Resolve the clinic session (creates default if none exists)
+        resolved_session_id = await resolve_clinic_session_id(body.doctor_id, appt_date, session_id_requested, hosp_id)
+
+        # Check for existing appointment in same session (multi-session: patient may book other sessions)
+        dup_filter: dict = {
+            "$or": [{"patient_id": patient_id}, {"patient_mobile": mobile}],
             "date": appt_date,
             "status": {"$in": ["booked", "arrived", "in_consultation", "completed", "skipped"]},
-        })
+        }
+        if resolved_session_id:
+            dup_filter["session_id"] = resolved_session_id
+
+        existing_appointment = await db.appointments.find_one(dup_filter)
         if existing_appointment:
+            existing_sess_name = ""
+            if existing_appointment.get("session_id"):
+                es = await db.clinic_sessions.find_one({"id": existing_appointment["session_id"]}, {"_id": 0, "session_name": 1})
+                existing_sess_name = f" in {es.get('session_name', 'that session')}" if es else ""
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="This patient already has an active appointment for today."
+                detail=f"This patient already has an active appointment{existing_sess_name} for today."
             )
 
         hosp_id = user.get("hospital_id") or doctor.get("hospital_id")
-        token_number = await allocate_next_token(hosp_id, body.doctor_id, appt_date)
+        token_number = await allocate_next_token_for_session(hosp_id, body.doctor_id, appt_date, resolved_session_id)
+
+        # Fetch session name for display
+        sess_name = "Walk-in"
+        if resolved_session_id:
+            cs = await db.clinic_sessions.find_one({"id": resolved_session_id}, {"_id": 0, "session_name": 1, "start_time": 1, "end_time": 1})
+            if cs:
+                sess_name = cs.get("session_name") or "Walk-in"
         appt_id = str(uuid.uuid4())
         secure_token = secrets.token_urlsafe(16)
         appt = {
@@ -4523,7 +5206,9 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
             "patient_mobile": mobile,
             "patient_address": body.address,
             "date": appt_date,
-            "slot": body.slot or "Walk-in",
+            "slot": body.slot or sess_name,
+            "session_id": resolved_session_id,
+            "session_name": sess_name if resolved_session_id else None,
             "token_number": token_number,
             "status": "arrived",  # walk-in patient is already at clinic
             "payment_method": body.payment_method or "pay_at_clinic",
@@ -5294,6 +5979,13 @@ async def owner_update_doctor(doctor_id: str, body: OwnerUpdateDoctorBody, user:
 
     # Broadcast if wait-time-affecting field changed
     if "avg_consult_minutes" in updates or "timings" in updates or "fees" in updates or "status" in updates:
+        if "timings" in updates and updates["timings"]:
+            new_start = extract_session_start_time(updates["timings"])
+            today = get_ist_now().strftime("%Y-%m-%d")
+            await db.doctor_sessions.update_one(
+                {"doctor_id": d["id"], "date": today, "actual_start_time": None},
+                {"$set": {"original_start_time": new_start, "expected_start_time": new_start, "updated_at": now_iso()}}
+            )
         await broadcast_doctor_update(d["id"], "doctor_profile_updated")
 
     await audit(user["id"], "owner.update_doctor", target=d["id"])

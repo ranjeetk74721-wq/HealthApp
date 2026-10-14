@@ -11,6 +11,7 @@ import * as ImagePicker from "expo-image-picker";
 import { api } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
+import DoctorTimingAdjustmentModal from "@/src/components/DoctorTimingAdjustmentModal";
 
 const STALE_AFTER_MS = 30_000;
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024; // 5 MB limit
@@ -257,6 +258,26 @@ export default function OwnerDashboard() {
   }, [router, signOut, stats]);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
+
+  // Timing adjustment modal for admin
+  const [timingDoc, setTimingDoc] = useState<DocRow | null>(null);
+  const [timingSession, setTimingSession] = useState<any>(null);
+  const [timingModalOpen, setTimingModalOpen] = useState(false);
+  const [timingLoading, setTimingLoading] = useState(false);
+
+  const openTimingAdjustment = async (d: DocRow) => {
+    setTimingLoading(true);
+    try {
+      const sess = await api.get(`/doctor/${d.id}/session`);
+      setTimingDoc(d);
+      setTimingSession(sess);
+      setTimingModalOpen(true);
+    } catch (e: any) {
+      Alert.alert("Error", e.message || "Failed to load doctor session timing");
+    } finally {
+      setTimingLoading(false);
+    }
+  };
 
   const pickImage = async (setter: (v: string) => void) => {
     try {
@@ -776,6 +797,14 @@ export default function OwnerDashboard() {
                 </View>
               </View>
               <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+                <Pressable
+                  testID={`adjust-timing-${d.id}`}
+                  onPress={() => openTimingAdjustment(d)}
+                  style={[styles.iconActionBtn, { backgroundColor: "#FEF3C7" }]}
+                  hitSlop={8}
+                >
+                  <Ionicons name="time-outline" size={18} color="#D97706" />
+                </Pressable>
                 <Pressable testID={`edit-doc-${d.id}`} onPress={() => openEditDoctor(d)} style={[styles.iconActionBtn, { backgroundColor: colors.brandSecondary + "30" }]} hitSlop={8}>
                   <Ionicons name="create-outline" size={18} color={colors.brandPrimary} />
                 </Pressable>
@@ -1365,7 +1394,20 @@ export default function OwnerDashboard() {
                   </>
                 ) : null}
 
-                <View style={{ flexDirection: "row", gap: spacing.sm, marginTop: spacing.lg }}>
+                <Pressable
+                  testID="view-adjust-timing-btn"
+                  onPress={() => {
+                    const docToAdjust = viewDoc;
+                    setViewDoc(null);
+                    if (docToAdjust) openTimingAdjustment(docToAdjust);
+                  }}
+                  style={[styles.submitBtn, { backgroundColor: "#D97706", flexDirection: "row", justifyContent: "center", gap: 6, marginTop: spacing.md }]}
+                >
+                  <Ionicons name="time-outline" size={18} color="#fff" />
+                  <Text style={styles.submitBtnText}>Adjust Consultation Start & Delay</Text>
+                </Pressable>
+
+                <View style={{ flexDirection: "row", gap: spacing.sm, marginTop: spacing.sm }}>
                   <Pressable
                     onPress={() => {
                       const docToEdit = viewDoc;
@@ -1396,6 +1438,27 @@ export default function OwnerDashboard() {
           </Pressable>
         </Pressable>
       </Modal>
+
+      {/* ── Doctor Timing Adjustment Modal (Admin Panel) ── */}
+      {timingDoc && timingSession && (
+        <DoctorTimingAdjustmentModal
+          visible={timingModalOpen}
+          doctorId={timingDoc.id}
+          doctorName={timingDoc.full_name}
+          sessionData={timingSession}
+          affectedCount={timingDoc.todays_appts || 0}
+          onClose={() => {
+            setTimingModalOpen(false);
+            setTimingDoc(null);
+            setTimingSession(null);
+          }}
+          onSuccess={() => {
+            setToast(`Updated schedule for Dr. ${timingDoc.full_name}`);
+            load(true);
+            setTimeout(() => setToast(null), 3000);
+          }}
+        />
+      )}
     </SafeAreaView>
   );
 }
