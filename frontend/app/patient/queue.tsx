@@ -109,7 +109,11 @@ export default function PatientQueue() {
         // Clear fallback polling when WS is active — WS handles updates
         if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
       };
-      ws.onmessage = () => {
+      ws.onmessage = (e: any) => {
+        try {
+          const msg = typeof e?.data === "string" ? JSON.parse(e.data) : e?.data;
+          if (msg?.type === "ping" || msg?.type === "pong" || msg?.type === "connected") return;
+        } catch {}
         if (isFocused.current) load(true);
       };
       ws.onerror = () => setWsConnected(false);

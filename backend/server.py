@@ -1,4 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, Request, Response
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, Request, Response, Body
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
@@ -15,7 +16,7 @@ import hashlib
 import pymongo
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
-from typing import List, Optional, Literal, Dict, Any
+from typing import List, Optional, Literal, Dict, Any, Tuple
 import uuid
 from datetime import datetime, timezone, timedelta
 import bcrypt
@@ -127,6 +128,7 @@ _push_client = httpx.AsyncClient(
 )
 
 app = FastAPI()
+app.add_middleware(GZipMiddleware, minimum_size=500)  # Enable gzip compression for responses larger than 500 bytes
 
 app.add_middleware(
     CORSMiddleware,
@@ -347,6 +349,12 @@ class AppointmentCreate(BaseModel):
     slot: Optional[str] = "Token Booking"  # optional for backward compatibility
     payment_method: str = "pay_at_clinic"  # or "online"
     session_id: Optional[str] = None  # clinic_sessions.id — if None, uses or creates default session
+    booking_window_id: Optional[str] = None
+    slot_time: Optional[str] = None
+    patient_city: Optional[str] = None
+    patient_area: Optional[str] = None
+    patient_latitude: Optional[float] = None
+    patient_longitude: Optional[float] = None
 
 
 class Appointment(BaseModel):
@@ -448,6 +456,101 @@ class ReceptionRescheduleBody(BaseModel):
     new_slot: Optional[str] = "Walk-in"
 
 
+class LocationBookingWindow(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    start_time: str  # 12-hour AM/PM: e.g. "10:00 AM"
+    end_time: str    # 12-hour AM/PM: e.g. "11:00 AM"
+    category: str = "all"  # "local" | "distant" | "all"
+    max_bookings: Optional[int] = None  # None or 0 = unlimited capacity
+    description: Optional[str] = None
+
+
+class LocationEligibilityRule(BaseModel):
+    rule_type: str = "both"  # "radius" | "areas" | "both" | "none"
+    radius_km: Optional[float] = None  # Configured distance radius (e.g. 10.0 or 15.0 km)
+    local_areas: List[str] = Field(default_factory=list)  # e.g. ["Malviya Nagar", "Jaipur", "Mansarovar"]
+    distant_definition: str = "outside_local"  # "outside_local" = outside configured radius / areas
+
+
+class DoctorScheduleSessionCreate(BaseModel):
+    session_name: str  # e.g. "Session 1: Morning OPD"
+    clinic_id: Optional[str] = None
+    clinic_name: Optional[str] = None
+    clinic_address: Optional[str] = None
+    clinic_city: Optional[str] = None
+    clinic_latitude: Optional[float] = None
+    clinic_longitude: Optional[float] = None
+    
+    date_type: str = "recurring"  # "recurring" | "date"
+    date: Optional[str] = None    # "YYYY-MM-DD" if date_type == "date"
+    days_of_week: List[str] = Field(
+        default_factory=lambda: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    )
+    
+    start_time: str  # "10:00 AM"
+    end_time: str    # "02:00 PM"
+    booking_open_time: Optional[str] = None   # e.g. "08:00 AM"
+    booking_close_time: Optional[str] = None  # e.g. "01:30 PM"
+    
+    max_bookings: Optional[int] = None  # None or 0 = unlimited capacity
+    is_unlimited_capacity: bool = False
+    slot_duration_minutes: int = 15
+    patient_self_booking_enabled: bool = True
+    
+    location_rule: Optional[LocationEligibilityRule] = None
+    booking_windows: List[LocationBookingWindow] = Field(default_factory=list)
+
+
+class DoctorScheduleSessionUpdate(BaseModel):
+    session_name: Optional[str] = None
+    clinic_id: Optional[str] = None
+    clinic_name: Optional[str] = None
+    clinic_address: Optional[str] = None
+    clinic_city: Optional[str] = None
+    clinic_latitude: Optional[float] = None
+    clinic_longitude: Optional[float] = None
+    
+    date_type: Optional[str] = None
+    date: Optional[str] = None
+    days_of_week: Optional[List[str]] = None
+    
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    booking_open_time: Optional[str] = None
+    booking_close_time: Optional[str] = None
+    
+    max_bookings: Optional[int] = None
+    is_unlimited_capacity: Optional[bool] = None
+    slot_duration_minutes: Optional[int] = None
+    patient_self_booking_enabled: Optional[bool] = None
+    status: Optional[str] = None  # "active" | "closed" | "cancelled"
+    
+    location_rule: Optional[LocationEligibilityRule] = None
+    booking_windows: Optional[List[LocationBookingWindow]] = None
+
+
+class DoctorSessionDateOverrideBody(BaseModel):
+    date: str  # YYYY-MM-DD
+    status: Optional[str] = None  # "active" | "closed" | "cancelled"
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    max_bookings: Optional[int] = None
+    is_unlimited_capacity: Optional[bool] = None
+    reason: Optional[str] = None
+
+
+class RulePreviewRequest(BaseModel):
+    location_rule: LocationEligibilityRule
+    booking_windows: List[LocationBookingWindow] = Field(default_factory=list)
+    clinic_city: Optional[str] = None
+    clinic_latitude: Optional[float] = None
+    clinic_longitude: Optional[float] = None
+    test_patient_city: Optional[str] = None
+    test_patient_area: Optional[str] = None
+    test_patient_latitude: Optional[float] = None
+    test_patient_longitude: Optional[float] = None
+
+
 
 # ---- Mobile OTP Auth models ----
 class SendOTPBody(BaseModel):
@@ -479,6 +582,12 @@ class AddPatientBody(BaseModel):
     date: Optional[str] = None  # YYYY-MM-DD, defaults to today
     payment_method: Optional[str] = "pay_at_clinic"
     session_id: Optional[str] = None  # clinic_sessions.id — for multi-session support
+    booking_window_id: Optional[str] = None
+    slot_time: Optional[str] = None
+    patient_city: Optional[str] = None
+    patient_area: Optional[str] = None
+    patient_latitude: Optional[float] = None
+    patient_longitude: Optional[float] = None
 
 
 # ── Multi-Session Models ──────────────────────────────────────────────────────
@@ -1380,8 +1489,12 @@ async def get_or_create_doctor_session(doctor_id: str, date: str) -> dict:
 
 async def calculate_appointment_eta(appt: dict) -> dict:
     """Calculate live queue metrics and latest estimated turn time for an appointment."""
+    appt_session_id = appt.get("session_id")
+    appt_q = {"doctor_id": appt["doctor_id"], "date": appt["date"], "status": {"$ne": "cancelled"}}
+    if appt_session_id and not appt_session_id.endswith("_default"):
+        appt_q["session_id"] = appt_session_id
     all_appts = await db.appointments.find(
-        {"doctor_id": appt["doctor_id"], "date": appt["date"], "status": {"$ne": "cancelled"}},
+        appt_q,
         {"_id": 0},
     ).sort([("queue_order", 1), ("token_number", 1)]).to_list(500)
 
@@ -1482,6 +1595,11 @@ async def calculate_appointment_eta(appt: dict) -> dict:
                 eta_minutes = 0
         elif not has_consultation_occurred:
             exp_start_str = session.get("expected_start_time") or session.get("original_start_time") or "10:00 AM"
+            if appt_session_id and not appt_session_id.endswith("_default"):
+                custom_sess = await db.doctor_schedule_configs.find_one({"id": appt_session_id}, {"_id": 0, "start_time": 1, "date_overrides": 1})
+                if custom_sess:
+                    override_start = (custom_sess.get("date_overrides", {}).get(appt_date) or {}).get("start_time")
+                    exp_start_str = override_start or custom_sess.get("start_time") or exp_start_str
             start_dt = parse_time_to_ist_dt(appt_date, exp_start_str)
             if not start_dt:
                 start_dt = ist_now
@@ -3058,12 +3176,66 @@ async def create_appointment(
             detail="You already have an active appointment for this doctor/session."
         )
 
-    # Fetch session name for display on patient screens
+    # ── Session & location-based booking window validation ───────────────────
+    session_name = None
+    booking_window_category = None
+    clinic_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
+    slot_label = body.slot or "Token Booking"
+
+    if body.session_id and not body.session_id.endswith("_default"):
+        resolved_sessions = await resolve_doctor_sessions_for_date(
+            doctor_id=body.doctor_id,
+            target_date=body.date,
+            patient_city=body.patient_city,
+            patient_area=body.patient_area,
+            patient_lat=body.patient_latitude,
+            patient_lon=body.patient_longitude,
+            is_staff=False,
+        )
+        target_session = next((s for s in resolved_sessions if s["id"] == body.session_id), None)
+        if not target_session:
+            raise HTTPException(status_code=400, detail="Requested session is not available on this date.")
+
+        if target_session.get("status") in ("closed", "cancelled"):
+            raise HTTPException(status_code=400, detail=f"This session is currently {target_session.get('status')}.")
+
+        if not target_session.get("patient_self_booking_enabled", True):
+            raise HTTPException(status_code=403, detail="Patient self-booking is disabled for this session. Please contact reception.")
+
+        if target_session.get("booking_status") == "not_yet_open":
+            raise HTTPException(status_code=400, detail=target_session.get("booking_status_msg", "Booking is not yet open for this session."))
+
+        if target_session.get("booking_status") == "closed":
+            raise HTTPException(status_code=400, detail=target_session.get("booking_status_msg", "Booking is closed for this session."))
+
+        if target_session.get("is_full"):
+            raise HTTPException(status_code=400, detail="This session has reached its maximum booking capacity.")
+
+        session_name = target_session.get("session_name")
+        clinic_name = target_session.get("clinic_name") or clinic_name
+
+        if body.booking_window_id and not body.booking_window_id.endswith("_w_all") and not body.booking_window_id.endswith("_w_default"):
+            target_window = next((w for w in target_session.get("booking_windows", []) if w["id"] == body.booking_window_id), None)
+            if not target_window:
+                raise HTTPException(status_code=400, detail="Requested booking window was not found in this session.")
+            if target_window.get("is_full"):
+                raise HTTPException(status_code=400, detail="This booking window has reached its maximum capacity.")
+            if not target_window.get("is_eligible"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Location eligibility check failed: {target_window.get('eligibility_reason')}. You cannot book this window."
+                )
+            booking_window_category = target_window.get("category")
+            slot_label = f"{target_window.get('start_time')} – {target_window.get('end_time')} ({target_window.get('category').title()})"
+
+    # Fetch session name for display if not already resolved from schedule config
     sess_name = None
     if resolved_session_id:
         cs = await db.clinic_sessions.find_one({"id": resolved_session_id}, {"_id": 0, "session_name": 1})
         if cs:
             sess_name = cs.get("session_name")
+    if not session_name:
+        session_name = sess_name
 
     # Atomically allocate per-session sequential token
     token_number = await allocate_next_token_for_session(doctor.get("hospital_id"), body.doctor_id, body.date, resolved_session_id)
@@ -3080,9 +3252,16 @@ async def create_appointment(
         "patient_mobile": patient_mobile or None,
         "patient_address": user.get("address"),
         "date": body.date,
-        "slot": body.slot,
-        "session_id": resolved_session_id,
-        "session_name": sess_name,
+        "slot": slot_label,
+        "session_id": resolved_session_id or body.session_id,
+        "session_name": session_name or sess_name,
+        "booking_window_id": body.booking_window_id,
+        "booking_window_category": booking_window_category,
+        "clinic_name": clinic_name,
+        "patient_city": body.patient_city,
+        "patient_area": body.patient_area,
+        "patient_latitude": body.patient_latitude,
+        "patient_longitude": body.patient_longitude,
         "token_number": token_number,
         "status": "booked",
         "payment_method": body.payment_method,
@@ -4643,6 +4822,869 @@ async def set_doctor_availability(
     return {"ok": True, "session": updated, "doctor_status": doc_status}
 
 
+# ============ UNLIMITED CONFIGURABLE DAILY SESSIONS & LOCATION-BASED BOOKING ============
+
+def time_str_to_minutes(time_str: Optional[str]) -> Optional[int]:
+    """Convert 12-hour or 24-hour time string (e.g. '10:00 AM', '02:30 PM') to minutes from midnight (0..1439)."""
+    if not time_str:
+        return None
+    s = str(time_str).strip()
+    m12 = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$", s, re.IGNORECASE)
+    if m12:
+        hr = int(m12.group(1))
+        minute = int(m12.group(2) or 0)
+        meridiem = m12.group(3).upper()
+        if hr < 1 or hr > 12 or minute < 0 or minute > 59:
+            return None
+        if meridiem == "PM" and hr < 12:
+            hr += 12
+        elif meridiem == "AM" and hr == 12:
+            hr = 0
+        return hr * 60 + minute
+    m24 = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if m24:
+        hr = int(m24.group(1))
+        minute = int(m24.group(2))
+        if hr < 0 or hr > 23 or minute < 0 or minute > 59:
+            return None
+        return hr * 60 + minute
+    return None
+
+
+def validate_time_range(start_str: str, end_str: str) -> Tuple[bool, Optional[str]]:
+    """Validate that start_str and end_str are valid 12-hour AM/PM times and start < end."""
+    s = time_str_to_minutes(start_str)
+    e = time_str_to_minutes(end_str)
+    if s is None:
+        return False, f"Invalid start time format '{start_str}'. Use 12-hour format like '10:00 AM'."
+    if e is None:
+        return False, f"Invalid end time format '{end_str}'. Use 12-hour format like '02:00 PM'."
+    if s >= e:
+        return False, f"Start time ({start_str}) must be earlier than end time ({end_str})."
+    return True, None
+
+
+def check_time_intervals_overlap(s1_str: str, e1_str: str, s2_str: str, e2_str: str) -> bool:
+    """Return True if time interval [s1, e1] strictly overlaps with [s2, e2]."""
+    s1, e1 = time_str_to_minutes(s1_str), time_str_to_minutes(e1_str)
+    s2, e2 = time_str_to_minutes(s2_str), time_str_to_minutes(e2_str)
+    if any(x is None for x in (s1, e1, s2, e2)):
+        return False
+    return max(s1, s2) < min(e1, e2)
+
+
+def calculate_haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate geodesic distance between two latitude/longitude points in kilometers using Haversine formula."""
+    try:
+        R = 6371.0  # Earth's radius in kilometers
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = math.sin(dlat / 2.0) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2.0) ** 2
+        c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+        return round(R * c, 2)
+    except Exception:
+        return 0.0
+
+
+def generate_readable_rule_summaries(location_rule: Optional[dict], windows: List[dict]) -> List[str]:
+    """Generate human-readable summaries of location rules and booking windows."""
+    summaries = []
+    if not location_rule:
+        summaries.append("Location: Open to all patients (no location restrictions configured).")
+    else:
+        parts = []
+        r_km = location_rule.get("radius_km")
+        if r_km is not None and float(r_km) > 0:
+            parts.append(f"within {float(r_km):.1f} km distance radius from clinic")
+        areas = location_rule.get("local_areas") or []
+        if areas:
+            parts.append(f"in local cities/areas [{', '.join(areas)}]")
+        if parts:
+            summaries.append(f"Local Definition: Patients {' or '.join(parts)}.")
+            summaries.append("Distant Definition: Patients outside the configured local area/radius.")
+        else:
+            summaries.append("Location: Open to all patients.")
+
+    if not windows:
+        summaries.append("Windows: Full session duration open as a single booking window.")
+    else:
+        for idx, w in enumerate(windows, 1):
+            cat = w.get("category", "all").lower()
+            cap = f"max {w.get('max_bookings')} bookings" if w.get("max_bookings") else "unlimited capacity"
+            cat_desc = "Local patients only" if cat == "local" else ("Distant patients only" if cat == "distant" else "All patients")
+            summaries.append(f"Window {idx} ({w.get('start_time')} – {w.get('end_time')}): {cat_desc} ({cap}).")
+    return summaries
+
+
+def evaluate_location_eligibility(
+    window: dict,
+    location_rule: Optional[dict],
+    clinic_city: Optional[str] = None,
+    clinic_lat: Optional[float] = None,
+    clinic_lon: Optional[float] = None,
+    patient_city: Optional[str] = None,
+    patient_area: Optional[str] = None,
+    patient_lat: Optional[float] = None,
+    patient_lon: Optional[float] = None,
+) -> Tuple[bool, str, bool, Optional[str]]:
+    """
+    Evaluate if patient is eligible for a booking window based on location rules.
+    Returns: (is_eligible, reason, distance_calculated, limitation_note)
+    """
+    cat = (window.get("category") or "all").lower()
+    if cat == "all":
+        return True, "Open to all patients (no location restrictions for this window)", False, None
+
+    if not location_rule:
+        return True, "No location restrictions configured for this session", False, None
+
+    r_km = location_rule.get("radius_km")
+    radius_km = float(r_km) if (r_km is not None and float(r_km) > 0) else None
+    local_areas = [str(a).strip().lower() for a in (location_rule.get("local_areas") or []) if str(a).strip()]
+
+    # Check GPS coordinates distance calculation
+    has_gps = (
+        patient_lat is not None and patient_lon is not None
+        and clinic_lat is not None and clinic_lon is not None
+        and radius_km is not None
+    )
+
+    p_city_clean = (patient_city or "").strip().lower()
+    p_area_clean = (patient_area or "").strip().lower()
+    c_city_clean = (clinic_city or "").strip().lower()
+
+    # Determine area text match against configured local_areas
+    matches_local_area = False
+    matched_area_name = None
+    if local_areas:
+        for la in local_areas:
+            if la in p_city_clean or la in p_area_clean or p_city_clean in la or (p_area_clean and p_area_clean in la):
+                matches_local_area = True
+                matched_area_name = la
+                break
+    elif c_city_clean:
+        if c_city_clean in p_city_clean or p_city_clean in c_city_clean or (p_area_clean and c_city_clean in p_area_clean):
+            matches_local_area = True
+            matched_area_name = clinic_city
+
+    if has_gps:
+        dist = calculate_haversine_distance_km(patient_lat, patient_lon, clinic_lat, clinic_lon)
+        is_local_by_radius = (dist <= radius_km)
+        is_local = is_local_by_radius or matches_local_area
+
+        if cat == "local":
+            if is_local:
+                reason = f"Eligible: Distance ({dist} km) is within local radius of {radius_km} km." if is_local_by_radius else f"Eligible: Area matches local zone '{matched_area_name}'."
+                return True, reason, True, None
+            else:
+                return False, f"Ineligible for Local window: Distance ({dist} km) exceeds configured radius of {radius_km} km.", True, None
+        elif cat == "distant":
+            if not is_local:
+                return True, f"Eligible: Distance ({dist} km) is outside local radius of {radius_km} km (distant patient window).", True, None
+            else:
+                return False, f"Ineligible for Distant window: Your location is local ({dist} km <= {radius_km} km).", True, None
+
+    # GPS coordinates unavailable: Evaluate via configured city/area rules
+    limitation_note = None
+    if radius_km is not None and not has_gps:
+        limitation_note = "Distance calculation requires GPS coordinates. Matching evaluated using explicit city/area rules."
+
+    if not local_areas and not c_city_clean:
+        # No local areas configured and no clinic city known
+        return True, "Eligible (no explicit local areas configured)", False, limitation_note
+
+    if cat == "local":
+        if matches_local_area:
+            return True, f"Eligible: Patient location matches configured local area '{matched_area_name}'.", False, limitation_note
+        else:
+            area_str = ", ".join(location_rule.get("local_areas") or [clinic_city or "Clinic city"])
+            return False, f"Ineligible: Local window reserved for patients in [{area_str}].", False, limitation_note
+    elif cat == "distant":
+        if not matches_local_area:
+            return True, "Eligible: Patient location is outside configured local area (distant patient window).", False, limitation_note
+        else:
+            return False, "Ineligible: Reserved for distant patients. Your location is in the local zone.", False, limitation_note
+
+    return True, "Eligible", False, limitation_note
+
+
+def validate_booking_windows(session_start: str, session_end: str, windows: List[dict]):
+    """Validate that booking windows are within session bounds and do not conflict with each other."""
+    sess_s = time_str_to_minutes(session_start)
+    sess_e = time_str_to_minutes(session_end)
+    if sess_s is None or sess_e is None:
+        raise HTTPException(status_code=400, detail="Invalid session start or end time format")
+
+    for i, w in enumerate(windows):
+        w_s = time_str_to_minutes(w.get("start_time"))
+        w_e = time_str_to_minutes(w.get("end_time"))
+        if w_s is None or w_e is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Window #{i+1} has invalid time format. Use 12-hour AM/PM format (e.g. '10:00 AM')."
+            )
+        if w_s >= w_e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Window #{i+1} start time ({w.get('start_time')}) must be earlier than end time ({w.get('end_time')})."
+            )
+        if w_s < sess_s or w_e > sess_e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Window #{i+1} ({w.get('start_time')} – {w.get('end_time')}) is outside session time range ({session_start} – {session_end})."
+            )
+        if w.get("category") not in ("local", "distant", "all"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Window #{i+1} has invalid category '{w.get('category')}'. Must be 'local', 'distant', or 'all'."
+            )
+
+    # Check for overlapping window intervals
+    for i in range(len(windows)):
+        for j in range(i + 1, len(windows)):
+            w1 = windows[i]
+            w2 = windows[j]
+            if check_time_intervals_overlap(w1.get("start_time"), w1.get("end_time"), w2.get("start_time"), w2.get("end_time")):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Booking windows conflict: Window ({w1.get('start_time')} – {w1.get('end_time')}) overlaps with Window ({w2.get('start_time')} – {w2.get('end_time')})."
+                )
+
+
+async def check_doctor_session_conflicts(
+    doctor_id: str,
+    start_time: str,
+    end_time: str,
+    date_type: str,
+    date_val: Optional[str] = None,
+    days_of_week: Optional[List[str]] = None,
+    exclude_session_id: Optional[str] = None,
+):
+    """Ensure no overlapping sessions exist for the same doctor, including across different clinics."""
+    query = {"doctor_id": doctor_id, "status": {"$ne": "cancelled"}}
+    if exclude_session_id:
+        query["id"] = {"$ne": exclude_session_id}
+
+    existing_sessions = await db.doctor_schedule_configs.find(query).to_list(100)
+    for existing in existing_sessions:
+        # Check date/weekday overlap
+        overlaps_calendar = False
+        e_type = existing.get("date_type", "recurring")
+        if date_type == "date" and e_type == "date":
+            overlaps_calendar = (date_val == existing.get("date"))
+        elif date_type == "recurring" and e_type == "recurring":
+            e_days = set(existing.get("days_of_week") or [])
+            my_days = set(days_of_week or [])
+            overlaps_calendar = bool(e_days.intersection(my_days))
+        elif date_type == "date" and e_type == "recurring":
+            if date_val:
+                try:
+                    target_day = datetime.strptime(date_val, "%Y-%m-%d").strftime("%A")
+                    overlaps_calendar = target_day in (existing.get("days_of_week") or [])
+                except Exception:
+                    pass
+        elif date_type == "recurring" and e_type == "date":
+            e_date = existing.get("date")
+            if e_date:
+                try:
+                    target_day = datetime.strptime(e_date, "%Y-%m-%d").strftime("%A")
+                    overlaps_calendar = target_day in (days_of_week or [])
+                except Exception:
+                    pass
+
+        if overlaps_calendar:
+            if check_time_intervals_overlap(start_time, end_time, existing.get("start_time"), existing.get("end_time")):
+                clinic_label = existing.get("clinic_name") or "Another Clinic"
+                sess_name = existing.get("session_name") or "Existing Session"
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Session timing ({start_time} – {end_time}) overlaps with existing session '{sess_name}' "
+                        f"({existing.get('start_time')} – {existing.get('end_time')}) at clinic '{clinic_label}'. "
+                        "Doctors cannot have overlapping sessions across clinics."
+                    )
+                )
+
+
+async def resolve_doctor_sessions_for_date(
+    doctor_id: str,
+    target_date: str,
+    patient_city: Optional[str] = None,
+    patient_area: Optional[str] = None,
+    patient_lat: Optional[float] = None,
+    patient_lon: Optional[float] = None,
+    is_staff: bool = False,
+) -> List[dict]:
+    """Resolve all configured sessions and booking windows for doctor on a specific date in Asia/Kolkata."""
+    try:
+        weekday_name = datetime.strptime(target_date, "%Y-%m-%d").strftime("%A")
+    except Exception:
+        target_date = get_ist_now().strftime("%Y-%m-%d")
+        weekday_name = get_ist_now().strftime("%A")
+
+    # Fetch doctor profile
+    doctor = await db.doctors.find_one(
+        {"id": doctor_id},
+        {"_id": 0, "full_name": 1, "clinic_name": 1, "hospital_name": 1, "city": 1, "address": 1, "timings": 1, "hospital_id": 1, "latitude": 1, "longitude": 1}
+    )
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    default_clinic_name = doctor.get("clinic_name") or doctor.get("hospital_name") or "MeriBaari Clinic"
+    default_clinic_city = doctor.get("city") or ""
+    default_clinic_address = doctor.get("address") or ""
+    default_clinic_lat = doctor.get("latitude")
+    default_clinic_lon = doctor.get("longitude")
+
+    # Fetch matching session configs
+    query = {
+        "doctor_id": doctor_id,
+        "$or": [
+            {"date_type": "date", "date": target_date},
+            {"date_type": "recurring", "days_of_week": weekday_name},
+        ]
+    }
+    raw_sessions = await db.doctor_schedule_configs.find(query, {"_id": 0}).to_list(100)
+
+    # Fallback to doctor's existing single timing if no sessions are configured
+    if not raw_sessions:
+        orig_start = extract_session_start_time(doctor.get("timings")) or "10:00 AM"
+        fallback_session = {
+            "id": f"{doctor_id}_default",
+            "doctor_id": doctor_id,
+            "session_name": "Regular Consultation",
+            "clinic_name": default_clinic_name,
+            "clinic_city": default_clinic_city,
+            "clinic_address": default_clinic_address,
+            "clinic_latitude": default_clinic_lat,
+            "clinic_longitude": default_clinic_lon,
+            "date_type": "recurring",
+            "days_of_week": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+            "start_time": orig_start,
+            "end_time": "06:00 PM",
+            "booking_open_time": None,
+            "booking_close_time": None,
+            "max_bookings": None,
+            "is_unlimited_capacity": True,
+            "slot_duration_minutes": 15,
+            "patient_self_booking_enabled": True,
+            "status": "active",
+            "location_rule": {
+                "rule_type": "none",
+                "radius_km": None,
+                "local_areas": [default_clinic_city] if default_clinic_city else [],
+                "distant_definition": "outside_local"
+            },
+            "booking_windows": [
+                {
+                    "id": f"{doctor_id}_w_default",
+                    "start_time": orig_start,
+                    "end_time": "06:00 PM",
+                    "category": "all",
+                    "max_bookings": None,
+                    "description": "Open to all patients"
+                }
+            ]
+        }
+        raw_sessions = [fallback_session]
+
+    ist_now = get_ist_now()
+    resolved = []
+
+    for s in raw_sessions:
+        # Check date-specific overrides
+        date_overrides = s.get("date_overrides") or {}
+        override = date_overrides.get(target_date)
+
+        effective_status = (override.get("status") if override else None) or s.get("status", "active")
+        # Exclude cancelled sessions for this date unless requested by staff for audit
+        if effective_status == "cancelled" and not is_staff:
+            continue
+
+        effective_start = (override.get("start_time") if override else None) or s.get("start_time")
+        effective_end = (override.get("end_time") if override else None) or s.get("end_time")
+        effective_max = (override.get("max_bookings") if override else None) or s.get("max_bookings")
+        is_unlimited = bool(s.get("is_unlimited_capacity") or effective_max is None or effective_max <= 0)
+
+        # Count total appointments in this session
+        appt_count = await db.appointments.count_documents({
+            "doctor_id": doctor_id,
+            "date": target_date,
+            "status": {"$nin": ["cancelled"]},
+            "$or": [
+                {"session_id": s["id"]},
+                {"session_id": None} if s["id"].endswith("_default") else {"session_id": s["id"]}
+            ]
+        })
+        is_full = (not is_unlimited) and (appt_count >= effective_max)
+
+        # Booking window open / close logic in Asia/Kolkata
+        booking_status = "open"
+        booking_status_msg = "Booking is open"
+        b_open_str = s.get("booking_open_time")
+        b_close_str = s.get("booking_close_time")
+        target_dt = parse_time_to_ist_dt(target_date, effective_start)
+
+        if b_open_str:
+            open_dt = parse_time_to_ist_dt(target_date, b_open_str)
+            if open_dt and ist_now < open_dt:
+                booking_status = "not_yet_open"
+                booking_status_msg = f"Booking opens at {format_12hr_time(open_dt)}"
+
+        if b_close_str:
+            close_dt = parse_time_to_ist_dt(target_date, b_close_str)
+            if close_dt and ist_now > close_dt:
+                booking_status = "closed"
+                booking_status_msg = f"Booking closed at {format_12hr_time(close_dt)}"
+        elif target_dt and ist_now > target_dt + timedelta(hours=2):
+            # Automatic close if session is 2 hours past scheduled start and date is today
+            if target_date == ist_now.strftime("%Y-%m-%d"):
+                booking_status = "closed"
+                booking_status_msg = "Booking closed for past session"
+
+        # Resolve windows and location eligibility
+        c_lat = s.get("clinic_latitude") or default_clinic_lat
+        c_lon = s.get("clinic_longitude") or default_clinic_lon
+        c_city = s.get("clinic_city") or default_clinic_city
+        loc_rule = s.get("location_rule") or {}
+
+        resolved_windows = []
+        raw_windows = s.get("booking_windows") or [
+            {
+                "id": f"{s['id']}_w_all",
+                "start_time": effective_start,
+                "end_time": effective_end,
+                "category": "all",
+                "max_bookings": None,
+                "description": "All patients"
+            }
+        ]
+
+        for w in raw_windows:
+            w_cap = w.get("max_bookings")
+            w_count = await db.appointments.count_documents({
+                "doctor_id": doctor_id,
+                "date": target_date,
+                "booking_window_id": w["id"],
+                "status": {"$nin": ["cancelled"]}
+            })
+            w_full = bool(w_cap and w_count >= w_cap)
+
+            if is_staff:
+                eligible, reason, dist_calc, limitation_note = True, "Staff access (all windows visible)", False, None
+            elif patient_city or patient_area or (patient_lat is not None and patient_lon is not None):
+                eligible, reason, dist_calc, limitation_note = evaluate_location_eligibility(
+                    window=w,
+                    location_rule=loc_rule,
+                    clinic_city=c_city,
+                    clinic_lat=c_lat,
+                    clinic_lon=c_lon,
+                    patient_city=patient_city,
+                    patient_area=patient_area,
+                    patient_lat=patient_lat,
+                    patient_lon=patient_lon,
+                )
+            else:
+                # No patient location provided: only 'all' windows are marked eligible
+                if w.get("category") == "all":
+                    eligible, reason, dist_calc, limitation_note = True, "Open to all patients", False, None
+                else:
+                    eligible, reason, dist_calc, limitation_note = False, f"Location required to check eligibility for {w.get('category')} window", False, None
+
+            resolved_windows.append({
+                "id": w["id"],
+                "start_time": format_12hr_time(w["start_time"]),
+                "end_time": format_12hr_time(w["end_time"]),
+                "category": w.get("category", "all"),
+                "max_bookings": w_cap,
+                "current_bookings": w_count,
+                "is_full": w_full,
+                "is_eligible": eligible and not w_full and not is_full,
+                "eligibility_reason": reason,
+                "distance_calculated": dist_calc,
+                "limitation_note": limitation_note,
+                "description": w.get("description"),
+            })
+
+        rule_summaries = generate_readable_rule_summaries(loc_rule, raw_windows)
+
+        sess_obj = {
+            "id": s["id"],
+            "session_id": s["id"],
+            "doctor_id": doctor_id,
+            "session_name": s.get("session_name", "Consultation Session"),
+            "clinic_id": s.get("clinic_id"),
+            "clinic_name": s.get("clinic_name") or default_clinic_name,
+            "clinic_city": c_city,
+            "clinic_address": s.get("clinic_address") or default_clinic_address,
+            "clinic_latitude": c_lat,
+            "clinic_longitude": c_lon,
+            "date_type": s.get("date_type", "recurring"),
+            "date": s.get("date"),
+            "target_date": target_date,
+            "days_of_week": s.get("days_of_week", []),
+            "start_time": format_12hr_time(effective_start),
+            "end_time": format_12hr_time(effective_end),
+            "booking_open_time": format_12hr_time(b_open_str) if b_open_str else None,
+            "booking_close_time": format_12hr_time(b_close_str) if b_close_str else None,
+            "max_bookings": effective_max,
+            "is_unlimited_capacity": is_unlimited,
+            "current_bookings": appt_count,
+            "is_full": is_full,
+            "booking_status": booking_status,
+            "booking_status_msg": booking_status_msg,
+            "slot_duration_minutes": s.get("slot_duration_minutes", 15),
+            "patient_self_booking_enabled": s.get("patient_self_booking_enabled", True),
+            "status": effective_status,
+            "has_date_override": bool(override),
+            "location_rule": loc_rule,
+            "rule_summaries": rule_summaries,
+            "booking_windows": resolved_windows,
+        }
+        resolved.append(sess_obj)
+
+    # Sort resolved sessions by start time
+    resolved.sort(key=lambda x: time_str_to_minutes(x.get("start_time")) or 0)
+    return resolved
+
+
+@api_router.get("/doctor/{doctor_id}/sessions")
+async def get_doctor_sessions_staff(
+    doctor_id: str,
+    date: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """Staff endpoint to fetch all configured sessions and windows for a doctor without location restrictions."""
+    target_date = date or get_ist_now().strftime("%Y-%m-%d")
+    is_staff = user.get("role") in ("receptionist", "doctor", "admin", "owner", "developer")
+    sessions = await resolve_doctor_sessions_for_date(
+        doctor_id=doctor_id,
+        target_date=target_date,
+        is_staff=is_staff,
+    )
+    return {"ok": True, "doctor_id": doctor_id, "date": target_date, "sessions": sessions}
+
+
+@api_router.get("/doctors/{doctor_id}/sessions")
+async def get_doctor_sessions_public(
+    doctor_id: str,
+    date: Optional[str] = None,
+    patient_city: Optional[str] = None,
+    patient_area: Optional[str] = None,
+    patient_lat: Optional[float] = None,
+    patient_lon: Optional[float] = None,
+):
+    """Patient/public endpoint: evaluates location eligibility and displays eligible sessions and booking windows."""
+    target_date = date or get_ist_now().strftime("%Y-%m-%d")
+    sessions = await resolve_doctor_sessions_for_date(
+        doctor_id=doctor_id,
+        target_date=target_date,
+        patient_city=patient_city,
+        patient_area=patient_area,
+        patient_lat=patient_lat,
+        patient_lon=patient_lon,
+        is_staff=False,
+    )
+    return {"ok": True, "doctor_id": doctor_id, "date": target_date, "sessions": sessions}
+
+
+@api_router.post("/doctor/{doctor_id}/sessions")
+async def create_doctor_session(
+    doctor_id: str,
+    body: DoctorScheduleSessionCreate,
+    user: dict = Depends(require_role("doctor", "admin", "owner", "developer")),
+):
+    """Doctor or admin configures an unlimited daily or recurring session with location-based booking windows."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+
+    # 1. Validate time format & range
+    ok_time, err = validate_time_range(body.start_time, body.end_time)
+    if not ok_time:
+        raise HTTPException(status_code=400, detail=err)
+
+    if body.booking_open_time and body.booking_close_time:
+        ok_btime, berr = validate_time_range(body.booking_open_time, body.booking_close_time)
+        if not ok_btime:
+            raise HTTPException(status_code=400, detail=f"Booking window error: {berr}")
+
+    # 2. Validate booking windows
+    if body.booking_windows:
+        validate_booking_windows(body.start_time, body.end_time, [w.model_dump() for w in body.booking_windows])
+
+    # 3. Prevent overlapping sessions for the same doctor across clinics
+    await check_doctor_session_conflicts(
+        doctor_id=doctor_id,
+        start_time=body.start_time,
+        end_time=body.end_time,
+        date_type=body.date_type,
+        date_val=body.date,
+        days_of_week=body.days_of_week,
+    )
+
+    sess_id = str(uuid.uuid4())
+    doc_profile = await db.doctors.find_one({"id": doctor_id}, {"_id": 0, "clinic_name": 1, "city": 1, "address": 1})
+    clinic_name = body.clinic_name or (doc_profile or {}).get("clinic_name") or "MeriBaari Clinic"
+    clinic_city = body.clinic_city or (doc_profile or {}).get("city") or ""
+    clinic_addr = body.clinic_address or (doc_profile or {}).get("address") or ""
+
+    session_doc = {
+        "id": sess_id,
+        "doctor_id": doctor_id,
+        "session_name": body.session_name.strip(),
+        "clinic_id": body.clinic_id,
+        "clinic_name": clinic_name,
+        "clinic_address": clinic_addr,
+        "clinic_city": clinic_city,
+        "clinic_latitude": body.clinic_latitude,
+        "clinic_longitude": body.clinic_longitude,
+        "date_type": body.date_type,
+        "date": body.date,
+        "days_of_week": body.days_of_week,
+        "start_time": format_12hr_time(body.start_time),
+        "end_time": format_12hr_time(body.end_time),
+        "booking_open_time": format_12hr_time(body.booking_open_time) if body.booking_open_time else None,
+        "booking_close_time": format_12hr_time(body.booking_close_time) if body.booking_close_time else None,
+        "max_bookings": body.max_bookings if not body.is_unlimited_capacity else None,
+        "is_unlimited_capacity": body.is_unlimited_capacity,
+        "slot_duration_minutes": body.slot_duration_minutes,
+        "patient_self_booking_enabled": body.patient_self_booking_enabled,
+        "status": "active",
+        "date_overrides": {},
+        "location_rule": body.location_rule.model_dump() if body.location_rule else None,
+        "booking_windows": [w.model_dump() for w in body.booking_windows],
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+    await db.doctor_schedule_configs.insert_one(session_doc)
+    session_doc.pop("_id", None)
+    await broadcast_doctor_update(doctor_id, "session_config_created")
+    return {"ok": True, "message": "Session created successfully", "session": session_doc}
+
+
+@api_router.put("/doctor/{doctor_id}/sessions/{session_id}")
+async def update_doctor_session(
+    doctor_id: str,
+    session_id: str,
+    body: DoctorScheduleSessionUpdate,
+    user: dict = Depends(require_role("doctor", "admin", "owner", "developer")),
+):
+    """Doctor or admin edits an existing session schedule configuration."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+
+    existing = await db.doctor_schedule_configs.find_one({"id": session_id, "doctor_id": doctor_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Session configuration not found")
+
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        return {"ok": True, "message": "No changes"}
+
+    new_start = updates.get("start_time") or existing.get("start_time")
+    new_end = updates.get("end_time") or existing.get("end_time")
+    ok_time, err = validate_time_range(new_start, new_end)
+    if not ok_time:
+        raise HTTPException(status_code=400, detail=err)
+
+    # Validate windows if updated or times changed
+    windows = updates.get("booking_windows") if "booking_windows" in updates else existing.get("booking_windows", [])
+    if windows:
+        validate_booking_windows(new_start, new_end, windows)
+
+    # Check conflicts
+    d_type = updates.get("date_type") or existing.get("date_type")
+    d_val = updates.get("date") or existing.get("date")
+    d_days = updates.get("days_of_week") or existing.get("days_of_week")
+    await check_doctor_session_conflicts(
+        doctor_id=doctor_id,
+        start_time=new_start,
+        end_time=new_end,
+        date_type=d_type,
+        date_val=d_val,
+        days_of_week=d_days,
+        exclude_session_id=session_id,
+    )
+
+    if "start_time" in updates:
+        updates["start_time"] = format_12hr_time(updates["start_time"])
+    if "end_time" in updates:
+        updates["end_time"] = format_12hr_time(updates["end_time"])
+    if "booking_open_time" in updates and updates["booking_open_time"]:
+        updates["booking_open_time"] = format_12hr_time(updates["booking_open_time"])
+    if "booking_close_time" in updates and updates["booking_close_time"]:
+        updates["booking_close_time"] = format_12hr_time(updates["booking_close_time"])
+
+    updates["updated_at"] = now_iso()
+    await db.doctor_schedule_configs.update_one({"id": session_id}, {"$set": updates})
+    saved = await db.doctor_schedule_configs.find_one({"id": session_id}, {"_id": 0})
+    await broadcast_doctor_update(doctor_id, "session_config_updated")
+    return {"ok": True, "message": "Session updated successfully", "session": saved}
+
+
+@api_router.delete("/doctor/{doctor_id}/sessions/{session_id}")
+async def delete_doctor_session(
+    doctor_id: str,
+    session_id: str,
+    user: dict = Depends(require_role("doctor", "admin", "owner", "developer")),
+):
+    """Delete a session schedule configuration."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+    res = await db.doctor_schedule_configs.delete_one({"id": session_id, "doctor_id": doctor_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Session configuration not found")
+    await broadcast_doctor_update(doctor_id, "session_config_deleted")
+    return {"ok": True, "message": "Session configuration deleted successfully"}
+
+
+@api_router.post("/doctor/{doctor_id}/sessions/{session_id}/cancel")
+async def cancel_doctor_session(
+    doctor_id: str,
+    session_id: str,
+    body: dict = Body(default={}),
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer")),
+):
+    """Cancel a session: for a single date (date override) or permanently."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+    sess = await db.doctor_schedule_configs.find_one({"id": session_id, "doctor_id": doctor_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session configuration not found")
+
+    cancel_date = body.get("date")
+    reason = body.get("reason", "Cancelled by clinic")
+
+    if cancel_date:
+        # Date-specific cancellation: does NOT alter future recurring occurrences!
+        update_key = f"date_overrides.{cancel_date}"
+        await db.doctor_schedule_configs.update_one(
+            {"id": session_id},
+            {"$set": {update_key: {"status": "cancelled", "reason": reason, "updated_at": now_iso()}}}
+        )
+        msg = f"Session '{sess.get('session_name')}' cancelled for {cancel_date} only. Future occurrences remain active."
+    else:
+        # Full cancellation
+        await db.doctor_schedule_configs.update_one(
+            {"id": session_id},
+            {"$set": {"status": "cancelled", "cancel_reason": reason, "updated_at": now_iso()}}
+        )
+        msg = f"Session '{sess.get('session_name')}' cancelled."
+
+    await broadcast_doctor_update(doctor_id, "session_cancelled")
+    return {"ok": True, "message": msg}
+
+
+@api_router.post("/doctor/{doctor_id}/sessions/{session_id}/close")
+async def close_doctor_session(
+    doctor_id: str,
+    session_id: str,
+    body: dict = Body(default={}),
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer")),
+):
+    """Close bookings for this session (for a single date or permanently)."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+    sess = await db.doctor_schedule_configs.find_one({"id": session_id, "doctor_id": doctor_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session configuration not found")
+
+    target_date = body.get("date")
+    reason = body.get("reason", "Bookings closed by clinic")
+
+    if target_date:
+        update_key = f"date_overrides.{target_date}"
+        await db.doctor_schedule_configs.update_one(
+            {"id": session_id},
+            {"$set": {update_key: {"status": "closed", "reason": reason, "updated_at": now_iso()}}}
+        )
+        msg = f"Session bookings closed for {target_date}."
+    else:
+        await db.doctor_schedule_configs.update_one(
+            {"id": session_id},
+            {"$set": {"status": "closed", "close_reason": reason, "updated_at": now_iso()}}
+        )
+        msg = f"Session bookings closed."
+
+    await broadcast_doctor_update(doctor_id, "session_closed")
+    return {"ok": True, "message": msg}
+
+
+@api_router.post("/doctor/{doctor_id}/sessions/{session_id}/date-override")
+async def save_session_date_override(
+    doctor_id: str,
+    session_id: str,
+    body: DoctorSessionDateOverrideBody,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer")),
+):
+    """Apply date-specific changes to recurring schedules without changing every future occurrence."""
+    await verify_doctor_session_access(doctor_id, user, write=True)
+    sess = await db.doctor_schedule_configs.find_one({"id": session_id, "doctor_id": doctor_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session configuration not found")
+
+    override_data = {
+        "status": body.status or sess.get("status", "active"),
+        "updated_at": now_iso(),
+    }
+    if body.start_time:
+        override_data["start_time"] = format_12hr_time(body.start_time)
+    if body.end_time:
+        override_data["end_time"] = format_12hr_time(body.end_time)
+    if body.max_bookings is not None:
+        override_data["max_bookings"] = body.max_bookings
+    if body.is_unlimited_capacity is not None:
+        override_data["is_unlimited_capacity"] = body.is_unlimited_capacity
+    if body.reason:
+        override_data["reason"] = body.reason
+
+    update_key = f"date_overrides.{body.date}"
+    await db.doctor_schedule_configs.update_one(
+        {"id": session_id},
+        {"$set": {update_key: override_data}}
+    )
+    saved = await db.doctor_schedule_configs.find_one({"id": session_id}, {"_id": 0})
+    await broadcast_doctor_update(doctor_id, "session_override_saved")
+    return {
+        "ok": True,
+        "message": f"Schedule override saved for {body.date} without altering other recurring dates",
+        "session": saved
+    }
+
+
+@api_router.post("/doctor/session-location-rules/preview")
+async def preview_session_location_rules(
+    body: RulePreviewRequest,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer")),
+):
+    """Preview rule summaries and evaluate test patient location eligibility."""
+    loc_dict = body.location_rule.model_dump()
+    win_list = [w.model_dump() for w in body.booking_windows]
+    summaries = generate_readable_rule_summaries(loc_dict, win_list)
+
+    evaluations = []
+    if body.test_patient_city or body.test_patient_area or (body.test_patient_latitude is not None and body.test_patient_longitude is not None):
+        for w in win_list:
+            el, reas, d_calc, note = evaluate_location_eligibility(
+                window=w,
+                location_rule=loc_dict,
+                clinic_city=body.clinic_city,
+                clinic_lat=body.clinic_latitude,
+                clinic_lon=body.clinic_longitude,
+                patient_city=body.test_patient_city,
+                patient_area=body.test_patient_area,
+                patient_lat=body.test_patient_latitude,
+                patient_lon=body.test_patient_longitude,
+            )
+            evaluations.append({
+                "window_id": w["id"],
+                "window_times": f"{w.get('start_time')} – {w.get('end_time')}",
+                "category": w.get("category"),
+                "is_eligible": el,
+                "reason": reas,
+                "distance_calculated": d_calc,
+                "limitation_note": note,
+            })
+
+    return {"ok": True, "summaries": summaries, "evaluations": evaluations}
+
+
 # ============ REFERRAL & QUEUE MANAGEMENT ============
 @api_router.post("/reception/refer")
 @api_router.post("/appointments/{appt_id}/refer")
@@ -5195,6 +6237,15 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
                 sess_name = cs.get("session_name") or "Walk-in"
         appt_id = str(uuid.uuid4())
         secure_token = secrets.token_urlsafe(16)
+
+        session_name = None
+        clinic_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
+        if getattr(body, "session_id", None) and not body.session_id.endswith("_default"):
+            sess_doc = await db.doctor_schedule_configs.find_one({"id": body.session_id})
+            if sess_doc:
+                session_name = sess_doc.get("session_name")
+                clinic_name = sess_doc.get("clinic_name") or clinic_name
+
         appt = {
             "id": appt_id,
             "secure_token": secure_token,
@@ -5206,9 +6257,13 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
             "patient_mobile": mobile,
             "patient_address": body.address,
             "date": appt_date,
-            "slot": body.slot or sess_name,
-            "session_id": resolved_session_id,
-            "session_name": sess_name if resolved_session_id else None,
+            "slot": body.slot or sess_name or "Walk-in",
+            "session_id": resolved_session_id or getattr(body, "session_id", None),
+            "session_name": session_name or (sess_name if resolved_session_id else None),
+            "booking_window_id": getattr(body, "booking_window_id", None),
+            "clinic_name": clinic_name,
+            "patient_city": getattr(body, "patient_city", None),
+            "patient_area": getattr(body, "patient_area", None),
             "token_number": token_number,
             "status": "arrived",  # walk-in patient is already at clinic
             "payment_method": body.payment_method or "pay_at_clinic",
@@ -5760,10 +6815,17 @@ async def dev_liveair_credits(
 async def ws_doctor_queue(ws: WebSocket, doctor_id: str):
     channel = f"doctor:{doctor_id}"
     await manager.connect(channel, ws)
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await ws.send_json({"type": "ping"})
+            except Exception:
+                break
+    hb_task = asyncio.create_task(heartbeat())
     try:
         await ws.send_json({"type": "connected", "channel": channel})
         while True:
-            # Client can ping to keep alive; we just consume
             msg = await ws.receive_text()
             if msg == "ping":
                 await ws.send_json({"type": "pong", "ts": now_iso()})
@@ -5772,6 +6834,7 @@ async def ws_doctor_queue(ws: WebSocket, doctor_id: str):
     except Exception:
         pass
     finally:
+        hb_task.cancel()
         await manager.disconnect(channel, ws)
 
 
@@ -5779,6 +6842,14 @@ async def ws_doctor_queue(ws: WebSocket, doctor_id: str):
 async def ws_appt_queue(ws: WebSocket, appointment_id: str):
     channel = f"appt:{appointment_id}"
     await manager.connect(channel, ws)
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await ws.send_json({"type": "ping"})
+            except Exception:
+                break
+    hb_task = asyncio.create_task(heartbeat())
     try:
         await ws.send_json({"type": "connected", "channel": channel})
         while True:
@@ -5790,6 +6861,7 @@ async def ws_appt_queue(ws: WebSocket, appointment_id: str):
     except Exception:
         pass
     finally:
+        hb_task.cancel()
         await manager.disconnect(channel, ws)
 
 

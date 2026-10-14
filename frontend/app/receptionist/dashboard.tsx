@@ -72,6 +72,9 @@ export default function ReceptionistDashboard() {
 
   // Add Patient sheet (preserves inputs on error)
   const [addOpen, setAddOpen] = useState(false);
+  const [configuredSessions, setConfiguredSessions] = useState<any[]>([]);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [selectedWindowId, setSelectedWindowId] = useState<string | null>(null);
   const [pName, setPName] = useState("");
   const [pMobile, setPMobile] = useState("");
   const [pAge, setPAge] = useState("");
@@ -137,14 +140,16 @@ export default function ReceptionistDashboard() {
         selectedDocRef.current = doctorId;
       }
       if (doctorId) {
-        const [q, sessRes, sum] = await Promise.all([
+        const [q, sessRes, sum, confSessRes] = await Promise.all([
           api.get(`/reception/queue?doctor_id=${doctorId}&date=${selectedDate}`, { bypassCache: shouldBypass }),
           api.get(`/doctor/${doctorId}/session?date=${selectedDate}`, { bypassCache: shouldBypass }).catch(() => null),
           api.get(`/appointments/calendar-summary?doctor_id=${doctorId}`, { bypassCache: shouldBypass }).catch(() => []),
+          api.get(`/doctor/${doctorId}/sessions?target_date=${selectedDate}`, { bypassCache: shouldBypass }).catch(() => ({ sessions: [] })),
         ]);
         setQueue(q || []);
         if (sessRes?.session) setDocSession(sessRes.session);
         setSummaryData(sum || []);
+        setConfiguredSessions(confSessRes?.sessions || []);
       }
       const nowStr = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true });
       setLastUpdated(nowStr);
@@ -176,7 +181,11 @@ export default function ReceptionistDashboard() {
         setWsConnected(true);
         if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
       };
-      ws.onmessage = () => {
+      ws.onmessage = (e: any) => {
+        try {
+          const msg = typeof e?.data === "string" ? JSON.parse(e.data) : e?.data;
+          if (msg?.type === "ping" || msg?.type === "pong" || msg?.type === "connected") return;
+        } catch {}
         if (isFocused.current && (Platform.OS !== "web" || document.visibilityState === "visible")) {
           load(true, true);
         }
@@ -438,6 +447,7 @@ export default function ReceptionistDashboard() {
   const resetAddForm = () => {
     setPName(""); setPMobile(""); setPAge(""); setPGender(null);
     setPSymptoms(""); setPAddress(""); setPSlot(""); setAddError(null);
+    setSelectedSessionId(null); setSelectedWindowId(null);
   };
 
   const onAddPatient = async () => {
@@ -447,6 +457,12 @@ export default function ReceptionistDashboard() {
     if (!selectedDoc) return setAddError("Select a doctor first");
     setAddLoading(true);
     try {
+      const selectedSession = configuredSessions.find((s) => s.id === selectedSessionId);
+      const selectedWindow = selectedSession?.booking_windows?.find((w: any) => w.id === selectedWindowId);
+      const effectiveSlot =
+        pSlot ||
+        (selectedWindow ? `${selectedWindow.start_time} - ${selectedWindow.end_time}` : (selectedSession ? selectedSession.session_name : "Walk-in"));
+
       const res = await api.post("/reception/add-patient", {
         full_name: pName.trim(),
         mobile: pMobile.replace(/[^0-9]/g, ""),
@@ -455,7 +471,10 @@ export default function ReceptionistDashboard() {
         symptoms: pSymptoms || undefined,
         address: pAddress || undefined,
         doctor_id: selectedDoc,
-        slot: pSlot || "Walk-in",
+        session_id: selectedSessionId || undefined,
+        booking_window_id: selectedWindowId || undefined,
+        slot_time: (selectedWindow ? `${selectedWindow.start_time} - ${selectedWindow.end_time}` : pSlot) || undefined,
+        slot: effectiveSlot,
         date: selectedDate,
       });
       setAddToast(`Added: ${res.patient.full_name} · Token #${res.appointment?.token_number}`);
@@ -1066,9 +1085,92 @@ export default function ReceptionistDashboard() {
             <Pressable style={[styles.sheet, { maxHeight: "92%", minHeight: "70%" }]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
-                <Text style={styles.sheetTitle}>Add Walk-in Patient</Text>
-                <Text style={styles.sheetSub}>Patient will be assigned next atomic token for {selectedDate}.</Text>
-                <Text style={styles.label}>Full Name*</Text>
+                <Text style={styles.sheetTitle}>Add Patient to Queue</Text>
+                <Text style={styles.sheetSub}>Select doctor session & slot (receptionist override enabled). Date: {selectedDate}</Text>
+
+                {/* 1. Doctor Sessions Selection (All configured sessions accessible to receptionist) */}
+                <Text style={styles.label}>1. Doctor Session (सत्र चुनें)</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 4 }}>
+                  <Pressable
+                    onPress={() => {
+                      setSelectedSessionId(null);
+                      setSelectedWindowId(null);
+                    }}
+                    style={[
+                      styles.recSessionChip,
+                      selectedSessionId === null && styles.recSessionChipActive,
+                    ]}
+                  >
+                    <Text style={[styles.recSessionText, selectedSessionId === null && { color: "#fff" }]}>
+                      General Walk-in
+                    </Text>
+                  </Pressable>
+                  {configuredSessions.map((sess) => {
+                    const isSessActive = selectedSessionId === sess.id;
+                    return (
+                      <Pressable
+                        key={sess.id}
+                        onPress={() => {
+                          setSelectedSessionId(sess.id);
+                          setSelectedWindowId(null);
+                          setPSlot(`${sess.start_time} - ${sess.end_time}`);
+                        }}
+                        style={[
+                          styles.recSessionChip,
+                          isSessActive && styles.recSessionChipActive,
+                        ]}
+                      >
+                        <Text style={[styles.recSessionText, isSessActive && { color: "#fff" }]}>
+                          {sess.session_name} ({sess.start_time} - {sess.end_time})
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
+
+                {/* 2. Booking Windows / Slots (Receptionist has access to ALL windows including local-only) */}
+                {selectedSessionId && (
+                  (() => {
+                    const chosen = configuredSessions.find((s) => s.id === selectedSessionId);
+                    const wins = chosen?.booking_windows || [];
+                    if (wins.length === 0) return null;
+                    return (
+                      <View style={{ marginTop: spacing.xs, marginBottom: spacing.sm }}>
+                        <Text style={styles.label}>2. Booking Window / Slot (Receptionist Override: All Windows Available)</Text>
+                        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 4 }}>
+                          {wins.map((w: any) => {
+                            const isWinActive = selectedWindowId === w.id;
+                            const target = w.target_patient_category || "all";
+                            const badge = target === "local" ? "Local" : target === "distant" ? "Distant" : "All";
+                            return (
+                              <Pressable
+                                key={w.id}
+                                onPress={() => {
+                                  setSelectedWindowId(w.id);
+                                  setPSlot(`${w.start_time} - ${w.end_time}`);
+                                }}
+                                style={[
+                                  styles.recWindowChip,
+                                  isWinActive && styles.recWindowChipActive,
+                                ]}
+                              >
+                                <Text style={[styles.recWindowTime, isWinActive && { color: "#fff" }]}>
+                                  {w.start_time} - {w.end_time}
+                                </Text>
+                                <Text style={[styles.recWindowBadge, isWinActive && { color: "#E0E7FF" }]}>
+                                  [{badge}]
+                                </Text>
+                              </Pressable>
+                            );
+                          })}
+                        </ScrollView>
+                      </View>
+                    );
+                  })()
+                )}
+
+                {/* 3. Patient Details */}
+                <Text style={styles.label}>3. Patient Full Name*</Text>
                 <TextInput testID="ap-name" placeholder="Patient name" placeholderTextColor={colors.muted} value={pName} onChangeText={setPName} style={styles.input} />
                 <Text style={styles.label}>Mobile Number*</Text>
                 <View style={styles.mobileWrap}>
@@ -1093,13 +1195,13 @@ export default function ReceptionistDashboard() {
                 </View>
                 <Text style={styles.label}>Symptoms / Reason</Text>
                 <TextInput testID="ap-symptoms" placeholder="Fever, cough..." placeholderTextColor={colors.muted} value={pSymptoms} onChangeText={setPSymptoms} multiline style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]} />
-                <Text style={styles.label}>Address</Text>
-                <TextInput testID="ap-address" placeholder="Area, city" placeholderTextColor={colors.muted} value={pAddress} onChangeText={setPAddress} style={styles.input} />
-                <Text style={styles.label}>Slot (optional)</Text>
-                <TextInput testID="ap-slot" placeholder="e.g. 11:00 AM (leave blank for Walk-in)" placeholderTextColor={colors.muted} value={pSlot} onChangeText={setPSlot} style={styles.input} />
+                <Text style={styles.label}>Address / Area (Optional - ऐच्छिक)</Text>
+                <TextInput testID="ap-address" placeholder="Area, city (optional for receptionist)" placeholderTextColor={colors.muted} value={pAddress} onChangeText={setPAddress} style={styles.input} />
+                <Text style={styles.label}>Custom Slot / Note (optional)</Text>
+                <TextInput testID="ap-slot" placeholder="e.g. 11:00 AM (or leave blank)" placeholderTextColor={colors.muted} value={pSlot} onChangeText={setPSlot} style={styles.input} />
                 {addError ? <Text style={styles.error}>{addError}</Text> : null}
                 <Pressable testID="ap-submit" onPress={onAddPatient} disabled={addLoading} style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }]}>
-                  {addLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Add to Queue</Text>}
+                  {addLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Confirm Booking & Add to Queue</Text>}
                 </Pressable>
                 <View style={{ height: spacing.xl }} />
               </ScrollView>
@@ -1592,4 +1694,46 @@ const styles = StyleSheet.create({
   },
   toast: { position: "absolute", bottom: 100, left: 20, right: 20, backgroundColor: colors.success, padding: spacing.md, borderRadius: radius.md, flexDirection: "row", alignItems: "center", gap: spacing.sm, elevation: 5 },
   toastText: { color: "#fff", fontWeight: "600", flex: 1 },
+  recSessionChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: radius.md,
+    backgroundColor: colors.surfaceSecondary,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  recSessionChipActive: {
+    backgroundColor: colors.brandPrimary,
+    borderColor: colors.brandPrimary,
+  },
+  recSessionText: {
+    fontSize: font.sm,
+    fontWeight: "600",
+    color: colors.onSurface,
+  },
+  recWindowChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: radius.md,
+    backgroundColor: "#EEF2FF",
+    borderWidth: 1,
+    borderColor: "#C7D2FE",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
+  recWindowChipActive: {
+    backgroundColor: colors.brandPrimary,
+    borderColor: colors.brandPrimary,
+  },
+  recWindowTime: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: colors.onSurface,
+  },
+  recWindowBadge: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: colors.brandPrimary,
+  },
 });

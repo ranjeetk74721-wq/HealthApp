@@ -126,7 +126,13 @@ export default function DoctorDashboard() {
         // WS is live — stop fallback polling
         if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
       };
-      ws.onmessage = () => { if (isFocused.current) load(true); };
+      ws.onmessage = (e: any) => {
+        try {
+          const msg = typeof e?.data === "string" ? JSON.parse(e.data) : e?.data;
+          if (msg?.type === "ping" || msg?.type === "pong" || msg?.type === "connected") return;
+        } catch {}
+        if (isFocused.current) load(true);
+      };
       ws.onerror   = () => setWsConnected(false);
       ws.onclose   = () => {
         setWsConnected(false);
