@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import {
   View,
   Text,
@@ -54,8 +54,10 @@ export default function BookAppointment() {
   // Booking & payment state
   const [showPay, setShowPay] = useState(false);
   const [booking, setBooking] = useState(false);
+  const [bookingMethod, setBookingMethod] = useState<"online" | "pay_at_clinic" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<any | null>(null);
+  const isSubmittingRef = useRef(false);
 
   const iso = (d: Date) => d.toISOString().split("T")[0];
 
@@ -146,7 +148,11 @@ export default function BookAppointment() {
     (selectedSessionId && (!selectedSession?.booking_windows?.length || selectedWindowId));
 
   const book = async (method: "online" | "pay_at_clinic") => {
+    // Immediate synchronous in-flight guard: prevent duplicate submissions from rapid repeated clicks
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
     setBooking(true);
+    setBookingMethod(method);
     setError(null);
     try {
       const payload: any = {
@@ -170,14 +176,43 @@ export default function BookAppointment() {
       if (patientLat !== null) payload.patient_latitude = patientLat;
       if (patientLon !== null) payload.patient_longitude = patientLon;
 
-      const res = await api.post("/appointments", payload);
+      const res = await api.post("/appointments", payload, { timeoutMs: 12000 });
       setShowPay(false);
       setSuccess(res);
     } catch (e: any) {
-      setShowPay(false);
-      setError(e.message || "Booking failed. Please review session eligibility.");
+      if (e?.isTimeout || e?.name === "TimeoutError") {
+        // A client timeout does not prove server failure.
+        // Reconcile result using existing supported read endpoint before allowing another submission.
+        try {
+          const myAppts = await api.get("/appointments/me", { bypassCache: true, timeoutMs: 6000 });
+          const targetDateStr = iso(selectedDate);
+          const matched = Array.isArray(myAppts)
+            ? myAppts.find(
+                (a: any) =>
+                  a.doctor_id === id &&
+                  a.date === targetDateStr &&
+                  ["booked", "arrived", "in_consultation"].includes(a.status)
+              )
+            : null;
+          if (matched) {
+            setShowPay(false);
+            setSuccess(matched);
+            return;
+          }
+        } catch {
+          // Reconcile read failed
+        }
+        setShowPay(false);
+        setError("Booking request timed out. Server verification confirmed no appointment was created. You can retry.");
+      } else {
+        setShowPay(false);
+        setError(e.message || "Booking failed. Please review session eligibility.");
+      }
     } finally {
+      // Synchronously release in-flight guard so legitimate subsequent booking remains possible and errors do not permanently lock button
+      isSubmittingRef.current = false;
       setBooking(false);
+      setBookingMethod(null);
     }
   };
 
@@ -589,20 +624,41 @@ export default function BookAppointment() {
       <SafeAreaView edges={["bottom"]} style={styles.stickyCta}>
         <Pressable
           testID="proceed-payment-cta"
-          disabled={!canProceedToBook}
+          disabled={!canProceedToBook || booking}
           onPress={() => setShowPay(true)}
-          style={[styles.ctaBtn, !canProceedToBook && { opacity: 0.5 }]}
+          style={[styles.ctaBtn, (!canProceedToBook || booking) && { opacity: 0.6 }]}
         >
-          <Text style={styles.ctaText}>नंबर लगाएँ (Book Appointment)</Text>
-          {selectedSlotTime ? (
-            <Text style={styles.ctaSub}>Selected: {selectedSlotTime}</Text>
-          ) : null}
+          {booking ? (
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8 }}>
+              <ActivityIndicator size="small" color="#fff" />
+              <Text style={styles.ctaText}>Booking…</Text>
+            </View>
+          ) : (
+            <>
+              <Text style={styles.ctaText}>नंबर लगाएँ (Book Appointment)</Text>
+              {selectedSlotTime ? (
+                <Text style={styles.ctaSub}>Selected: {selectedSlotTime}</Text>
+              ) : null}
+            </>
+          )}
         </Pressable>
       </SafeAreaView>
 
       {/* Payment / Confirmation Modal */}
-      <Modal transparent visible={showPay} animationType="slide" onRequestClose={() => setShowPay(false)}>
-        <Pressable style={styles.modalBackdrop} onPress={() => setShowPay(false)}>
+      <Modal
+        transparent
+        visible={showPay}
+        animationType="slide"
+        onRequestClose={() => {
+          if (!booking) setShowPay(false);
+        }}
+      >
+        <Pressable
+          style={styles.modalBackdrop}
+          onPress={() => {
+            if (!booking) setShowPay(false);
+          }}
+        >
           <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
             <View style={styles.sheetHandle} />
             <Text style={styles.sheetTitle}>Confirm Booking & Payment</Text>
@@ -618,35 +674,72 @@ export default function BookAppointment() {
               testID="pay-online"
               disabled={booking}
               onPress={() => book("online")}
-              style={styles.payOption}
+              style={[
+                styles.payOption,
+                booking && { opacity: bookingMethod === "online" ? 0.95 : 0.4 },
+              ]}
             >
               <View style={styles.payIcon}>
-                <Ionicons name="card" size={22} color={colors.brandPrimary} />
+                {booking && bookingMethod === "online" ? (
+                  <ActivityIndicator size="small" color={colors.brandPrimary} />
+                ) : (
+                  <Ionicons name="card" size={22} color={colors.brandPrimary} />
+                )}
               </View>
               <View style={{ flex: 1 }}>
-                <Text style={styles.payTitle}>Pay Online (Mock)</Text>
-                <Text style={styles.paySub}>UPI, Card, Net Banking</Text>
+                <Text style={styles.payTitle}>
+                  {booking && bookingMethod === "online" ? "Booking…" : "Pay Online (Mock)"}
+                </Text>
+                <Text style={styles.paySub}>
+                  {booking && bookingMethod === "online"
+                    ? "Confirming appointment with doctor…"
+                    : "UPI, Card, Net Banking"}
+                </Text>
               </View>
-              <Ionicons name="chevron-forward" size={20} color={colors.muted} />
+              {!(booking && bookingMethod === "online") && (
+                <Ionicons name="chevron-forward" size={20} color={colors.muted} />
+              )}
             </Pressable>
 
             <Pressable
               testID="pay-at-clinic"
               disabled={booking}
               onPress={() => book("pay_at_clinic")}
-              style={styles.payOption}
+              style={[
+                styles.payOption,
+                booking && { opacity: bookingMethod === "pay_at_clinic" ? 0.95 : 0.4 },
+              ]}
             >
               <View style={styles.payIcon}>
-                <Ionicons name="cash" size={22} color={colors.success} />
+                {booking && bookingMethod === "pay_at_clinic" ? (
+                  <ActivityIndicator size="small" color={colors.success} />
+                ) : (
+                  <Ionicons name="cash" size={22} color={colors.success} />
+                )}
               </View>
               <View style={{ flex: 1 }}>
-                <Text style={styles.payTitle}>Pay at Clinic</Text>
-                <Text style={styles.paySub}>Pay cash or UPI at doctor reception</Text>
+                <Text style={styles.payTitle}>
+                  {booking && bookingMethod === "pay_at_clinic" ? "Booking…" : "Pay at Clinic"}
+                </Text>
+                <Text style={styles.paySub}>
+                  {booking && bookingMethod === "pay_at_clinic"
+                    ? "Confirming appointment with doctor…"
+                    : "Pay cash or UPI at doctor reception"}
+                </Text>
               </View>
-              <Ionicons name="chevron-forward" size={20} color={colors.muted} />
+              {!(booking && bookingMethod === "pay_at_clinic") && (
+                <Ionicons name="chevron-forward" size={20} color={colors.muted} />
+              )}
             </Pressable>
 
-            {booking && <ActivityIndicator style={{ marginTop: spacing.md }} color={colors.brand} />}
+            {booking && (
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, marginTop: spacing.md }}>
+                <ActivityIndicator size="small" color={colors.brand} />
+                <Text style={{ fontSize: font.sm, color: colors.onSurfaceSecondary, fontWeight: "500" }}>
+                  Booking appointment…
+                </Text>
+              </View>
+            )}
           </Pressable>
         </Pressable>
       </Modal>

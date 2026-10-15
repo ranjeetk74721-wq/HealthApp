@@ -165,7 +165,7 @@ export async function subscribeToPushNotifications(options?: {
     }
 
     // 3. Initialize Firebase Messaging
-    const app = getFirebaseApp();
+    const app = await getFirebaseApp();
     if (!app) {
       return { ok: false, status: "granted", error: "Firebase app is not configured." };
     }
@@ -228,7 +228,7 @@ export async function unsubscribeFromPushNotifications(): Promise<boolean> {
 
     if (Platform.OS === "web" && typeof window !== "undefined") {
       try {
-        const app = getFirebaseApp();
+        const app = await getFirebaseApp();
         if (app) {
           const { getMessaging, deleteToken } = await import("firebase/messaging");
           const messaging = getMessaging(app);
@@ -261,7 +261,7 @@ export function setupForegroundNotificationListener(
 
   (async () => {
     try {
-      const app = getFirebaseApp();
+      const app = await getFirebaseApp();
       if (!app) return;
       const { getMessaging, onMessage } = await import("firebase/messaging");
       const messaging = getMessaging(app);

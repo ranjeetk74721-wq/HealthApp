@@ -213,6 +213,7 @@ async def ensure_db_indexes():
             # appointments — most queries filter by doctor_id + date
             db.appointments.create_index([("doctor_id", 1), ("date", 1), ("status", 1)]),
             db.appointments.create_index([("doctor_id", 1), ("date", 1), ("queue_order", 1), ("token_number", 1)]),
+            db.appointments.create_index([("doctor_id", 1), ("date", 1), ("session_id", 1), ("queue_order", 1), ("token_number", 1)]),
             db.appointments.create_index([("patient_id", 1), ("created_at", -1)]),
             db.appointments.create_index([("id", 1)], unique=True),
             db.appointments.create_index([("secure_token", 1)], unique=True, sparse=True),
@@ -230,6 +231,9 @@ async def ensure_db_indexes():
             db.doctors.create_index([("user_id", 1)]),
             db.doctors.create_index([("specialty", 1)]),
             db.doctors.create_index([("city", 1)]),
+            # doctor schedule configs
+            db.doctor_schedule_configs.create_index([("id", 1)], unique=True),
+            db.doctor_schedule_configs.create_index([("doctor_id", 1), ("date_type", 1)]),
             # push subscriptions
             db.push_subscriptions.create_index([("token", 1)], unique=True),
             db.push_subscriptions.create_index([("user_id", 1), ("active", 1)]),
@@ -270,6 +274,11 @@ async def health_check():
         return {"status": "ok", "database": "connected"}
     except Exception:
         return {"status": "degraded", "database": "unavailable"}
+
+
+@api_router.get("/health")
+async def api_health_check():
+    return await health_check()
 
 Role = Literal["patient", "doctor", "receptionist", "owner", "admin"]
 
@@ -1413,7 +1422,37 @@ async def resolve_clinic_session_id(doctor_id: str, date: str, session_id: Optio
     return default.get("id")
 
 
-async def get_or_create_doctor_session(doctor_id: str, date: str) -> dict:
+# Field projections for high-performance live ETA calculations
+APPOINTMENT_ETA_PROJECTION = {
+    "_id": 0,
+    "id": 1,
+    "status": 1,
+    "token_number": 1,
+    "queue_order": 1,
+    "started_at": 1,
+    "consultation_completed_at": 1,
+}
+
+DOCTOR_ETA_PROJECTION = {
+    "_id": 0,
+    "avg_consult_minutes": 1,
+    "status": 1,
+    "full_name": 1,
+    "clinic_name": 1,
+}
+
+SESSION_ETA_PROJECTION = {
+    "_id": 0,
+    "history": 0,
+}
+
+
+async def get_or_create_doctor_session(
+    doctor_id: str,
+    date: str,
+    doctor: Optional[dict] = None,
+    existing_appts: Optional[list] = None,
+) -> dict:
     """Fetch existing doctor session for given date or create and persist default session."""
     session_id = f"{doctor_id}_{date}"
     if not hasattr(db, "doctor_sessions") or not hasattr(db.doctor_sessions, "find_one"):
@@ -1430,20 +1469,24 @@ async def get_or_create_doctor_session(doctor_id: str, date: str) -> dict:
     if session:
         return session
 
-    # Fetch doctor profile to seed original start time and hospital_id
-    doctor = await db.doctors.find_one(
-        {"id": doctor_id},
-        {"_id": 0, "timings": 1, "hospital_id": 1, "full_name": 1, "clinic_name": 1, "status": 1}
-    )
+    # Fetch doctor profile to seed original start time and hospital_id if not already supplied
+    if not doctor or not doctor.get("timings"):
+        doctor = await db.doctors.find_one(
+            {"id": doctor_id},
+            {"_id": 0, "timings": 1, "hospital_id": 1, "full_name": 1, "clinic_name": 1, "status": 1}
+        )
     timings = (doctor or {}).get("timings", "10:00 AM - 6:00 PM")
     orig_start = extract_session_start_time(timings)
     hospital_id = (doctor or {}).get("hospital_id")
 
-    # Check appointments for today
-    all_appts = await db.appointments.find(
-        {"doctor_id": doctor_id, "date": date, "status": {"$ne": "cancelled"}},
-        {"_id": 0, "status": 1}
-    ).to_list(500)
+    # Check appointments for today if not already supplied
+    if existing_appts is None:
+        all_appts = await db.appointments.find(
+            {"doctor_id": doctor_id, "date": date, "status": {"$ne": "cancelled"}},
+            {"_id": 0, "status": 1}
+        ).to_list(500)
+    else:
+        all_appts = existing_appts
 
     has_in_consult = any(a.get("status") == "in_consultation" for a in all_appts)
     has_completed = any(a.get("status") == "completed" for a in all_appts)
@@ -1479,7 +1522,9 @@ async def get_or_create_doctor_session(doctor_id: str, date: str) -> dict:
         "updated_at": now_iso(),
     }
     try:
-        await db.doctor_sessions.update_one({"id": session_id}, {"$setOnInsert": session}, upsert=True)
+        res = await db.doctor_sessions.update_one({"id": session_id}, {"$setOnInsert": session}, upsert=True)
+        if getattr(res, "upserted_id", None) is not None:
+            return session
     except Exception:
         pass
 
@@ -1487,16 +1532,85 @@ async def get_or_create_doctor_session(doctor_id: str, date: str) -> dict:
     return saved or session
 
 
-async def calculate_appointment_eta(appt: dict) -> dict:
+async def calculate_appointment_eta(
+    appt: dict,
+    doctor: Optional[dict] = None,
+    session: Optional[dict] = None,
+    schedule_config: Optional[dict] = None,
+) -> dict:
     """Calculate live queue metrics and latest estimated turn time for an appointment."""
+    doctor_id = appt["doctor_id"]
+    appt_date = appt.get("date") or get_ist_now().strftime("%Y-%m-%d")
     appt_session_id = appt.get("session_id")
-    appt_q = {"doctor_id": appt["doctor_id"], "date": appt["date"], "status": {"$ne": "cancelled"}}
-    if appt_session_id and not appt_session_id.endswith("_default"):
+    has_custom_schedule = bool(appt_session_id and not appt_session_id.endswith("_default"))
+
+    appt_q = {"doctor_id": doctor_id, "date": appt_date, "status": {"$ne": "cancelled"}}
+    if has_custom_schedule:
         appt_q["session_id"] = appt_session_id
-    all_appts = await db.appointments.find(
+
+    session_id = f"{doctor_id}_{appt_date}"
+
+    # Build independent concurrent read tasks
+    appts_coro = db.appointments.find(
         appt_q,
-        {"_id": 0},
+        APPOINTMENT_ETA_PROJECTION,
     ).sort([("queue_order", 1), ("token_number", 1)]).to_list(500)
+
+    doc_coro = (
+        db.doctors.find_one({"id": doctor_id}, DOCTOR_ETA_PROJECTION)
+        if doctor is None
+        else None
+    )
+
+    sess_coro = (
+        db.doctor_sessions.find_one({"id": session_id}, SESSION_ETA_PROJECTION)
+        if session is None and hasattr(db, "doctor_sessions") and hasattr(db.doctor_sessions, "find_one")
+        else None
+    )
+
+    sched_coro = (
+        db.doctor_schedule_configs.find_one({"id": appt_session_id}, {"_id": 0, "start_time": 1, "date_overrides": 1})
+        if (schedule_config is None and has_custom_schedule and hasattr(db, "doctor_schedule_configs") and hasattr(db.doctor_schedule_configs, "find_one"))
+        else None
+    )
+
+    pending_tasks = []
+    task_keys = []
+
+    pending_tasks.append(appts_coro)
+    task_keys.append("all_appts")
+
+    if doc_coro is not None:
+        pending_tasks.append(doc_coro)
+        task_keys.append("doctor")
+
+    if sess_coro is not None:
+        pending_tasks.append(sess_coro)
+        task_keys.append("session")
+
+    if sched_coro is not None:
+        pending_tasks.append(sched_coro)
+        task_keys.append("schedule_config")
+
+    gathered_results = await asyncio.gather(*pending_tasks)
+    gathered_map = dict(zip(task_keys, gathered_results))
+
+    all_appts = gathered_map["all_appts"]
+    if doctor is None:
+        doctor = gathered_map.get("doctor")
+    if session is None:
+        session = gathered_map.get("session")
+    if schedule_config is None and has_custom_schedule:
+        schedule_config = gathered_map.get("schedule_config")
+
+    # If doctor session document does not exist yet in database, create or initialize it
+    if not session:
+        session = await get_or_create_doctor_session(
+            doctor_id,
+            appt_date,
+            doctor=doctor,
+            existing_appts=all_appts,
+        )
 
     # Exclude completed, cancelled, and skipped patients from active waiting-time calculation
     active = [a for a in all_appts if a.get("status") in ("booked", "arrived", "in_consultation")]
@@ -1525,14 +1639,9 @@ async def calculate_appointment_eta(appt: dict) -> dict:
         patients_ahead = 0
         my_position = -1
 
-    # Fetch doctor details (duration estimate: configurable, 5-minute default)
-    doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "avg_consult_minutes": 1, "status": 1, "full_name": 1, "clinic_name": 1})
+    # Duration estimate: configurable, 5-minute default
     doc_status = (doctor or {}).get("status", "active")
     per = int((doctor or {}).get("avg_consult_minutes") or 5)
-
-    # Fetch doctor session
-    appt_date = appt.get("date") or get_ist_now().strftime("%Y-%m-%d")
-    session = await get_or_create_doctor_session(appt["doctor_id"], appt_date)
 
     eta_minutes = 0
     expected_turn_time = None
@@ -1596,7 +1705,9 @@ async def calculate_appointment_eta(appt: dict) -> dict:
         elif not has_consultation_occurred:
             exp_start_str = session.get("expected_start_time") or session.get("original_start_time") or "10:00 AM"
             if appt_session_id and not appt_session_id.endswith("_default"):
-                custom_sess = await db.doctor_schedule_configs.find_one({"id": appt_session_id}, {"_id": 0, "start_time": 1, "date_overrides": 1})
+                custom_sess = schedule_config
+                if custom_sess is None and hasattr(db, "doctor_schedule_configs") and hasattr(db.doctor_schedule_configs, "find_one"):
+                    custom_sess = await db.doctor_schedule_configs.find_one({"id": appt_session_id}, {"_id": 0, "start_time": 1, "date_overrides": 1})
                 if custom_sess:
                     override_start = (custom_sess.get("date_overrides", {}).get(appt_date) or {}).get("start_time")
                     exp_start_str = override_start or custom_sess.get("start_time") or exp_start_str
@@ -1975,7 +2086,7 @@ async def send_welcome_status_if_needed(
         doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0})
         hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
         token_num = appt.get("token_number")
-        eta_data = await calculate_appointment_eta(appt)
+        eta_data = await calculate_appointment_eta(appt, doctor=doctor)
         current_serving = eta_data.get("currently_serving")
         serving_display = f"#{current_serving}" if current_serving is not None else "Not started yet"
         eta_display = eta_data.get("expected_turn_time") or "Estimated time updating"
@@ -2094,7 +2205,7 @@ async def notify_queue_movement(doctor_id: str) -> None:
             ) + (1 if current_in_consultation else 0)
 
             # Calculate ETA
-            eta_data = await calculate_appointment_eta(appt)
+            eta_data = await calculate_appointment_eta(appt, doctor=doctor)
             eta_display = eta_data.get("expected_turn_time") or "Estimate pending"
             current_eta_min = eta_data.get("eta_minutes", 0)
 
@@ -2219,7 +2330,7 @@ async def notify_doctor_status_change(doctor_id: str, new_status: str) -> None:
 async def notify_timing_adjusted(doctor_id: str, date: str, new_start_time: Optional[str], reason: Optional[str] = None) -> None:
     """Notify all active waiting patients about the doctor's revised timing."""
     try:
-        doctor = await db.doctors.find_one({"id": doctor_id}, {"_id": 0, "full_name": 1, "clinic_name": 1, "hospital_name": 1})
+        doctor = await db.doctors.find_one({"id": doctor_id}, {"_id": 0, "full_name": 1, "clinic_name": 1, "hospital_name": 1, "avg_consult_minutes": 1, "status": 1})
         hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
         doc_name = (doctor or {}).get("full_name", "").replace("Dr. ", "")
 
@@ -2241,7 +2352,7 @@ async def notify_timing_adjusted(doctor_id: str, date: str, new_start_time: Opti
             if not recipients:
                 continue
 
-            eta_data = await calculate_appointment_eta(a)
+            eta_data = await calculate_appointment_eta(a, doctor=doctor)
             token_num = a.get("token_number")
             serving = eta_data.get("currently_serving")
             serving_display = f"#{serving}" if serving is not None else "Waiting"
@@ -3169,7 +3280,7 @@ async def create_appointment(
     if resolved_session_id:
         dup_filter["session_id"] = resolved_session_id
 
-    existing_appointment = await db.appointments.find_one(dup_filter)
+    existing_appointment = await db.appointments.find_one(dup_filter, {"_id": 1})
     if existing_appointment:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -3182,6 +3293,7 @@ async def create_appointment(
     clinic_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
     slot_label = body.slot or "Token Booking"
 
+    target_session = None
     if body.session_id and not body.session_id.endswith("_default"):
         resolved_sessions = await resolve_doctor_sessions_for_date(
             doctor_id=body.doctor_id,
@@ -3191,6 +3303,7 @@ async def create_appointment(
             patient_lat=body.patient_latitude,
             patient_lon=body.patient_longitude,
             is_staff=False,
+            doctor=doctor,
         )
         target_session = next((s for s in resolved_sessions if s["id"] == body.session_id), None)
         if not target_session:
@@ -3281,7 +3394,12 @@ async def create_appointment(
         )
 
     # Calculate latest ETA and trigger Renflair V7 transactional SMS
-    eta_data = await calculate_appointment_eta(doc)
+    target_sched = target_session if (body.session_id and not body.session_id.endswith("_default")) else None
+    eta_data = await calculate_appointment_eta(
+        doc,
+        doctor=doctor,
+        schedule_config=target_sched,
+    )
     expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
     doc["expected_turn_time"] = expected_time_val
     doc["expected_time"] = expected_time_val
@@ -5152,6 +5270,7 @@ async def resolve_doctor_sessions_for_date(
     patient_lat: Optional[float] = None,
     patient_lon: Optional[float] = None,
     is_staff: bool = False,
+    doctor: Optional[dict] = None,
 ) -> List[dict]:
     """Resolve all configured sessions and booking windows for doctor on a specific date in Asia/Kolkata."""
     try:
@@ -5160,11 +5279,12 @@ async def resolve_doctor_sessions_for_date(
         target_date = get_ist_now().strftime("%Y-%m-%d")
         weekday_name = get_ist_now().strftime("%A")
 
-    # Fetch doctor profile
-    doctor = await db.doctors.find_one(
-        {"id": doctor_id},
-        {"_id": 0, "full_name": 1, "clinic_name": 1, "hospital_name": 1, "city": 1, "address": 1, "timings": 1, "hospital_id": 1, "latitude": 1, "longitude": 1}
-    )
+    # Fetch doctor profile if not already provided
+    if not doctor or (not doctor.get("clinic_name") and not doctor.get("hospital_name") and not doctor.get("timings")):
+        doctor = await db.doctors.find_one(
+            {"id": doctor_id},
+            {"_id": 0, "full_name": 1, "clinic_name": 1, "hospital_name": 1, "city": 1, "address": 1, "timings": 1, "hospital_id": 1, "latitude": 1, "longitude": 1}
+        )
     if not doctor:
         raise HTTPException(status_code=404, detail="Doctor not found")
 
@@ -6282,7 +6402,7 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
         if resolved_session_id:
             dup_filter["session_id"] = resolved_session_id
 
-        existing_appointment = await db.appointments.find_one(dup_filter)
+        existing_appointment = await db.appointments.find_one(dup_filter, {"_id": 1, "session_id": 1})
         if existing_appointment:
             existing_sess_name = ""
             if existing_appointment.get("session_id"):
@@ -6351,7 +6471,7 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
             )
 
         # Trigger Renflair Transactional SMS V7
-        eta_data = await calculate_appointment_eta(appt)
+        eta_data = await calculate_appointment_eta(appt, doctor=doctor)
         dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
         expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
         hour_val = expected_time_val if (" – " in expected_time_val or " - " in expected_time_val) else format_renflair_hour(expected_time_val, default="2")
@@ -6451,12 +6571,12 @@ async def reception_send_appointment_link(
     if not mobile:
         raise HTTPException(status_code=400, detail="Patient has no registered mobile number")
 
-    # Fetch latest ETA using existing queue logic
-    eta_data = await calculate_appointment_eta(appt)
+    # Fetch doctor profile once and pass to ETA calculation
+    doctor = await db.doctors.find_one({"id": appt.get("doctor_id")}, {"_id": 0, "hospital_name": 1, "clinic_name": 1, "avg_consult_minutes": 1, "status": 1}) if appt.get("doctor_id") else None
+    eta_data = await calculate_appointment_eta(appt, doctor=doctor)
     dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
     expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
     hour_val = expected_time_val if (" – " in expected_time_val or " - " in expected_time_val) else format_renflair_hour(expected_time_val, default="2")
-    doctor = await db.doctors.find_one({"id": appt.get("doctor_id")}) if appt.get("doctor_id") else None
     hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
     appt_date = appt.get("date")
 

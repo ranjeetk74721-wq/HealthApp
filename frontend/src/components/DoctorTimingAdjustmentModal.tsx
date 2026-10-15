@@ -9,6 +9,7 @@ import {
   ActivityIndicator,
   ScrollView,
   Platform,
+  KeyboardAvoidingView,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { colors, spacing, radius, font } from "@/src/theme";
@@ -167,6 +168,8 @@ export default function DoctorTimingAdjustmentModal({
 
   // UI state
   const [loading, setLoading] = useState(false);
+  const [verifyingServerState, setVerifyingServerState] = useState(false);
+  const [isTimeoutFailure, setIsTimeoutFailure] = useState(false);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -395,8 +398,12 @@ export default function DoctorTimingAdjustmentModal({
     }
 
     setLoading(true);
+    setVerifyingServerState(false);
+    setIsTimeoutFailure(false);
+    setError(null);
+    let payload: any = null;
     try {
-      const payload: any = {
+      payload = {
         date: sessionData?.date,
         expected_version: sessionData?.version,
         reason: finalReason,
@@ -416,16 +423,64 @@ export default function DoctorTimingAdjustmentModal({
         }
       }
 
-      const res = await api.post(`/doctor/${doctorId}/session/adjust-timing`, payload);
+      const res = await api.post(`/doctor/${doctorId}/session/adjust-timing`, payload, { timeoutMs: 10000 });
       setSuccessMsg(res.message || "Timing updated successfully");
       setTimeout(() => {
         onSuccess(res.session);
         onClose();
       }, 600);
     } catch (err: any) {
-      setError(err?.message || "Failed to adjust doctor timing. Please try again.");
+      if (err?.isTimeout || err?.name === "TimeoutError") {
+        // A client timeout does not prove the server failed to save.
+        // Before offering a repeated write after an ambiguous timeout,
+        // use existing read endpoints to check whether the change already succeeded.
+        setVerifyingServerState(true);
+        try {
+          const targetDate = sessionData?.date;
+          const check = await api.get(`/doctor/${doctorId}/session?date=${targetDate}`, {
+            bypassCache: true,
+            timeoutMs: 6000,
+          });
+          const sess = check?.session;
+          if (sess) {
+            const expectedMatches = payload.new_start_time
+              ? sess.expected_start_time === payload.new_start_time
+              : payload.delay_minutes
+              ? sess.expected_start_time === previewExpected
+              : true;
+            const schedMatches = payload.new_scheduled_start_time
+              ? sess.original_start_time === payload.new_scheduled_start_time
+              : true;
+            const reasonMatches = payload.reason
+              ? sess.delay_reason === payload.reason
+              : true;
+            const unconfirmedMatches = payload.return_time_unconfirmed !== undefined
+              ? Boolean(sess.return_time_unconfirmed) === Boolean(payload.return_time_unconfirmed)
+              : true;
+
+            if (expectedMatches && schedMatches && reasonMatches && unconfirmedMatches) {
+              setSuccessMsg("Timing update confirmed saved on server");
+              setTimeout(() => {
+                onSuccess(sess);
+                onClose();
+              }, 800);
+              return;
+            }
+          }
+        } catch {
+          // Verification read also failed
+        } finally {
+          setVerifyingServerState(false);
+        }
+
+        setIsTimeoutFailure(true);
+        setError("Request timed out. Server verification confirmed timing was not updated. You can safely retry.");
+      } else {
+        setError(err?.message || "Failed to adjust doctor timing. Please try again.");
+      }
     } finally {
       setLoading(false);
+      setVerifyingServerState(false);
     }
   };
 
@@ -438,9 +493,12 @@ export default function DoctorTimingAdjustmentModal({
       visible={visible}
       transparent
       animationType="fade"
-      onRequestClose={() => { if (!loading) onClose(); }}
+      onRequestClose={() => { if (!loading && !verifyingServerState) onClose(); }}
     >
-      <View style={styles.backdrop}>
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={styles.backdrop}
+      >
         <View style={styles.modalCard}>
           {/* ── Header ── */}
           <View style={styles.header}>
@@ -451,7 +509,7 @@ export default function DoctorTimingAdjustmentModal({
               </Text>
             </View>
             <Pressable
-              onPress={() => { if (!loading) onClose(); }}
+              onPress={() => { if (!loading && !verifyingServerState) onClose(); }}
               style={styles.closeBtn}
               testID="close-timing-modal"
               hitSlop={10}
@@ -822,9 +880,9 @@ export default function DoctorTimingAdjustmentModal({
           {/* ── Footer Buttons ── */}
           <View style={styles.footer}>
             <Pressable
-              onPress={() => { if (!loading) onClose(); }}
-              disabled={loading}
-              style={[styles.btn, styles.cancelBtn]}
+              onPress={() => { if (!loading && !verifyingServerState) onClose(); }}
+              disabled={loading || verifyingServerState}
+              style={[styles.btn, styles.cancelBtn, (loading || verifyingServerState) && { opacity: 0.6 }]}
               testID="cancel-timing-btn"
             >
               <Text style={styles.cancelBtnText}>Cancel</Text>
@@ -832,29 +890,33 @@ export default function DoctorTimingAdjustmentModal({
 
             <Pressable
               onPress={handleSave}
-              disabled={loading || Boolean(scheduledInputError) || Boolean(customTimeError)}
+              disabled={loading || verifyingServerState || Boolean(scheduledInputError) || Boolean(customTimeError)}
               style={[
                 styles.btn,
                 styles.saveBtn,
-                (loading || Boolean(scheduledInputError) || Boolean(customTimeError)) && { opacity: 0.65 },
+                (loading || verifyingServerState || Boolean(scheduledInputError) || Boolean(customTimeError)) && { opacity: 0.75 },
               ]}
               testID="save-timing-btn"
             >
-              {loading ? (
+              {loading || verifyingServerState ? (
                 <>
                   <ActivityIndicator size="small" color="#fff" />
-                  <Text style={styles.saveBtnText}>Saving...</Text>
+                  <Text style={styles.saveBtnText}>
+                    {verifyingServerState ? "Verifying..." : "Saving..."}
+                  </Text>
                 </>
               ) : (
                 <>
-                  <Ionicons name="checkmark-circle" size={16} color="#fff" />
-                  <Text style={styles.saveBtnText}>Save & Update Patients</Text>
+                  <Ionicons name={isTimeoutFailure ? "refresh-outline" : "checkmark-circle"} size={16} color="#fff" />
+                  <Text style={styles.saveBtnText}>
+                    {isTimeoutFailure ? "Retry Timing Update" : "Save & Update Patients"}
+                  </Text>
                 </>
               )}
             </Pressable>
           </View>
         </View>
-      </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }
@@ -872,7 +934,8 @@ const styles = StyleSheet.create({
     borderRadius: radius.lg,
     width: "100%",
     maxWidth: 540,
-    maxHeight: "94%",
+    maxHeight: "92%",
+    flexDirection: "column",
     padding: spacing.lg,
     ...Platform.select({
       web: { boxShadow: "0 10px 25px rgba(0,0,0,0.2)" },
@@ -890,7 +953,11 @@ const styles = StyleSheet.create({
   title: { fontSize: font.lg, fontWeight: "700", color: colors.onSurface },
   subtitle: { fontSize: font.sm, color: colors.onSurfaceSecondary, marginTop: 2 },
   closeBtn: { padding: spacing.xs },
-  scroll: { marginVertical: spacing.xs },
+  scroll: {
+    flex: 1,
+    flexGrow: 1,
+    marginVertical: spacing.xs,
+  },
 
   // Section
   section: {
