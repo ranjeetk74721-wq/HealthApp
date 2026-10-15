@@ -16,6 +16,7 @@ import DoctorSessionBar from "@/src/components/DoctorSessionBar";
 import DoctorSessionManagerModal from "@/src/components/DoctorSessionManagerModal";
 import PatientDetailsModal from "@/src/components/PatientDetailsModal";
 import { printPatientList } from "@/src/utils/printPatientList";
+import { safeLocalStorageGet } from "@/src/utils/safeStorage";
 
 const POLL_INTERVAL_MS = 10_000;
 const GENDERS = ["Male", "Female", "Other"];
@@ -41,7 +42,7 @@ export default function ReceptionistDashboard() {
   // ── Canonical Receptionist Route Guard ──
   useEffect(() => {
     if (!authLoading && (!user || user.role !== "receptionist")) {
-      const lastHosp = (typeof window !== "undefined" && window.localStorage?.getItem("cq_receptionist_last_hospital")) || "";
+      const lastHosp = safeLocalStorageGet("cq_receptionist_last_hospital") || "";
       if (lastHosp) {
         router.replace({ pathname: "/staff-login", params: { role: "receptionist", hospitalId: lastHosp } });
       } else {
@@ -52,7 +53,7 @@ export default function ReceptionistDashboard() {
 
   // Safe redirect on authentication expiration
   const handleAuthExpired = useCallback(async () => {
-    const lastHosp = user?.hospital_id || (typeof window !== "undefined" && window.localStorage?.getItem("cq_receptionist_last_hospital")) || "";
+    const lastHosp = user?.hospital_id || safeLocalStorageGet("cq_receptionist_last_hospital") || "";
     await signOut();
     if (lastHosp) {
       router.replace({ pathname: "/staff-login", params: { role: "receptionist", hospitalId: lastHosp } });

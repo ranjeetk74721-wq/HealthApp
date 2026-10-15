@@ -12,6 +12,9 @@ export default function Root({ children }: PropsWithChildren) {
         <meta name="google-site-verification" content="odBixVw-npeF1pKbiKtQ8c85qhvGX0UPzNCRC_oY82M" />
         <meta name="theme-color" content="#0369A1" />
         <meta name="description" content="MeriBaari — Book doctor appointments, view live token numbers, and track rolling estimated waiting times in real-time." />
+        <meta httpEquiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+        <meta httpEquiv="Pragma" content="no-cache" />
+        <meta httpEquiv="Expires" content="0" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta name="apple-mobile-web-app-capable" content="yes" />
         <meta name="apple-mobile-web-app-status-bar-style" content="default" />

@@ -17,6 +17,8 @@ import { api, ApiError } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { safeLocalStorageGet } from "@/src/utils/safeStorage";
+
 export default function StaffLogin() {
   const router = useRouter();
   const params = useLocalSearchParams<{
@@ -28,7 +30,7 @@ export default function StaffLogin() {
   const { signIn } = useAuth();
   const insets = useSafeAreaInsets();
 
-  const savedHospitalId = typeof window !== "undefined" ? window.localStorage?.getItem("cq_receptionist_last_hospital") : null;
+  const savedHospitalId = safeLocalStorageGet("cq_receptionist_last_hospital");
   const hospitalId = (params.hospitalId as string) || savedHospitalId || "Unknown Hospital";
   const hospitalName = (params.hospitalName as string) || (hospitalId !== "Unknown Hospital" ? `Hospital ${hospitalId}` : "");
   const role = (params.role as string) || "";

@@ -117,12 +117,12 @@ export function getApiBase(): string {
   return base ? `${base}/api` : "/api";
 }
 
+import { safeSessionStorageGet } from "@/src/utils/safeStorage";
+
 async function getToken(): Promise<string | null> {
-  if (Platform.OS === "web" && typeof window !== "undefined") {
-    try {
-      const sessToken = window.sessionStorage.getItem("cq_session_token");
-      if (sessToken) return sessToken;
-    } catch {}
+  if (Platform.OS === "web") {
+    const sessToken = safeSessionStorageGet("cq_session_token");
+    if (sessToken) return sessToken;
   }
   return await AsyncStorage.getItem("cq_token");
 }

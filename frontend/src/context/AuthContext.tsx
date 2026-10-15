@@ -76,6 +76,15 @@ async function registerForPush(user_id: string) {
   }
 }
 
+import {
+  safeLocalStorageGet,
+  safeLocalStorageSet,
+  safeLocalStorageRemove,
+  safeSessionStorageGet,
+  safeSessionStorageSet,
+  safeSessionStorageRemove,
+} from "@/src/utils/safeStorage";
+
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [state, setState] = useState<AuthState>({ token: null, user: null, loading: true });
 
@@ -83,37 +92,38 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     (async () => {
       try {
         // 1. One-time legacy migration for receptionist persisted sessions on web
-        if (Platform.OS === "web" && typeof window !== "undefined") {
+        if (Platform.OS === "web") {
           try {
-            const hasMigrated = window.localStorage.getItem(MIGRATION_KEY);
+            const hasMigrated = safeLocalStorageGet(MIGRATION_KEY);
             if (!hasMigrated) {
-              const legacyUserStr = window.localStorage.getItem(USER_KEY);
+              const legacyUserStr = safeLocalStorageGet(USER_KEY);
               if (legacyUserStr) {
                 try {
                   const parsed = JSON.parse(legacyUserStr);
                   if (parsed?.role === "receptionist") {
                     if (parsed.hospital_id) {
-                      window.localStorage.setItem(RECEPTIONIST_LAST_HOSPITAL_KEY, parsed.hospital_id);
+                      safeLocalStorageSet(RECEPTIONIST_LAST_HOSPITAL_KEY, parsed.hospital_id);
                     }
-                    window.localStorage.removeItem(TOKEN_KEY);
-                    window.localStorage.removeItem(USER_KEY);
+                    safeLocalStorageRemove(TOKEN_KEY);
+                    safeLocalStorageRemove(USER_KEY);
                     await AsyncStorage.removeItem(TOKEN_KEY);
                     await AsyncStorage.removeItem(USER_KEY);
                   }
                 } catch {}
               }
-              window.localStorage.setItem(MIGRATION_KEY, "done");
+              safeLocalStorageSet(MIGRATION_KEY, "done");
             }
           } catch {}
         }
 
         // 2. Check tab-scoped sessionStorage on Web for active receptionist session
-        if (Platform.OS === "web" && typeof window !== "undefined") {
+        if (Platform.OS === "web") {
           try {
-            const sessToken = window.sessionStorage.getItem(SESSION_TOKEN_KEY);
-            const sessUserStr = window.sessionStorage.getItem(SESSION_USER_KEY);
+            const sessToken = safeSessionStorageGet(SESSION_TOKEN_KEY);
+            const sessUserStr = safeSessionStorageGet(SESSION_USER_KEY);
             if (sessToken && sessUserStr) {
-              const parsedSessUser = JSON.parse(sessUserStr);
+              let parsedSessUser: any = null;
+              try { parsedSessUser = JSON.parse(sessUserStr); } catch {}
               if (parsedSessUser?.role === "receptionist") {
                 setState({ token: sessToken, user: parsedSessUser, loading: false });
                 if (parsedSessUser?.id) {
@@ -130,14 +140,15 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           AsyncStorage.getItem(TOKEN_KEY),
           AsyncStorage.getItem(USER_KEY),
         ]);
-        const parsedUser = u ? JSON.parse(u) : null;
+        let parsedUser: any = null;
+        if (u) {
+          try { parsedUser = JSON.parse(u); } catch {}
+        }
 
         // If a receptionist was found in long-lived storage, clean it out and require fresh login
         if (parsedUser?.role === "receptionist") {
-          if (Platform.OS === "web" && typeof window !== "undefined" && parsedUser.hospital_id) {
-            try {
-              window.localStorage.setItem(RECEPTIONIST_LAST_HOSPITAL_KEY, parsedUser.hospital_id);
-            } catch {}
+          if (Platform.OS === "web" && parsedUser.hospital_id) {
+            safeLocalStorageSet(RECEPTIONIST_LAST_HOSPITAL_KEY, parsedUser.hospital_id);
           }
           await Promise.all([
             AsyncStorage.removeItem(TOKEN_KEY),
@@ -182,13 +193,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
     if (user.role === "receptionist" && Platform.OS === "web") {
       // Receptionist on web: keep strictly in tab-scoped sessionStorage
-      try {
-        window.sessionStorage.setItem(SESSION_TOKEN_KEY, token);
-        window.sessionStorage.setItem(SESSION_USER_KEY, JSON.stringify(user));
-        if ((user as any).hospital_id) {
-          window.localStorage.setItem(RECEPTIONIST_LAST_HOSPITAL_KEY, (user as any).hospital_id);
-        }
-      } catch {}
+      safeSessionStorageSet(SESSION_TOKEN_KEY, token);
+      safeSessionStorageSet(SESSION_USER_KEY, JSON.stringify(user));
+      if ((user as any).hospital_id) {
+        safeLocalStorageSet(RECEPTIONIST_LAST_HOSPITAL_KEY, (user as any).hospital_id);
+      }
       // Clear any persistent keys
       await Promise.all([
         AsyncStorage.removeItem(TOKEN_KEY),
@@ -197,10 +206,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     } else {
       // Non-receptionist roles (doctor, patient, owner, admin) retain persistent storage
       if (Platform.OS === "web") {
-        try {
-          window.sessionStorage.removeItem(SESSION_TOKEN_KEY);
-          window.sessionStorage.removeItem(SESSION_USER_KEY);
-        } catch {}
+        safeSessionStorageRemove(SESSION_TOKEN_KEY);
+        safeSessionStorageRemove(SESSION_USER_KEY);
       }
       await Promise.all([
         AsyncStorage.setItem(TOKEN_KEY, token),
@@ -213,12 +220,16 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       registerForPush(user.id).catch(() => {});
 
       // On web, if notifications were previously granted, link the device token to the new user
-      if (
-        Platform.OS === "web" &&
-        typeof window !== "undefined" &&
-        typeof Notification !== "undefined" &&
-        Notification.permission === "granted"
-      ) {
+      let isNotifGranted = false;
+      try {
+        isNotifGranted =
+          Platform.OS === "web" &&
+          typeof window !== "undefined" &&
+          typeof Notification !== "undefined" &&
+          Notification.permission === "granted";
+      } catch {}
+
+      if (isNotifGranted) {
         AsyncStorage.getItem(PUSH_TOKEN_KEY).then((cached) => {
           if (cached) {
             const base = getBackendBase();
@@ -235,7 +246,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
               }),
             }).catch(() => {});
           }
-        });
+        }).catch(() => {});
       }
     }
   }, []);
@@ -255,7 +266,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         }).catch(() => {});
 
         // On Web, delete FCM token on the device to stop previous account's notifications
-        if (Platform.OS === "web" && typeof window !== "undefined") {
+        if (Platform.OS === "web") {
           try {
             const { getFirebaseApp } = await import("@/src/firebase");
             const app = await getFirebaseApp();
@@ -274,12 +285,10 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     }
 
     // Clean up web session storage and trigger cross-tab logout sync
-    if (Platform.OS === "web" && typeof window !== "undefined") {
-      try {
-        window.sessionStorage.removeItem(SESSION_TOKEN_KEY);
-        window.sessionStorage.removeItem(SESSION_USER_KEY);
-        window.localStorage.setItem(LOGOUT_BROADCAST_KEY, Date.now().toString());
-      } catch {}
+    if (Platform.OS === "web") {
+      safeSessionStorageRemove(SESSION_TOKEN_KEY);
+      safeSessionStorageRemove(SESSION_USER_KEY);
+      safeLocalStorageSet(LOGOUT_BROADCAST_KEY, Date.now().toString());
     }
 
     await Promise.all([

@@ -690,7 +690,18 @@ export default function OwnerDashboard() {
     s.toLowerCase().includes(editDocSpecSearch.toLowerCase().trim())
   );
 
-  if (authLoading || (loading && !stats)) return <SafeAreaView style={styles.safe}><ActivityIndicator style={{ marginTop: 60 }} color={colors.brandPrimary} /></SafeAreaView>;
+  if (authLoading || (loading && !stats && !error)) {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <View style={{ flex: 1, justifyContent: "center", alignItems: "center", gap: 12 }}>
+          <ActivityIndicator size="large" color={colors.brandPrimary} />
+          <Text style={{ color: colors.muted, fontSize: font.sm, fontWeight: "600" }}>
+            Loading Admin Panel...
+          </Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
@@ -705,6 +716,18 @@ export default function OwnerDashboard() {
       </View>
 
       <ScrollView contentContainerStyle={styles.scroll} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true); }} />}>
+        {error && (
+          <View style={{ backgroundColor: "#FEF2F2", borderColor: "#FCA5A5", borderWidth: 1, borderRadius: radius.md, padding: spacing.md, marginVertical: spacing.sm, flexDirection: "row", alignItems: "center", gap: 12 }}>
+            <Ionicons name="alert-circle-outline" size={24} color={colors.error} />
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontSize: font.sm, fontWeight: "600", color: "#991B1B" }}>Failed to Load Admin Data</Text>
+              <Text style={{ fontSize: font.xs, color: "#7F1D1D", marginTop: 2 }}>{error}</Text>
+            </View>
+            <Pressable onPress={() => load(true)} style={{ backgroundColor: colors.brandPrimary, paddingHorizontal: 12, paddingVertical: 6, borderRadius: radius.sm }}>
+              <Text style={{ color: "#fff", fontWeight: "600", fontSize: font.xs }}>Retry</Text>
+            </Pressable>
+          </View>
+        )}
         {stats && (
           <View style={styles.kpiRow}>
             <View style={styles.kpiCard}>
