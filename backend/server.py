@@ -3755,14 +3755,27 @@ async def doctor_appointments(
         {"doctor_id": d["id"], "date": target_date, "status": {"$ne": "cancelled"}},
         {"_id": 0},
     ).sort("token_number", 1).to_list(500)
+    # Batch-fetch missing patient addresses to eliminate N+1 queries
+    missing_pids = list({a["patient_id"] for a in appts if not a.get("patient_address") and a.get("patient_id")})
+    user_address_map = {}
+    if missing_pids:
+        try:
+            users = await db.users.find({"id": {"$in": missing_pids}}, {"_id": 0, "id": 1, "address": 1}).to_list(len(missing_pids))
+            user_address_map = {u["id"]: u["address"] for u in users if u.get("address")}
+        except Exception:
+            pass
+
     for a in appts:
         if not a.get("patient_address") and a.get("patient_id"):
-            try:
-                u = await db.users.find_one({"id": a["patient_id"]}, {"_id": 0, "address": 1})
-                if u and u.get("address"):
-                    a["patient_address"] = u["address"]
-            except Exception:
-                pass
+            if a["patient_id"] in user_address_map:
+                a["patient_address"] = user_address_map[a["patient_id"]]
+            else:
+                try:
+                    u = await db.users.find_one({"id": a["patient_id"]}, {"_id": 0, "address": 1})
+                    if u and u.get("address"):
+                        a["patient_address"] = u["address"]
+                except Exception:
+                    pass
         if a.get("payment_amount") is None and d.get("fees") is not None:
             a["payment_amount"] = d["fees"]
         if not a.get("payment_status"):
@@ -3775,7 +3788,7 @@ async def doctor_dashboard(user: dict = Depends(require_role("doctor"))):
     d = await db.doctors.find_one({"user_id": user["id"]}, {"_id": 0})
     if not d:
         raise HTTPException(status_code=404, detail="Doctor profile not found")
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = get_ist_now().strftime("%Y-%m-%d")
     all_today = await db.appointments.find({"doctor_id": d["id"], "date": today}, {"_id": 0}).to_list(500)
     completed = [a for a in all_today if a["status"] == "completed"]
     pending = [a for a in all_today if a["status"] in ("booked", "arrived", "in_consultation")]
@@ -3823,8 +3836,20 @@ async def verify_doctor_session_access(doctor_id: str, user: dict, write: bool =
     elif role == "receptionist":
         user_hosp = (user.get("hospital_id") or "").strip().upper()
         doc_hosp = (doc.get("hospital_id") or "").strip().upper()
-        if user_hosp and doc_hosp and user_hosp != doc_hosp:
-            raise HTTPException(status_code=403, detail="Forbidden: Doctor does not belong to your hospital")
+        rec_doc_id = user.get("doctor_id") or user.get("assigned_doctor_id")
+
+        # Check direct doctor assignment
+        is_directly_assigned = bool(rec_doc_id and rec_doc_id == doctor_id)
+        # Check hospital matching
+        hospital_match = bool(user_hosp and doc_hosp and user_hosp == doc_hosp)
+        # Check doctor record lists this receptionist
+        is_doctor_user = bool(
+            doc.get("receptionist_id") == user.get("id") or
+            user.get("id") in (doc.get("receptionist_ids") or [])
+        )
+
+        if not (hospital_match or is_directly_assigned or is_doctor_user):
+            raise HTTPException(status_code=403, detail="Forbidden: Doctor does not belong to your hospital or assigned clinic")
     elif role in ("admin", "owner", "developer"):
         user_hosp = (user.get("hospital_id") or "").strip().upper()
         doc_hosp = (doc.get("hospital_id") or "").strip().upper()
@@ -3849,17 +3874,19 @@ async def get_doctor_session(
     session_date = date or get_ist_now().strftime("%Y-%m-%d")
     session = await get_or_create_doctor_session(doctor_id, session_date)
 
-    # Count waiting patients affected
-    waiting_count = await db.appointments.count_documents({
-        "doctor_id": doctor_id,
-        "date": session_date,
-        "status": {"$in": ["booked", "arrived"]}
-    })
-    total_active = await db.appointments.count_documents({
-        "doctor_id": doctor_id,
-        "date": session_date,
-        "status": {"$in": ["booked", "arrived", "in_consultation"]}
-    })
+    # Count waiting patients affected concurrently
+    waiting_count, total_active = await asyncio.gather(
+        db.appointments.count_documents({
+            "doctor_id": doctor_id,
+            "date": session_date,
+            "status": {"$in": ["booked", "arrived"]}
+        }),
+        db.appointments.count_documents({
+            "doctor_id": doctor_id,
+            "date": session_date,
+            "status": {"$in": ["booked", "arrived", "in_consultation"]}
+        }),
+    )
 
     return {
         "ok": True,
@@ -3892,34 +3919,42 @@ async def list_clinic_sessions(
         {"_id": 0},
     ).sort("session_number", 1).to_list(20)
 
-    # Enrich each session with live patient counts
+    # Batch-enrich sessions with live patient counts and timing data
+    session_ids = [s["id"] for s in sessions]
+    counts_map: Dict[str, Dict[str, int]] = {}
+    if session_ids:
+        try:
+            agg = await db.appointments.aggregate([
+                {"$match": {"doctor_id": doctor_id, "date": session_date, "session_id": {"$in": session_ids}}},
+                {"$group": {"_id": {"session_id": "$session_id", "status": "$status"}, "count": {"$sum": 1}}},
+            ]).to_list(200)
+            for item in agg:
+                sid = item["_id"].get("session_id")
+                st = item["_id"].get("status")
+                if sid and st:
+                    counts_map.setdefault(sid, {})[st] = item["count"]
+        except Exception:
+            pass
+
+    timing_ids = [f"{doctor_id}_{session_date}_{sid}" for sid in session_ids] + [f"{doctor_id}_{session_date}"]
+    doctor_sess_map = {}
+    if timing_ids:
+        try:
+            docs = await db.doctor_sessions.find({"id": {"$in": timing_ids}}, {"_id": 0}).to_list(len(timing_ids))
+            doctor_sess_map = {d["id"]: d for d in docs}
+        except Exception:
+            pass
+
     for s in sessions:
         sid = s["id"]
-        s["waiting_count"] = await db.appointments.count_documents({
-            "doctor_id": doctor_id, "date": session_date,
-            "session_id": sid, "status": {"$in": ["booked", "arrived"]},
-        })
-        s["in_consultation_count"] = await db.appointments.count_documents({
-            "doctor_id": doctor_id, "date": session_date,
-            "session_id": sid, "status": "in_consultation",
-        })
-        s["completed_count"] = await db.appointments.count_documents({
-            "doctor_id": doctor_id, "date": session_date,
-            "session_id": sid, "status": "completed",
-        })
-        s["total_count"] = await db.appointments.count_documents({
-            "doctor_id": doctor_id, "date": session_date,
-            "session_id": sid, "status": {"$nin": ["cancelled"]},
-        })
-        # Pull the linked doctor_session timing/delay data
-        doctor_sess = await db.doctor_sessions.find_one(
-            {"id": f"{doctor_id}_{session_date}_{sid}"}, {"_id": 0}
-        )
-        if not doctor_sess:
-            # Fallback to legacy single-session record
-            doctor_sess = await db.doctor_sessions.find_one(
-                {"id": f"{doctor_id}_{session_date}"}, {"_id": 0}
-            )
+        c = counts_map.get(sid, {})
+        s["waiting_count"] = c.get("booked", 0) + c.get("arrived", 0)
+        s["in_consultation_count"] = c.get("in_consultation", 0)
+        s["completed_count"] = c.get("completed", 0)
+        s["total_count"] = sum(v for k, v in c.items() if k != "cancelled")
+
+        # Pull the linked doctor_session timing/delay data (with legacy fallback)
+        doctor_sess = doctor_sess_map.get(f"{doctor_id}_{session_date}_{sid}") or doctor_sess_map.get(f"{doctor_id}_{session_date}")
         s["doctor_session"] = doctor_sess
 
     return {"ok": True, "sessions": sessions, "date": session_date}
@@ -4381,6 +4416,9 @@ async def _generate_session_excel(doctor_id: str, session_id: str, session_date:
             "Access-Control-Expose-Headers": "Content-Disposition",
         },
     )
+
+
+@api_router.post("/doctor/{doctor_id}/session/cabin-presence")
 async def update_cabin_presence(
     doctor_id: str,
     body: CabinPresenceBody,
@@ -5355,6 +5393,7 @@ async def get_doctor_sessions_staff(
     user: dict = Depends(get_current_user),
 ):
     """Staff endpoint to fetch all configured sessions and windows for a doctor without location restrictions."""
+    await verify_doctor_session_access(doctor_id, user, write=False)
     target_date = date or get_ist_now().strftime("%Y-%m-%d")
     is_staff = user.get("role") in ("receptionist", "doctor", "admin", "owner", "developer")
     sessions = await resolve_doctor_sessions_for_date(
@@ -5392,7 +5431,7 @@ async def get_doctor_sessions_public(
 async def create_doctor_session(
     doctor_id: str,
     body: DoctorScheduleSessionCreate,
-    user: dict = Depends(require_role("doctor", "admin", "owner", "developer")),
+    user: dict = Depends(require_role("doctor", "receptionist", "admin", "owner", "developer")),
 ):
     """Doctor or admin configures an unlimited daily or recurring session with location-based booking windows."""
     await verify_doctor_session_access(doctor_id, user, write=True)
@@ -5467,7 +5506,7 @@ async def update_doctor_session(
     doctor_id: str,
     session_id: str,
     body: DoctorScheduleSessionUpdate,
-    user: dict = Depends(require_role("doctor", "admin", "owner", "developer")),
+    user: dict = Depends(require_role("doctor", "receptionist", "admin", "owner", "developer")),
 ):
     """Doctor or admin edits an existing session schedule configuration."""
     await verify_doctor_session_access(doctor_id, user, write=True)
@@ -5525,7 +5564,7 @@ async def update_doctor_session(
 async def delete_doctor_session(
     doctor_id: str,
     session_id: str,
-    user: dict = Depends(require_role("doctor", "admin", "owner", "developer")),
+    user: dict = Depends(require_role("doctor", "receptionist", "admin", "owner", "developer")),
 ):
     """Delete a session schedule configuration."""
     await verify_doctor_session_access(doctor_id, user, write=True)
@@ -5843,22 +5882,47 @@ async def reception_queue(
             if not any(a["id"] == ca["id"] for a in appts):
                 appts.insert(0, ca)
 
+    # Batch-fetch missing patient addresses and doctor fees to eliminate N+1 queries
+    missing_pids = list({a["patient_id"] for a in appts if not a.get("patient_address") and a.get("patient_id")})
+    user_address_map = {}
+    if missing_pids:
+        try:
+            users = await db.users.find({"id": {"$in": missing_pids}}, {"_id": 0, "id": 1, "address": 1}).to_list(len(missing_pids))
+            user_address_map = {u["id"]: u["address"] for u in users if u.get("address")}
+        except Exception:
+            pass
+
+    doc_ids_needed = list({a["doctor_id"] for a in appts if a.get("payment_amount") is None and a.get("doctor_id")})
+    doc_fee_map = {}
+    if doc_ids_needed:
+        try:
+            docs = await db.doctors.find({"id": {"$in": doc_ids_needed}}, {"_id": 0, "id": 1, "fees": 1}).to_list(len(doc_ids_needed))
+            doc_fee_map = {d["id"]: d["fees"] for d in docs if d.get("fees") is not None}
+        except Exception:
+            pass
+
     # Enrich appointments with real-time dynamic ETAs and patient details
     for a in appts:
         if not a.get("patient_address") and a.get("patient_id"):
-            try:
-                u = await db.users.find_one({"id": a["patient_id"]}, {"_id": 0, "address": 1})
-                if u and u.get("address"):
-                    a["patient_address"] = u["address"]
-            except Exception:
-                pass
+            if a["patient_id"] in user_address_map:
+                a["patient_address"] = user_address_map[a["patient_id"]]
+            else:
+                try:
+                    u = await db.users.find_one({"id": a["patient_id"]}, {"_id": 0, "address": 1})
+                    if u and u.get("address"):
+                        a["patient_address"] = u["address"]
+                except Exception:
+                    pass
         if a.get("payment_amount") is None and a.get("doctor_id"):
-            try:
-                doc_fee = await db.doctors.find_one({"id": a["doctor_id"]}, {"_id": 0, "fees": 1})
-                if doc_fee and doc_fee.get("fees") is not None:
-                    a["payment_amount"] = doc_fee["fees"]
-            except Exception:
-                pass
+            if a["doctor_id"] in doc_fee_map:
+                a["payment_amount"] = doc_fee_map[a["doctor_id"]]
+            else:
+                try:
+                    doc_fee = await db.doctors.find_one({"id": a["doctor_id"]}, {"_id": 0, "fees": 1})
+                    if doc_fee and doc_fee.get("fees") is not None:
+                        a["payment_amount"] = doc_fee["fees"]
+                except Exception:
+                    pass
         if not a.get("payment_status"):
             a["payment_status"] = "pending"
 
@@ -5964,27 +6028,30 @@ async def complete_consultation(body: QueueActionBody, user: dict = Depends(requ
         }}
     )
 
-    # Notify completed patient once that their consultation is complete
+    # Move nonessential notification delivery off the response-critical path using background task
     pid = appt.get("patient_id")
     recipients = [r for r in [pid, appt["id"]] if r and r != "emergency"]
     if recipients:
-        doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "full_name": 1, "hospital_name": 1, "clinic_name": 1})
-        hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
-        sec_token = appt.get("secure_token")
-        action_url = f"/appointment/{sec_token}" if sec_token else "/patient/history"
-        try:
-            await send_fcm_web_push(
-                recipients=recipients,
-                title=f"{hospital_name} — Consultation Complete",
-                body="Your consultation is complete. Thank you for visiting!",
-                action_url=action_url,
-                tag=f"meribaari-complete-{appt['id']}",
-            )
-        except Exception as e:
-            logger.warning(f"Error sending completion push (non-fatal): {e}")
+        async def _send_completion_push():
+            try:
+                doctor = await db.doctors.find_one({"id": appt["doctor_id"]}, {"_id": 0, "full_name": 1, "hospital_name": 1, "clinic_name": 1})
+                hospital_name = (doctor or {}).get("hospital_name") or (doctor or {}).get("clinic_name") or "MeriBaari Clinic"
+                sec_token = appt.get("secure_token")
+                action_url = f"/appointment/{sec_token}" if sec_token else "/patient/history"
+                await send_fcm_web_push(
+                    recipients=recipients,
+                    title=f"{hospital_name} — Consultation Complete",
+                    body="Your consultation is complete. Thank you for visiting!",
+                    action_url=action_url,
+                    tag=f"meribaari-complete-{appt['id']}",
+                )
+                await db.push_subscriptions.update_many({"appointment_id": appt["id"]}, {"$set": {"active": False}})
+            except Exception as e:
+                logger.warning(f"Error sending completion push (non-fatal): {e}")
 
-    # Deactivate push subscriptions for this completed appointment so subsequent queue notifications stop
-    await db.push_subscriptions.update_many({"appointment_id": appt["id"]}, {"$set": {"active": False}})
+        asyncio.create_task(_send_completion_push())
+    else:
+        await db.push_subscriptions.update_many({"appointment_id": appt["id"]}, {"$set": {"active": False}})
 
 
     # Check if remaining queue for today is complete
@@ -6469,7 +6536,14 @@ async def reception_export_excel(
     target_date = date or today
 
     q: dict = {"date": target_date}
-    if user.get("hospital_id"):
+    if user.get("role") == "doctor":
+        doc = await db.doctors.find_one({"user_id": user["id"]})
+        if not doc:
+            doc = await db.doctors.find_one({"id": user["id"]})
+        if doc:
+            doctor_id = doc["id"]
+            q["doctor_id"] = doctor_id
+    elif user.get("hospital_id"):
         docs = await db.doctors.find({"hospital_id": user["hospital_id"]}, {"id": 1}).to_list(None)
         valid_doc_ids = [d["id"] for d in docs]
         if doctor_id:

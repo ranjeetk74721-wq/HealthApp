@@ -109,10 +109,22 @@ export default function DoctorSessionManagerModal({
   }, [doctorId, selectedDate]);
 
   useEffect(() => {
-    if (visible) {
+    if (visible && doctorId) {
+      setViewMode("list");
+      setEditingSessionId(null);
+      setOverrideSession(null);
+      setErrorMsg(null);
+      if (initialDate) {
+        setSelectedDate(initialDate);
+      }
       loadSessions();
+    } else if (!visible) {
+      setSessions([]);
+      setEditingSessionId(null);
+      setOverrideSession(null);
+      setErrorMsg(null);
     }
-  }, [visible, loadSessions]);
+  }, [visible, doctorId, initialDate, loadSessions]);
 
   const toggleDay = (day: string) => {
     if (selectedDays.includes(day)) {
@@ -399,9 +411,16 @@ export default function DoctorSessionManagerModal({
       <View style={styles.container}>
         {/* Header */}
         <View style={styles.header}>
-          <View>
-            <Text style={styles.headerTitle}>Doctor Daily Sessions & Slots</Text>
-            <Text style={styles.headerSub}>{doctorName} · Asia/Kolkata</Text>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 10, flex: 1 }}>
+            <View style={styles.docHeaderBadge}>
+              <Ionicons name="medical" size={20} color={colors.brandPrimary} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.headerTitle}>OPD Sessions & Shifts</Text>
+              <Text style={styles.headerSub}>
+                Doctor: <Text style={{ fontWeight: "700", color: colors.brandPrimary }}>{doctorName}</Text> · Asia/Kolkata
+              </Text>
+            </View>
           </View>
           <Pressable onPress={onClose} style={styles.closeBtn} testID="close-session-manager-btn">
             <Ionicons name="close" size={24} color={colors.onSurface} />
@@ -590,6 +609,34 @@ export default function DoctorSessionManagerModal({
             {/* Basic Info */}
             <View style={styles.section}>
               <Text style={styles.sectionHeader}>1. Session & Clinic Details</Text>
+
+              <Text style={styles.fieldLabel}>Shift Presets (Quick Templates)</Text>
+              <View style={styles.presetsRow}>
+                {[
+                  { label: "Morning OPD", start: "10:00 AM", end: "02:00 PM" },
+                  { label: "Evening OPD", start: "05:00 PM", end: "09:00 PM" },
+                  { label: "Night Shift", start: "09:00 PM", end: "06:00 AM" },
+                  { label: "Emergency Shift", start: "08:00 AM", end: "08:00 PM" },
+                ].map((preset) => {
+                  const active = sessionName === preset.label;
+                  return (
+                    <Pressable
+                      key={preset.label}
+                      onPress={() => {
+                        setSessionName(preset.label);
+                        setStartTime(preset.start);
+                        setEndTime(preset.end);
+                      }}
+                      style={[styles.presetChip, active && styles.presetChipActive]}
+                    >
+                      <Text style={[styles.presetChipText, active && styles.presetChipTextActive]}>
+                        {preset.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+
               <Text style={styles.fieldLabel}>Session Name *</Text>
               <TextInput
                 style={styles.textInput}
@@ -1067,7 +1114,28 @@ export default function DoctorSessionManagerModal({
                 </View>
               )}
 
-              <Text style={[styles.fieldLabel, { marginTop: spacing.md }]}>Reason for Date Change (Shown in Queue)</Text>
+              <Text style={[styles.fieldLabel, { marginTop: spacing.md }]}>Common Reasons & Holiday Tags</Text>
+              <View style={styles.presetsRow}>
+                {[
+                  "Public Holiday",
+                  "Doctor on Leave",
+                  "Hospital Emergency",
+                  "Doctor Conference",
+                  "Reopening Clinic",
+                ].map((tag) => (
+                  <Pressable
+                    key={tag}
+                    onPress={() => setOverrideReason(tag)}
+                    style={[styles.presetChip, overrideReason === tag && styles.presetChipActive]}
+                  >
+                    <Text style={[styles.presetChipText, overrideReason === tag && styles.presetChipTextActive]}>
+                      {tag}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+
+              <Text style={[styles.fieldLabel, { marginTop: spacing.sm }]}>Reason for Date Change (Shown in Queue)</Text>
               <TextInput
                 style={styles.textInput}
                 value={overrideReason}
@@ -1476,4 +1544,40 @@ const styles = StyleSheet.create({
     borderColor: colors.brandTertiary,
   },
   overrideNoticeText: { fontSize: font.xs, color: colors.onBrandSecondary, flex: 1, lineHeight: 18 },
+  docHeaderBadge: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: colors.brandSecondary,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  presetsRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 4,
+    marginBottom: spacing.xs,
+  },
+  presetChip: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: 6,
+    borderRadius: radius.pill,
+    backgroundColor: colors.surfaceSecondary,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  presetChipActive: {
+    backgroundColor: colors.brandSecondary,
+    borderColor: colors.brandPrimary,
+  },
+  presetChipText: {
+    fontSize: font.xs,
+    fontWeight: "600",
+    color: colors.onSurfaceSecondary,
+  },
+  presetChipTextActive: {
+    color: colors.brandPrimary,
+    fontWeight: "700",
+  },
 });

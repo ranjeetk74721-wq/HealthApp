@@ -5,6 +5,7 @@ import { colors, spacing, radius, font } from "@/src/theme";
 import { api } from "@/src/api/client";
 import DoctorTimingAdjustmentModal from "./DoctorTimingAdjustmentModal";
 import DoctorSessionPauseModal from "./DoctorSessionPauseModal";
+import DoctorSessionManagerModal from "./DoctorSessionManagerModal";
 
 interface DoctorSessionBarProps {
   doctorId: string;
@@ -23,6 +24,7 @@ export default function DoctorSessionBar({
   onRefresh,
   canEdit = true,
 }: DoctorSessionBarProps) {
+  const [sessionManagerOpen, setSessionManagerOpen] = useState(false);
   const [timingModalOpen, setTimingModalOpen] = useState(false);
   const [pauseModalOpen, setPauseModalOpen] = useState(false);
   const [startingSession, setStartingSession] = useState(false);
@@ -324,6 +326,17 @@ export default function DoctorSessionBar({
             <Text style={styles.actionColLabel}>Adjust Doctor Timing</Text>
           </Pressable>
 
+          {/* Shifts & Custom Slots Manager */}
+          <Pressable
+            testID="manage-doctor-sessions-btn"
+            onPress={() => setSessionManagerOpen(true)}
+            disabled={isBusy}
+            style={[styles.actionColBtn, isBusy && { opacity: 0.6 }]}
+          >
+            <Ionicons name="calendar-outline" size={20} color={colors.brandPrimary} />
+            <Text style={styles.actionColLabel}>Shifts & Slots</Text>
+          </Pressable>
+
           {/* Start Session Button (when not started) */}
           {status === "not_started" && (
             <Pressable
@@ -393,6 +406,16 @@ export default function DoctorSessionBar({
           )}
         </View>
       ) : null}
+
+      {/* Shifts & Custom Slots Manager Modal */}
+      <DoctorSessionManagerModal
+        visible={sessionManagerOpen}
+        doctorId={doctorId}
+        doctorName={doctorName}
+        initialDate={session.date}
+        onClose={() => setSessionManagerOpen(false)}
+        onSessionsUpdated={() => onRefresh()}
+      />
 
       {/* Timing Adjustment Modal */}
       <DoctorTimingAdjustmentModal
@@ -525,6 +548,7 @@ const styles = StyleSheet.create({
   },
   actionsRow: {
     flexDirection: "row",
+    flexWrap: "wrap",
     gap: spacing.sm,
     marginTop: spacing.sm,
     paddingTop: spacing.xs,
@@ -533,6 +557,7 @@ const styles = StyleSheet.create({
   },
   actionColBtn: {
     flex: 1,
+    minWidth: 90,
     alignItems: "center",
     justifyContent: "center",
     paddingVertical: 8,

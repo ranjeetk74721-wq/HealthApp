@@ -12,6 +12,7 @@ import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import CalendarSummary from "@/src/components/CalendarSummary";
 import DoctorSessionBar from "@/src/components/DoctorSessionBar";
+import DoctorSessionManagerModal from "@/src/components/DoctorSessionManagerModal";
 import PatientDetailsModal from "@/src/components/PatientDetailsModal";
 import { printPatientList } from "@/src/utils/printPatientList";
 
@@ -43,7 +44,8 @@ export default function ReceptionistDashboard() {
   const [queueFilter, setQueueFilter] = useState<"all" | "active" | "completed">("all");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
+  const [actionLoadingMap, setActionLoadingMap] = useState<Record<string, string>>({});
+  const [sessionManagerOpen, setSessionManagerOpen] = useState(false);
 
   // Network and stale tracking
   const [isOnline, setIsOnline] = useState(true);
@@ -86,11 +88,14 @@ export default function ReceptionistDashboard() {
   const [addError, setAddError] = useState<string | null>(null);
   const [addToast, setAddToast] = useState<string | null>(null);
   const [exportLoading, setExportLoading] = useState(false);
+  const [autoReferLoading, setAutoReferLoading] = useState(false);
 
   // View completed toggle
   const [showCompleted, setShowCompleted] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const wsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const requestIdRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isFocused = useRef(true);
   const [wsConnected, setWsConnected] = useState(false);
@@ -130,9 +135,11 @@ export default function ReceptionistDashboard() {
   }, []);
 
   const load = useCallback(async (silent = false, bypassCache = false) => {
+    const curReqId = ++requestIdRef.current;
     const shouldBypass = silent || bypassCache;
     try {
       const docs = await api.get("/reception/doctors", { bypassCache: shouldBypass });
+      if (curReqId !== requestIdRef.current) return;
       setDoctors(docs);
       const doctorId = selectedDocRef.current || (docs[0]?.id ?? null);
       if (doctorId && !selectedDocRef.current) {
@@ -144,8 +151,9 @@ export default function ReceptionistDashboard() {
           api.get(`/reception/queue?doctor_id=${doctorId}&date=${selectedDate}`, { bypassCache: shouldBypass }),
           api.get(`/doctor/${doctorId}/session?date=${selectedDate}`, { bypassCache: shouldBypass }).catch(() => null),
           api.get(`/appointments/calendar-summary?doctor_id=${doctorId}`, { bypassCache: shouldBypass }).catch(() => []),
-          api.get(`/doctor/${doctorId}/sessions?target_date=${selectedDate}`, { bypassCache: shouldBypass }).catch(() => ({ sessions: [] })),
+          api.get(`/doctor/${doctorId}/sessions?date=${selectedDate}&target_date=${selectedDate}`, { bypassCache: shouldBypass }).catch(() => ({ sessions: [] })),
         ]);
+        if (curReqId !== requestIdRef.current) return;
         setQueue(q || []);
         if (sessRes?.session) setDocSession(sessRes.session);
         setSummaryData(sum || []);
@@ -155,14 +163,17 @@ export default function ReceptionistDashboard() {
       setLastUpdated(nowStr);
       setIsStale(false);
     } catch (err: any) {
+      if (curReqId !== requestIdRef.current) return;
       setIsStale(true);
       if (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired"))) {
         await signOut();
         router.replace("/login");
       }
     } finally {
-      if (!silent) setLoading(false);
-      setRefreshing(false);
+      if (curReqId === requestIdRef.current) {
+        if (!silent) setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, [router, signOut, selectedDate]);
 
@@ -187,7 +198,10 @@ export default function ReceptionistDashboard() {
           if (msg?.type === "ping" || msg?.type === "pong" || msg?.type === "connected") return;
         } catch {}
         if (isFocused.current && (Platform.OS !== "web" || document.visibilityState === "visible")) {
-          load(true, true);
+          if (wsDebounceRef.current) clearTimeout(wsDebounceRef.current);
+          wsDebounceRef.current = setTimeout(() => {
+            load(true, true);
+          }, 300);
         }
       };
       ws.onerror = () => setWsConnected(false);
@@ -204,6 +218,7 @@ export default function ReceptionistDashboard() {
     } catch { setWsConnected(false); }
 
     return () => {
+      if (wsDebounceRef.current) { clearTimeout(wsDebounceRef.current); wsDebounceRef.current = null; }
       if (wsRef.current) { try { wsRef.current.close(); } catch { /* ignore */ } wsRef.current = null; }
     };
   }, [selectedDoc, load]);
@@ -227,9 +242,9 @@ export default function ReceptionistDashboard() {
   );
 
   // Queue Action Handlers
-  const handleAction = async (path: string, apptId: string, successMsg?: string) => {
-    if (actionLoadingId) return; // Prevent double tap or concurrent actions
-    setActionLoadingId(apptId);
+  const handleAction = async (path: string, apptId: string, actionType: string, successMsg?: string) => {
+    if (actionLoadingMap[apptId]) return; // Prevent double tap or concurrent actions on same patient
+    setActionLoadingMap((prev) => ({ ...prev, [apptId]: actionType }));
     try {
       await api.post(path, { appointment_id: apptId });
       if (successMsg) {
@@ -240,7 +255,11 @@ export default function ReceptionistDashboard() {
     } catch (err: any) {
       Alert.alert("Action Failed", err?.message || "Could not complete queue action");
     } finally {
-      setActionLoadingId(null);
+      setActionLoadingMap((prev) => {
+        const next = { ...prev };
+        delete next[apptId];
+        return next;
+      });
     }
   };
 
@@ -248,6 +267,7 @@ export default function ReceptionistDashboard() {
     handleAction(
       "/reception/start_consultation",
       appt.id,
+      "start",
       `Consultation started for Token #${appt.token_number}`
     );
   };
@@ -256,6 +276,7 @@ export default function ReceptionistDashboard() {
     handleAction(
       "/reception/complete",
       appt.id,
+      "complete",
       `Consultation completed for Token #${appt.token_number}. Patient record archived.`
     );
   };
@@ -264,6 +285,7 @@ export default function ReceptionistDashboard() {
     handleAction(
       "/reception/skip",
       appt.id,
+      "skip",
       `Token #${appt.token_number} skipped. Token preserved.`
     );
   };
@@ -272,6 +294,7 @@ export default function ReceptionistDashboard() {
     handleAction(
       "/reception/rejoin",
       appt.id,
+      "rejoin",
       `Token #${appt.token_number} rejoined active queue.`
     );
   };
@@ -280,6 +303,7 @@ export default function ReceptionistDashboard() {
     handleAction(
       "/reception/mark_arrived",
       appt.id,
+      "arrived",
       `Token #${appt.token_number} marked arrived.`
     );
   };
@@ -289,6 +313,7 @@ export default function ReceptionistDashboard() {
       handleAction(
         "/reception/cancel",
         appt.id,
+        "cancel",
         `Token #${appt.token_number} cancelled.`
       );
     };
@@ -391,6 +416,45 @@ export default function ReceptionistDashboard() {
       Alert.alert("Export Error", err?.message || "Failed to download Excel report");
     } finally {
       setExportLoading(false);
+    }
+  };
+
+  const handleAutoReferQueue = async () => {
+    if (!selectedDoc) return;
+    const curDoc = doctors.find((d) => d.id === selectedDoc);
+    const docName = curDoc?.full_name || "Doctor";
+    const pendingCount = activeQueue.length;
+    if (pendingCount === 0) {
+      Alert.alert("No Patients", "There are no active or waiting patients to auto-refer.");
+      return;
+    }
+
+    const doRefer = async () => {
+      setAutoReferLoading(true);
+      try {
+        const res = await api.post("/reception/auto-refer", { from_doctor_id: selectedDoc });
+        Alert.alert("Auto-Refer Complete", res?.message || `Transferred ${res?.count || 0} patient(s) successfully.`);
+        load(true, true);
+      } catch (err: any) {
+        Alert.alert("Auto-Refer Error", err?.message || "Failed to auto-refer queue.");
+      } finally {
+        setAutoReferLoading(false);
+      }
+    };
+
+    if (Platform.OS === "web") {
+      if (window.confirm(`Auto-refer ${pendingCount} waiting patient(s) of ${docName} to available active doctors in the hospital?`)) {
+        doRefer();
+      }
+    } else {
+      Alert.alert(
+        "Auto-Refer Queue",
+        `Auto-refer ${pendingCount} waiting patient(s) of ${docName} to available active doctors in the hospital?`,
+        [
+          { text: "Cancel", style: "cancel" },
+          { text: "Auto-Refer All", style: "destructive", onPress: doRefer },
+        ]
+      );
     }
   };
 
@@ -625,14 +689,41 @@ export default function ReceptionistDashboard() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true, true); }} />}
       >
         {/* 1. Doctor Session Timing & Availability Controls (Requirements 4 & 5) */}
-        {selectedDoc && docSession && (
-          <DoctorSessionBar
-            doctorId={selectedDoc}
-            doctorName={doctors.find((d) => d.id === selectedDoc)?.full_name || "Doctor"}
-            session={docSession}
-            waitingCount={activeQueue.filter((q) => ["booked", "arrived"].includes(q.status)).length}
-            onRefresh={() => load(true, true)}
-          />
+        {selectedDoc && (
+          docSession ? (
+            <DoctorSessionBar
+              doctorId={selectedDoc}
+              doctorName={doctors.find((d) => d.id === selectedDoc)?.full_name || "Doctor"}
+              session={docSession}
+              waitingCount={activeQueue.filter((q) => ["booked", "arrived"].includes(q.status)).length}
+              onRefresh={() => load(true, true)}
+            />
+          ) : (
+            <View style={styles.sessionBarPlaceholder}>
+              <ActivityIndicator size="small" color={colors.brandPrimary} />
+              <Text style={styles.sessionBarPlaceholderText}>Loading doctor session & cabin state...</Text>
+            </View>
+          )
+        )}
+
+        {/* Doctor Shifts & Cabin Slots Management */}
+        {selectedDoc && (
+          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, marginBottom: spacing.md }}>
+            <View style={{ flex: 1, paddingRight: spacing.sm }}>
+              <Text style={{ fontSize: font.sm, fontWeight: "700", color: colors.onSurface }}>
+                {doctors.find((d) => d.id === selectedDoc)?.full_name || "Doctor"}&apos;s Shifts & Cabin Slots
+              </Text>
+              <Text style={{ fontSize: 11, color: colors.muted }}>Day shift, Night shift, Emergency shift & Holidays</Text>
+            </View>
+            <Pressable
+              testID="receptionist-manage-doctor-shifts-btn"
+              onPress={() => setSessionManagerOpen(true)}
+              style={{ backgroundColor: colors.brandPrimary, paddingHorizontal: spacing.md, paddingVertical: 8, borderRadius: radius.md, flexDirection: "row", alignItems: "center", gap: 6 }}
+            >
+              <Ionicons name="calendar-outline" size={16} color="#fff" />
+              <Text style={{ color: "#fff", fontWeight: "700", fontSize: font.sm }}>Manage Doctor Shifts</Text>
+            </Pressable>
+          </View>
         )}
 
         {/* 2. Today's Patient Bookings and Active Queue (Requirement 5) */}
@@ -666,6 +757,21 @@ export default function ReceptionistDashboard() {
                 <>
                   <Ionicons name="download-outline" size={15} color="#0F766E" />
                   <Text style={styles.exportBtnText}>Excel</Text>
+                </>
+              )}
+            </Pressable>
+            <Pressable
+              onPress={handleAutoReferQueue}
+              disabled={autoReferLoading || activeQueue.length === 0}
+              style={[styles.autoReferBtn, (autoReferLoading || activeQueue.length === 0) && { opacity: 0.6 }]}
+              testID="reception-auto-refer-queue-btn"
+            >
+              {autoReferLoading ? (
+                <ActivityIndicator size="small" color="#7C3AED" />
+              ) : (
+                <>
+                  <Ionicons name="git-branch-outline" size={15} color="#7C3AED" />
+                  <Text style={styles.autoReferBtnText}>Auto-Refer</Text>
                 </>
               )}
             </Pressable>
@@ -723,7 +829,8 @@ export default function ReceptionistDashboard() {
             const isArrived = a.status === "arrived";
             const isBooked = a.status === "booked";
             const isCompleted = a.status === "completed";
-            const isItemBusy = actionLoadingId === a.id;
+            const currentAction = actionLoadingMap[a.id];
+            const isItemBusy = !!currentAction;
 
             return (
               <View key={a.id} style={[styles.apptCard, isConsulting && styles.apptCardConsulting, isCompleted && { opacity: 0.8 }]}>
@@ -821,7 +928,11 @@ export default function ReceptionistDashboard() {
                         disabled={isItemBusy}
                         style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
                       >
-                        <Ionicons name="checkmark-circle-outline" size={18} color={colors.info} />
+                        {currentAction === "arrived" ? (
+                          <ActivityIndicator size="small" color={colors.info} />
+                        ) : (
+                          <Ionicons name="checkmark-circle-outline" size={18} color={colors.info} />
+                        )}
                         <Text style={styles.actionColBtnLabel}>Arrived</Text>
                       </Pressable>
 
@@ -831,7 +942,11 @@ export default function ReceptionistDashboard() {
                         disabled={isItemBusy}
                         style={[styles.actionColBtn, styles.actionColBtnPrimary, isItemBusy && { opacity: 0.5 }]}
                       >
-                        <Ionicons name="play" size={18} color="#fff" />
+                        {currentAction === "start" ? (
+                          <ActivityIndicator size="small" color="#fff" />
+                        ) : (
+                          <Ionicons name="play" size={18} color="#fff" />
+                        )}
                         <Text style={[styles.actionColBtnLabel, { color: "#fff", fontWeight: "700" }]}>
                           Start Consultation
                         </Text>
@@ -843,7 +958,11 @@ export default function ReceptionistDashboard() {
                         disabled={isItemBusy}
                         style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
                       >
-                        <Ionicons name="arrow-forward-circle-outline" size={18} color={colors.warning} />
+                        {currentAction === "skip" ? (
+                          <ActivityIndicator size="small" color={colors.warning} />
+                        ) : (
+                          <Ionicons name="arrow-forward-circle-outline" size={18} color={colors.warning} />
+                        )}
                         <Text style={styles.actionColBtnLabel}>Skip Patient</Text>
                       </Pressable>
 
@@ -863,7 +982,11 @@ export default function ReceptionistDashboard() {
                         disabled={isItemBusy}
                         style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
                       >
-                        <Ionicons name="close-circle-outline" size={18} color={colors.error} />
+                        {currentAction === "cancel" ? (
+                          <ActivityIndicator size="small" color={colors.error} />
+                        ) : (
+                          <Ionicons name="close-circle-outline" size={18} color={colors.error} />
+                        )}
                         <Text style={[styles.actionColBtnLabel, { color: colors.error }]}>Cancel</Text>
                       </Pressable>
                     </>
@@ -878,7 +1001,11 @@ export default function ReceptionistDashboard() {
                         disabled={isItemBusy}
                         style={[styles.actionColBtn, styles.actionColBtnPrimary, isItemBusy && { opacity: 0.5 }]}
                       >
-                        <Ionicons name="play" size={18} color="#fff" />
+                        {currentAction === "start" ? (
+                          <ActivityIndicator size="small" color="#fff" />
+                        ) : (
+                          <Ionicons name="play" size={18} color="#fff" />
+                        )}
                         <Text style={[styles.actionColBtnLabel, { color: "#fff", fontWeight: "700" }]}>
                           Start Consultation
                         </Text>
@@ -890,7 +1017,11 @@ export default function ReceptionistDashboard() {
                         disabled={isItemBusy}
                         style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
                       >
-                        <Ionicons name="arrow-forward-circle-outline" size={18} color={colors.warning} />
+                        {currentAction === "skip" ? (
+                          <ActivityIndicator size="small" color={colors.warning} />
+                        ) : (
+                          <Ionicons name="arrow-forward-circle-outline" size={18} color={colors.warning} />
+                        )}
                         <Text style={styles.actionColBtnLabel}>Skip Patient</Text>
                       </Pressable>
 
@@ -910,7 +1041,11 @@ export default function ReceptionistDashboard() {
                         disabled={isItemBusy}
                         style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
                       >
-                        <Ionicons name="close-circle-outline" size={18} color={colors.error} />
+                        {currentAction === "cancel" ? (
+                          <ActivityIndicator size="small" color={colors.error} />
+                        ) : (
+                          <Ionicons name="close-circle-outline" size={18} color={colors.error} />
+                        )}
                         <Text style={[styles.actionColBtnLabel, { color: colors.error }]}>Cancel</Text>
                       </Pressable>
                     </>
@@ -924,7 +1059,7 @@ export default function ReceptionistDashboard() {
                       disabled={isItemBusy}
                       style={[styles.actionColBtn, styles.actionColBtnSuccess, isItemBusy && { opacity: 0.5 }]}
                     >
-                      {isItemBusy ? (
+                      {currentAction === "complete" ? (
                         <ActivityIndicator size="small" color="#fff" />
                       ) : (
                         <>
@@ -946,7 +1081,11 @@ export default function ReceptionistDashboard() {
                         disabled={isItemBusy}
                         style={[styles.actionColBtn, { backgroundColor: "#FEF3C7", borderColor: "#FCD34D" }, isItemBusy && { opacity: 0.5 }]}
                       >
-                        <Ionicons name="refresh-circle-outline" size={18} color="#B45309" />
+                        {currentAction === "rejoin" ? (
+                          <ActivityIndicator size="small" color="#B45309" />
+                        ) : (
+                          <Ionicons name="refresh-circle-outline" size={18} color="#B45309" />
+                        )}
                         <Text style={[styles.actionColBtnLabel, { color: "#92400E" }]}>
                           Rejoin Queue
                         </Text>
@@ -958,7 +1097,11 @@ export default function ReceptionistDashboard() {
                         disabled={isItemBusy}
                         style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
                       >
-                        <Ionicons name="close-circle-outline" size={18} color={colors.error} />
+                        {currentAction === "cancel" ? (
+                          <ActivityIndicator size="small" color={colors.error} />
+                        ) : (
+                          <Ionicons name="close-circle-outline" size={18} color={colors.error} />
+                        )}
                         <Text style={[styles.actionColBtnLabel, { color: colors.error }]}>Cancel</Text>
                       </Pressable>
                     </>
@@ -1327,18 +1470,31 @@ export default function ReceptionistDashboard() {
         </Pressable>
       </Modal>
 
-      {/* ── Patient Details View / Edit Modal ── */}
-      <PatientDetailsModal
-        visible={!!selectedPatientAppt}
-        appointment={selectedPatientAppt}
-        onClose={() => setSelectedPatientAppt(null)}
-        onUpdated={(updated) => {
-          setQueue((prev) =>
-            prev.map((a) => (a.id === updated.id ? { ...a, ...updated } : a))
-          );
-          setSelectedPatientAppt(updated);
-        }}
-      />
+      {/* ── Patient Details View / Edit Modal (deferred until selected) ── */}
+      {!!selectedPatientAppt && (
+        <PatientDetailsModal
+          visible={!!selectedPatientAppt}
+          appointment={selectedPatientAppt}
+          onClose={() => setSelectedPatientAppt(null)}
+          onUpdated={(updated) => {
+            setQueue((prev) =>
+              prev.map((a) => (a.id === updated.id ? { ...a, ...updated } : a))
+            );
+            setSelectedPatientAppt(updated);
+          }}
+        />
+      )}
+      {/* ── Shifts & Custom Slots Manager Modal (for Cabin Doctor - deferred until opened) ── */}
+      {selectedDoc && sessionManagerOpen && (
+        <DoctorSessionManagerModal
+          visible={sessionManagerOpen}
+          doctorId={selectedDoc}
+          doctorName={doctors.find((d) => d.id === selectedDoc)?.full_name || "Doctor"}
+          initialDate={selectedDate}
+          onClose={() => setSessionManagerOpen(false)}
+          onSessionsUpdated={() => load(true, true)}
+        />
+      )}
     </SafeAreaView>
   );
 }
@@ -1671,6 +1827,22 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#0F766E",
   },
+  autoReferBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: "#F5F3FF",
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 6,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    borderColor: "#DDD6FE",
+  },
+  autoReferBtnText: {
+    fontSize: font.xs,
+    fontWeight: "700",
+    color: "#7C3AED",
+  },
   etaRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -1735,5 +1907,21 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: "700",
     color: colors.brandPrimary,
+  },
+  sessionBarPlaceholder: {
+    minHeight: 120,
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    marginBottom: spacing.md,
+    justifyContent: "center",
+    alignItems: "center",
+    gap: spacing.sm,
+    padding: spacing.md,
+  },
+  sessionBarPlaceholderText: {
+    fontSize: font.sm,
+    color: colors.muted,
   },
 });
