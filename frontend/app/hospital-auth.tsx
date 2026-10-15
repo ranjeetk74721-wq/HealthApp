@@ -1,14 +1,15 @@
 import { useState } from "react";
-import { View, Text, TextInput, Pressable, StyleSheet, ActivityIndicator } from "react-native";
+import { View, Text, TextInput, Pressable, StyleSheet, ActivityIndicator, ScrollView } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { api } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 export default function HospitalAuth() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const params = useLocalSearchParams<{ hospitalId?: string; hospitalName?: string }>();
   const hospitalId = (params.hospitalId || "").trim().toUpperCase();
   const hospitalName = params.hospitalName || "Hospital Verification";
@@ -52,10 +53,16 @@ export default function HospitalAuth() {
   };
 
   return (
-    <SafeAreaView style={styles.safe}>
-      <View style={styles.container}>
+    <SafeAreaView style={styles.safe} edges={["top"]}>
+      <ScrollView
+        contentContainerStyle={[
+          styles.scrollContent,
+          { paddingBottom: Math.max(insets.bottom + 24, spacing.xxl) },
+        ]}
+        keyboardShouldPersistTaps="handled"
+      >
         <View style={styles.backWrap}>
-          <Pressable onPress={() => router.back()} style={styles.backBtn}>
+          <Pressable onPress={() => router.back()} style={styles.backBtn} hitSlop={12}>
             <Ionicons name="arrow-back" size={24} color={colors.onSurface} />
           </Pressable>
         </View>
@@ -93,20 +100,20 @@ export default function HospitalAuth() {
 
           {error ? <Text style={styles.error}>{error}</Text> : null}
 
-          <Pressable onPress={onVerify} disabled={loading} style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }]}>
+          <Pressable onPress={onVerify} disabled={loading} style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }, loading && { opacity: 0.7 }]}>
             {loading ? <ActivityIndicator color={colors.onBrandPrimary} /> : <Text style={styles.primaryBtnText}>Verify & Continue</Text>}
           </Pressable>
         </View>
-      </View>
+      </ScrollView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.surfaceSecondary },
-  container: { flex: 1, padding: spacing.xl },
+  scrollContent: { padding: spacing.xl, maxWidth: 480, width: "100%", alignSelf: "center" },
   backWrap: { marginBottom: spacing.md },
-  backBtn: { padding: spacing.xs },
+  backBtn: { padding: spacing.xs, alignSelf: "flex-start" },
   headerWrap: { alignItems: "center", marginBottom: spacing.xl },
   badge: { flexDirection: "row", alignItems: "center", backgroundColor: colors.brandSecondary + "40", paddingHorizontal: spacing.md, paddingVertical: 4, borderRadius: radius.pill, marginBottom: spacing.sm },
   badgeText: { fontSize: font.sm, fontWeight: "800", color: colors.brandPrimary },
@@ -114,8 +121,8 @@ const styles = StyleSheet.create({
   subtitle: { fontSize: font.sm, color: colors.muted, textAlign: "center", paddingHorizontal: spacing.lg },
   card: { backgroundColor: colors.surface, padding: spacing.xl, borderRadius: radius.lg, borderWidth: 1, borderColor: colors.border, elevation: 2 },
   label: { fontSize: font.sm, fontWeight: "600", color: colors.onSurface, marginBottom: spacing.xs },
-  input: { backgroundColor: colors.surfaceSecondary, borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, padding: spacing.md, fontSize: font.base, color: colors.onSurface, marginBottom: spacing.lg },
+  input: { backgroundColor: colors.surfaceSecondary, borderWidth: 1, borderColor: colors.border, borderRadius: radius.md, padding: spacing.md, fontSize: font.base, color: colors.onSurface, marginBottom: spacing.lg, minHeight: 46 },
   error: { color: colors.error, fontSize: font.sm, marginBottom: spacing.md, textAlign: "center" },
-  primaryBtn: { backgroundColor: colors.brandPrimary, paddingVertical: spacing.md, borderRadius: radius.md, alignItems: "center" },
+  primaryBtn: { backgroundColor: colors.brandPrimary, paddingVertical: spacing.md, borderRadius: radius.md, alignItems: "center", minHeight: 48, justifyContent: "center" },
   primaryBtnText: { color: colors.onBrandPrimary, fontSize: font.base, fontWeight: "600" },
 });

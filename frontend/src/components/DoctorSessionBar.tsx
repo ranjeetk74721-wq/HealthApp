@@ -459,9 +459,12 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
     marginBottom: spacing.sm,
+    flexWrap: "wrap",
+    gap: 6,
   },
   titleWrap: {
     flex: 1,
+    minWidth: 160,
   },
   sessionTitle: {
     fontSize: font.base,

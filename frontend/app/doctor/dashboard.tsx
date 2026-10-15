@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   View, Text, StyleSheet, ScrollView, ActivityIndicator, Pressable,
   RefreshControl, Modal, TextInput, Alert, Image, Platform,
+  useWindowDimensions,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -40,6 +41,9 @@ const STATUS_COLORS: Record<string, string> = {
 
 export default function DoctorDashboard() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
+  const { width: windowWidth } = useWindowDimensions();
+  const isSmallScreen = windowWidth < 600;
   const { user, signOut } = useAuth();
   const [docSession, setDocSession]   = useState<any | null>(null);
   const [data, setData]       = useState<any | null>(null);
@@ -535,7 +539,7 @@ export default function DoctorDashboard() {
       </View>
 
       <ScrollView
-        contentContainerStyle={styles.scroll}
+        contentContainerStyle={[styles.scroll, { paddingBottom: Math.max(insets.bottom + 40, 100) }]}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true); }} />}
       >
         {/* ── Doctor Session Timing Bar & Controls (with stable placeholder to eliminate layout jump) ── */}
@@ -701,7 +705,7 @@ export default function DoctorDashboard() {
 
         {/* ── Patient queue section header with Print & Excel buttons ── */}
         <View style={styles.sectionHeaderRow}>
-          <View>
+          <View style={{ flex: 1, minWidth: 160 }}>
             <Text style={styles.sectionTitle}>
               Today&apos;s Schedule · {selectedDate}
             </Text>
@@ -791,7 +795,7 @@ export default function DoctorDashboard() {
                     <Text style={[styles.tokenText, a.status === "in_consultation" && { color: colors.onBrandPrimary }]}>#{a.token_number}</Text>
                   </View>
                   <View style={{ flex: 1 }}>
-                    <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                       <Text style={styles.apptName}>{a.patient_name}</Text>
                       <Ionicons name="information-circle-outline" size={14} color={colors.brandPrimary} />
                     </View>
@@ -828,12 +832,15 @@ export default function DoctorDashboard() {
                         testID={`doc-action-${act.label.toLowerCase()}-${a.id}`}
                         onPress={() => doAction(act.path, a.id, targetStatus, act.label)}
                         disabled={!!actionLoadingMap[a.id]}
-                        style={[styles.rowActBtn, { backgroundColor: act.color + "22" }, !!actionLoadingMap[a.id] && { opacity: 0.6 }]}
+                        style={[styles.rowActBtn, { backgroundColor: act.color + "18", borderColor: act.color + "44" }, !!actionLoadingMap[a.id] && { opacity: 0.6 }]}
                       >
                         {isActing ? (
                           <ActivityIndicator size="small" color={act.color} />
                         ) : (
-                          <Ionicons name={act.icon} size={14} color={act.color} />
+                          <>
+                            <Ionicons name={act.icon} size={15} color={act.color} />
+                            <Text style={[styles.rowActBtnLabel, { color: act.color }]}>{act.label}</Text>
+                          </>
                         )}
                       </Pressable>
                     );
@@ -841,9 +848,10 @@ export default function DoctorDashboard() {
                   <Pressable
                     testID={`presc-${a.id}`}
                     onPress={() => { setPrescOpen(a); setPrescText(a.prescription || ""); }}
-                    style={[styles.rowActBtn, { backgroundColor: colors.brandSecondary }]}
+                    style={[styles.rowActBtn, { backgroundColor: colors.brandSecondary, borderColor: colors.brandPrimary + "44" }]}
                   >
-                    <Ionicons name="document-text-outline" size={14} color={colors.brandPrimary} />
+                    <Ionicons name="document-text-outline" size={15} color={colors.brandPrimary} />
+                    <Text style={[styles.rowActBtnLabel, { color: colors.brandPrimary }]}>Rx</Text>
                   </Pressable>
                 </View>
               </View>
@@ -1129,7 +1137,7 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
   patientInfoPressable: {
-    flex: 1,
+    width: "100%",
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.md,
@@ -1141,7 +1149,14 @@ const styles = StyleSheet.create({
   },
   empty: { alignItems: "center", padding: spacing.xl },
   emptyText: { color: colors.muted },
-  apptCard: { flexDirection: "row", alignItems: "center", gap: spacing.md, backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border },
+  apptCard: {
+    backgroundColor: colors.surface,
+    padding: spacing.md,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    gap: spacing.sm,
+  },
   tokenBubble: { width: 44, height: 44, borderRadius: radius.pill, backgroundColor: colors.brandSecondary, alignItems: "center", justifyContent: "center" },
   tokenText: { fontSize: font.sm, fontWeight: "700", color: colors.brandPrimary },
   apptName: { fontSize: font.base, fontWeight: "600", color: colors.onSurface },
@@ -1150,8 +1165,31 @@ const styles = StyleSheet.create({
   statusPill: { paddingHorizontal: 8, paddingVertical: 2, borderRadius: radius.pill },
   statusText: { fontSize: 10, fontWeight: "700", textTransform: "capitalize" },
   symptoms: { fontSize: 11, color: colors.onSurfaceSecondary, marginTop: 2 },
-  rowActions: { flexDirection: "row", gap: 4, flexWrap: "wrap", maxWidth: 120, justifyContent: "flex-end" },
-  rowActBtn: { width: 30, height: 30, borderRadius: radius.pill, alignItems: "center", justifyContent: "center" },
+  rowActions: {
+    flexDirection: "row",
+    gap: 8,
+    flexWrap: "wrap",
+    justifyContent: "flex-end",
+    alignItems: "center",
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: colors.border,
+    paddingTop: 8,
+  },
+  rowActBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+    paddingVertical: 7,
+    paddingHorizontal: 12,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    minHeight: 38,
+  },
+  rowActBtnLabel: {
+    fontSize: 12,
+    fontWeight: "700",
+  },
   modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
   sheet: { backgroundColor: colors.surface, padding: spacing.lg, borderTopLeftRadius: 24, borderTopRightRadius: 24, gap: spacing.sm, paddingBottom: spacing.xxl },
   sheetHandle: { width: 40, height: 4, backgroundColor: colors.borderStrong, borderRadius: 2, alignSelf: "center", marginBottom: spacing.md },

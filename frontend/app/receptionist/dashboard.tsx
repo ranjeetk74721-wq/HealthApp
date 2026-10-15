@@ -4,7 +4,7 @@ import {
   RefreshControl, Modal, TextInput, KeyboardAvoidingView, Platform, Alert,
   useWindowDimensions,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -32,9 +32,11 @@ function formatTime(isoStr?: string | null): string {
 
 export default function ReceptionistDashboard() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const { user, loading: authLoading, signOut } = useAuth();
   const { width: windowWidth } = useWindowDimensions();
   const isSmallScreen = windowWidth < 540;
+  const isExtraSmallScreen = windowWidth < 360;
 
   // ── Canonical Receptionist Route Guard ──
   useEffect(() => {
@@ -1175,7 +1177,7 @@ export default function ReceptionistDashboard() {
 
       {/* ── Main Dashboard Scroll ── */}
       <ScrollView
-        contentContainerStyle={styles.scroll}
+        contentContainerStyle={[styles.scroll, { paddingBottom: 160 + insets.bottom }]}
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -1771,7 +1773,7 @@ export default function ReceptionistDashboard() {
       ) : null}
 
       {/* ── FABs (Add Patient & Emergency) ── */}
-      <View style={styles.fabRow} pointerEvents="box-none">
+      <View style={[styles.fabRow, { bottom: Math.max(insets.bottom + 12, 20) }]} pointerEvents="box-none">
         <Pressable
           testID="add-patient-btn"
           disabled={addLoading || !selectedDoc}
@@ -1779,15 +1781,16 @@ export default function ReceptionistDashboard() {
           style={[
             styles.fab,
             { backgroundColor: colors.brandPrimary },
+            isExtraSmallScreen && { paddingHorizontal: spacing.sm },
             (!selectedDoc || addLoading) && { opacity: 0.6 },
           ]}
         >
           {addLoading ? (
             <ActivityIndicator size="small" color="#fff" />
           ) : (
-            <Ionicons name="person-add" size={20} color="#fff" />
+            <Ionicons name="person-add" size={18} color="#fff" />
           )}
-          <Text style={styles.fabText}>{addLoading ? "Saving…" : "Add Patient"}</Text>
+          <Text style={[styles.fabText, isExtraSmallScreen && { fontSize: 13 }]}>{addLoading ? "Saving…" : "Add Patient"}</Text>
         </Pressable>
 
         <Pressable
@@ -1803,11 +1806,12 @@ export default function ReceptionistDashboard() {
           style={[
             styles.fab,
             { backgroundColor: colors.error },
+            isExtraSmallScreen && { paddingHorizontal: spacing.sm },
             !selectedDoc && { opacity: 0.6 },
           ]}
         >
-          <Ionicons name="alert" size={20} color="#fff" />
-          <Text style={styles.fabText}>Emergency</Text>
+          <Ionicons name="alert" size={18} color="#fff" />
+          <Text style={[styles.fabText, isExtraSmallScreen && { fontSize: 13 }]}>Emergency</Text>
         </Pressable>
       </View>
 
@@ -1995,14 +1999,16 @@ export default function ReceptionistDashboard() {
       <Modal transparent visible={emergencyOpen} animationType="slide" onRequestClose={() => setEmergencyOpen(false)}>
         <View style={styles.modalBackdrop}>
           <Pressable style={StyleSheet.absoluteFill} onPress={() => setEmergencyOpen(false)} />
-          <View style={styles.sheet}>
+          <View style={[styles.sheet, { maxHeight: "90%" }]}>
             <View style={styles.sheetHandle} />
-            <Text style={styles.sheetTitle}>Emergency Priority Insert</Text>
-            <Text style={styles.sheetSub}>Patient will be inserted with highest priority without disturbing existing token numbers.</Text>
-            <TextInput testID="emergency-name-input" placeholder="Patient name" placeholderTextColor={colors.muted} value={emergencyName} onChangeText={setEmergencyName} style={styles.emergencyInput} />
-            <Pressable testID="emergency-confirm" onPress={insertEmergency} style={styles.emergencyBtn}>
-              <Text style={styles.emergencyBtnText}>Insert as Priority</Text>
-            </Pressable>
+            <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+              <Text style={styles.sheetTitle}>Emergency Priority Insert</Text>
+              <Text style={styles.sheetSub}>Patient will be inserted with highest priority without disturbing existing token numbers.</Text>
+              <TextInput testID="emergency-name-input" placeholder="Patient name" placeholderTextColor={colors.muted} value={emergencyName} onChangeText={setEmergencyName} style={styles.emergencyInput} />
+              <Pressable testID="emergency-confirm" onPress={insertEmergency} style={styles.emergencyBtn}>
+                <Text style={styles.emergencyBtnText}>Insert as Priority</Text>
+              </Pressable>
+            </ScrollView>
           </View>
         </View>
       </Modal>
@@ -2111,49 +2117,51 @@ export default function ReceptionistDashboard() {
       <Modal transparent visible={referModalOpen} animationType="slide" onRequestClose={() => setReferModalOpen(false)}>
         <View style={styles.modalBackdrop}>
           <Pressable style={StyleSheet.absoluteFill} onPress={() => setReferModalOpen(false)} />
-          <View style={styles.sheet}>
+          <View style={[styles.sheet, { maxHeight: "90%" }]}>
             <View style={styles.sheetHandle} />
-            <Text style={styles.sheetTitle}>Refer / Transfer Patient</Text>
-            <Text style={styles.sheetSub}>
-              Transfer {referAppt?.patient_name} (Token #{referAppt?.token_number}) to another doctor in the hospital.
-            </Text>
+            <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+              <Text style={styles.sheetTitle}>Refer / Transfer Patient</Text>
+              <Text style={styles.sheetSub}>
+                Transfer {referAppt?.patient_name} (Token #{referAppt?.token_number}) to another doctor in the hospital.
+              </Text>
 
-            <Text style={styles.label}>Select Target Doctor*</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 8 }}>
-              {doctors
-                .filter((d) => d.id !== selectedDoc)
-                .map((d) => {
-                  const isTarget = targetDocId === d.id;
-                  return (
-                    <Pressable
-                      key={d.id}
-                      testID={`refer-target-${d.id}`}
-                      onPress={() => setTargetDocId(d.id)}
-                      style={[styles.docChip, isTarget && styles.docChipActive]}
-                    >
-                      <Text style={[styles.docChipText, isTarget && { color: colors.onBrandPrimary }]}>
-                        {d.full_name} ({d.specialty || "General"})
-                      </Text>
-                    </Pressable>
-                  );
-                })}
+              <Text style={styles.label}>Select Target Doctor*</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 8 }}>
+                {doctors
+                  .filter((d) => d.id !== selectedDoc)
+                  .map((d) => {
+                    const isTarget = targetDocId === d.id;
+                    return (
+                      <Pressable
+                        key={d.id}
+                        testID={`refer-target-${d.id}`}
+                        onPress={() => setTargetDocId(d.id)}
+                        style={[styles.docChip, isTarget && styles.docChipActive]}
+                      >
+                        <Text style={[styles.docChipText, isTarget && { color: colors.onBrandPrimary }]}>
+                          {d.full_name} ({d.specialty || "General"})
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+              </ScrollView>
+
+              <Text style={styles.label}>Reason for Transfer (Optional)</Text>
+              <TextInput
+                testID="refer-reason-input"
+                placeholder="e.g. Doctor on emergency / specialist consultation"
+                placeholderTextColor={colors.muted}
+                value={referReason}
+                onChangeText={setReferReason}
+                style={styles.input}
+              />
+
+              {referError ? <Text style={styles.error}>{referError}</Text> : null}
+
+              <Pressable testID="refer-confirm-btn" onPress={handleReferSubmit} disabled={referLoading} style={styles.primaryBtn}>
+                {referLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Confirm Transfer</Text>}
+              </Pressable>
             </ScrollView>
-
-            <Text style={styles.label}>Reason for Transfer (Optional)</Text>
-            <TextInput
-              testID="refer-reason-input"
-              placeholder="e.g. Doctor on emergency / specialist consultation"
-              placeholderTextColor={colors.muted}
-              value={referReason}
-              onChangeText={setReferReason}
-              style={styles.input}
-            />
-
-            {referError ? <Text style={styles.error}>{referError}</Text> : null}
-
-            <Pressable testID="refer-confirm-btn" onPress={handleReferSubmit} disabled={referLoading} style={styles.primaryBtn}>
-              {referLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Confirm Transfer</Text>}
-            </Pressable>
           </View>
         </View>
       </Modal>

@@ -499,6 +499,10 @@ export default function DoctorTimingAdjustmentModal({
         behavior={Platform.OS === "ios" ? "padding" : undefined}
         style={styles.backdrop}
       >
+        <Pressable
+          style={StyleSheet.absoluteFill}
+          onPress={() => { if (!loading && !verifyingServerState) onClose(); }}
+        />
         <View style={styles.modalCard}>
           {/* ── Header ── */}
           <View style={styles.header}>

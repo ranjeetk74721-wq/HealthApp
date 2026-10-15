@@ -129,7 +129,7 @@ export default function OtpScreen() {
 
   return (
     <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
-      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1 }}>
+      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1 }}>
         <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
           <Pressable onPress={() => router.back()} testID="otp-back" style={styles.back}>
             <Ionicons name="chevron-back" size={24} color={colors.onSurface} />
@@ -247,8 +247,8 @@ const styles = StyleSheet.create({
   iconCircle: { width: 80, height: 80, borderRadius: radius.pill, backgroundColor: colors.brandSecondary, alignItems: "center", justifyContent: "center" },
   title: { fontSize: font.xxl, fontWeight: "700", color: colors.onSurface, textAlign: "center" },
   subtitle: { fontSize: font.base, color: colors.muted, textAlign: "center", marginBottom: spacing.md },
-  otpRow: { flexDirection: "row", justifyContent: "space-between", gap: spacing.sm, marginVertical: spacing.md, paddingHorizontal: spacing.md },
-  otpBox: { flex: 1, aspectRatio: 1, maxWidth: 50, borderWidth: 1.5, borderColor: colors.border, borderRadius: radius.md, textAlign: "center", fontSize: font.xxl, fontWeight: "700", color: colors.onSurface, backgroundColor: colors.surface },
+  otpRow: { flexDirection: "row", justifyContent: "center", gap: 6, marginVertical: spacing.md, paddingHorizontal: 4 },
+  otpBox: { flex: 1, aspectRatio: 1, maxWidth: 48, minWidth: 32, borderWidth: 1.5, borderColor: colors.border, borderRadius: radius.md, textAlign: "center", fontSize: font.xl, fontWeight: "700", color: colors.onSurface, backgroundColor: colors.surface },
   otpBoxFilled: { borderColor: colors.brandPrimary, backgroundColor: colors.brandSecondary },
   devHint: { flexDirection: "row", alignItems: "center", gap: 6, justifyContent: "center", padding: spacing.sm, backgroundColor: colors.warning + "22", borderRadius: radius.md },
   devHintText: { fontSize: font.sm, color: colors.warning, fontWeight: "600" },

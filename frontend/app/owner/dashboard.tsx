@@ -864,7 +864,7 @@ export default function OwnerDashboard() {
       {/* ── Add Specialist Category Modal ── */}
       <Modal transparent visible={addSpecModalOpen} animationType="slide" onRequestClose={() => setAddSpecModalOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setAddSpecModalOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <Text style={styles.sheetTitle}>Add Specialist Category</Text>
@@ -892,7 +892,7 @@ export default function OwnerDashboard() {
       {/* ── Generate Hospital ID Modal ── */}
       <Modal transparent visible={hospModalOpen} animationType="slide" onRequestClose={() => setHospModalOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setHospModalOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
@@ -916,7 +916,7 @@ export default function OwnerDashboard() {
       {/* ── Edit Hospital Modal ── */}
       <Modal transparent visible={editHospModalOpen} animationType="slide" onRequestClose={() => setEditHospModalOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setEditHospModalOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
@@ -950,7 +950,7 @@ export default function OwnerDashboard() {
       {/* ── Add Doctor Modal ── */}
       <Modal transparent visible={addOpen} animationType="slide" onRequestClose={() => setAddOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setAddOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={[styles.sheet, { maxHeight: "92%", minHeight: "80%" }]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
@@ -1086,7 +1086,7 @@ export default function OwnerDashboard() {
       {/* ── Edit Doctor Modal ── */}
       <Modal transparent visible={editDocOpen} animationType="slide" onRequestClose={() => setEditDocOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setEditDocOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={[styles.sheet, { maxHeight: "92%", minHeight: "80%" }]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
@@ -1228,7 +1228,7 @@ export default function OwnerDashboard() {
       {/* ── Add Receptionist Modal ── */}
       <Modal transparent visible={addRecOpen} animationType="slide" onRequestClose={() => setAddRecOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setAddRecOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
@@ -1290,7 +1290,7 @@ export default function OwnerDashboard() {
       {/* ── Edit Receptionist Modal ── */}
       <Modal transparent visible={editRecOpen} animationType="slide" onRequestClose={() => setEditRecOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setEditRecOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
