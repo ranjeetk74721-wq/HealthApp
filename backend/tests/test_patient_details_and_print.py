@@ -51,6 +51,10 @@ class MockCollection:
                         if d.get(k) == v["$ne"]:
                             match = False
                             break
+                    elif isinstance(v, dict) and "$in" in v:
+                        if d.get(k) not in v["$in"]:
+                            match = False
+                            break
                     elif d.get(k) != v:
                         match = False
                         break

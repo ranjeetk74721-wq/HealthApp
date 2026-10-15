@@ -484,3 +484,185 @@ class TestNewDelayAndTimingFeatures:
         assert "11:00 AM" in eta_waiting["expected_turn_time"]
         assert "Doctor in emergency surgery" in eta_waiting["delay_notice"]
 
+
+class TestCompleteScheduleAndDelayFlow:
+    @pytest.mark.asyncio
+    async def test_receptionist_changes_schedule_and_queue_updates(self, mock_db, monkeypatch):
+        """Receptionist updates doctor's scheduled start to 03:00 PM -> DB persists, queue updates from 03:00 PM."""
+        tz_ist = timezone(timedelta(hours=5, minutes=30))
+        fixed_now = datetime(2026, 10, 2, 10, 0, 0, tzinfo=tz_ist)
+        monkeypatch.setattr(server, "get_ist_now", lambda: fixed_now)
+        broadcast_mock = AsyncMock()
+        monkeypatch.setattr(server, "broadcast_doctor_update", broadcast_mock)
+
+        doc_record = {
+            "id": "doc-1",
+            "full_name": "Dr. Rajesh Kumar",
+            "hospital_id": "H00001",
+            "avg_consult_minutes": 5,
+            "timings": "10:00 AM - 2:00 PM",
+            "status": "active",
+        }
+        mock_db.doctors.find_one = AsyncMock(return_value=doc_record)
+        session_doc = {
+            "id": "doc-1_2026-10-02",
+            "doctor_id": "doc-1",
+            "hospital_id": "H00001",
+            "date": "2026-10-02",
+            "original_start_time": "10:00 AM",
+            "expected_start_time": "10:00 AM",
+            "status": "not_started",
+            "version": 1,
+            "history": [],
+        }
+        mock_db.doctor_sessions.find_one = AsyncMock(return_value=session_doc)
+        mock_db.appointments.count_documents = AsyncMock(return_value=2)
+
+        updated_fields = {}
+        async def mock_update(filter_q, update_q, **kwargs):
+            updated_fields.update(update_q["$set"])
+            return {**session_doc, **update_q["$set"], "version": 2}
+        mock_db.doctor_sessions.find_one_and_update = mock_update
+
+        # Receptionist in same hospital updates scheduled start to 03:00 PM
+        receptionist_user = {"id": "rec-1", "role": "receptionist", "hospital_id": "H00001"}
+        body = DoctorTimingAdjustBody(
+            date="2026-10-02",
+            new_scheduled_start_time="03:00 PM",
+            reason="Schedule revised for afternoon session",
+            expected_version=1,
+        )
+        res = await adjust_doctor_timing("doc-1", body, receptionist_user)
+
+        assert res["ok"] is True
+        assert updated_fields["original_start_time"] == "3:00 PM" or updated_fields["original_start_time"] == "03:00 PM"
+        assert updated_fields["expected_start_time"] == "3:00 PM" or updated_fields["expected_start_time"] == "03:00 PM"
+        broadcast_mock.assert_called_with("doc-1", "timing_adjusted")
+
+    @pytest.mark.asyncio
+    async def test_receptionist_forbidden_for_different_hospital(self, mock_db):
+        """Receptionist cannot adjust doctor belonging to a different hospital."""
+        mock_db.doctors.find_one = AsyncMock(return_value={
+            "id": "doc-1",
+            "hospital_id": "H00002",
+        })
+        user = {"id": "rec-1", "role": "receptionist", "hospital_id": "H00001"}
+        with pytest.raises(HTTPException) as exc:
+            await verify_doctor_session_access("doc-1", user, write=True)
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_doctor_forbidden_for_other_doctor(self, mock_db):
+        """Doctor cannot adjust another doctor's session."""
+        mock_db.doctors.find_one = AsyncMock(return_value={
+            "id": "doc-1",
+            "user_id": "u-doc-1",
+        })
+        user = {"id": "u-doc-2", "role": "doctor"}
+        with pytest.raises(HTTPException) as exc:
+            await verify_doctor_session_access("doc-1", user, write=True)
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_scheduled_start_change_preserves_active_delay(self, mock_db, monkeypatch):
+        """When an active delay exists (+30m), changing Scheduled Start preserves the delay delta."""
+        tz_ist = timezone(timedelta(hours=5, minutes=30))
+        monkeypatch.setattr(server, "get_ist_now", lambda: datetime(2026, 10, 2, 9, 0, 0, tzinfo=tz_ist))
+        monkeypatch.setattr(server, "broadcast_doctor_update", AsyncMock())
+
+        mock_db.doctors.find_one = AsyncMock(return_value={
+            "id": "doc-1",
+            "hospital_id": "H00001",
+        })
+        # Doctor had 10:00 AM original and 10:30 AM expected (+30 min delay)
+        session_doc = {
+            "id": "doc-1_2026-10-02",
+            "doctor_id": "doc-1",
+            "date": "2026-10-02",
+            "original_start_time": "10:00 AM",
+            "expected_start_time": "10:30 AM",
+            "delay_reason": "Emergency surgery",
+            "status": "not_started",
+            "version": 2,
+        }
+        mock_db.doctor_sessions.find_one = AsyncMock(return_value=session_doc)
+        mock_db.appointments.count_documents = AsyncMock(return_value=1)
+
+        captured = {}
+        async def mock_update(filter_q, update_q, **kwargs):
+            captured.update(update_q["$set"])
+            return {**session_doc, **update_q["$set"]}
+        mock_db.doctor_sessions.find_one_and_update = mock_update
+
+        user = {"id": "doc-1", "role": "doctor"}
+        body = DoctorTimingAdjustBody(
+            date="2026-10-02",
+            new_scheduled_start_time="03:00 PM",
+            reason="Emergency surgery",
+            expected_version=2,
+        )
+        res = await adjust_doctor_timing("doc-1", body, user)
+        assert res["ok"] is True
+        # Original moves to 3:00 PM, Expected preserves +30m delta -> 3:30 PM
+        assert "3:00 PM" in captured["original_start_time"]
+        assert "3:30 PM" in captured["expected_start_time"]
+
+    @pytest.mark.asyncio
+    async def test_concurrency_conflict_raises_409(self, mock_db):
+        """Stale panel submitting outdated version raises HTTP 409 Conflict."""
+        mock_db.doctors.find_one = AsyncMock(return_value={"id": "doc-1", "user_id": "u-doc-1"})
+        mock_db.doctor_sessions.find_one = AsyncMock(return_value={
+            "id": "doc-1_2026-10-02",
+            "version": 3,  # DB is at version 3
+            "status": "not_started",
+        })
+        user = {"id": "u-doc-1", "role": "doctor"}
+        body = DoctorTimingAdjustBody(date="2026-10-02", delay_minutes=15, expected_version=1, reason="Running late")
+        with pytest.raises(HTTPException) as exc:
+            await adjust_doctor_timing("doc-1", body, user)
+        assert exc.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_latency_benchmark(self, mock_db, monkeypatch):
+        """Measure save latency and ETA calculation latency."""
+        import time
+        tz_ist = timezone(timedelta(hours=5, minutes=30))
+        monkeypatch.setattr(server, "get_ist_now", lambda: datetime(2026, 10, 2, 9, 0, 0, tzinfo=tz_ist))
+        monkeypatch.setattr(server, "broadcast_doctor_update", AsyncMock())
+
+        mock_db.doctors.find_one = AsyncMock(return_value={"id": "doc-bench", "user_id": "u-doc", "avg_consult_minutes": 5})
+        mock_db.doctor_sessions.find_one = AsyncMock(return_value={
+            "id": "doc-bench_2026-10-02",
+            "doctor_id": "doc-bench",
+            "original_start_time": "10:00 AM",
+            "expected_start_time": "10:00 AM",
+            "status": "not_started",
+            "version": 1,
+        })
+        mock_db.doctor_sessions.find_one_and_update = AsyncMock(return_value={"ok": True})
+        mock_db.appointments.count_documents = AsyncMock(return_value=10)
+
+        user = {"id": "u-doc", "role": "doctor"}
+        body = DoctorTimingAdjustBody(date="2026-10-02", new_scheduled_start_time="03:00 PM", reason="Shift change")
+
+        # Benchmark save
+        t0 = time.perf_counter()
+        for _ in range(50):
+            await adjust_doctor_timing("doc-bench", body, user)
+        t1 = time.perf_counter()
+        avg_save_ms = ((t1 - t0) / 50) * 1000
+
+        # Benchmark ETA calculation for 10 waiting appointments
+        appts = [{"id": f"a{i}", "doctor_id": "doc-bench", "date": "2026-10-02", "token_number": i + 1, "status": "booked"} for i in range(10)]
+        mock_db.appointments.find.return_value = MockCursor(appts)
+        t2 = time.perf_counter()
+        for appt in appts:
+            await calculate_appointment_eta(appt)
+        t3 = time.perf_counter()
+        avg_eta_ms = ((t3 - t2) / 10) * 1000
+
+        # Performance assertion: Save must be under 50ms and ETA calculation under 5ms
+        assert avg_save_ms < 50, f"Average save latency {avg_save_ms:.2f}ms exceeds 50ms threshold"
+        assert avg_eta_ms < 10, f"Average ETA calculation {avg_eta_ms:.2f}ms exceeds 10ms threshold"
+
+

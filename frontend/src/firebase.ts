@@ -36,7 +36,8 @@ export async function getFirebaseAuth(): Promise<any> {
   if (cachedAuth) return cachedAuth;
   try {
     const app = await getFirebaseApp();
-    const { getAuth } = await import("firebase/auth");
+    const authModule: any = await import("firebase/auth");
+    const { getAuth } = authModule;
     cachedAuth = getAuth(app);
     return cachedAuth;
   } catch (err) {
@@ -59,7 +60,8 @@ export async function sendFirebasePhoneOtp(
   }
 
   // Lazy load Firebase Auth phone modules
-  const { signInWithPhoneNumber, RecaptchaVerifier } = await import("firebase/auth");
+  const authModule: any = await import("firebase/auth");
+  const { signInWithPhoneNumber, RecaptchaVerifier } = authModule;
 
   // Set up reCAPTCHA verifier on Web
   if (Platform.OS === "web") {

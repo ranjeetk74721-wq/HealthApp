@@ -294,3 +294,96 @@ async def test_unknown_consultation_start_notice(mock_db, monkeypatch):
     eta = await calculate_appointment_eta(appts[0])
     assert eta["expected_turn_time"] == "Doctor ke consultation shuru karne ka samay abhi confirm nahi hai."
     assert eta["is_delayed_awaited"] is True
+
+
+from starlette.testclient import TestClient
+
+
+def test_cabin_presence_http_endpoint_registered_and_authorized(mock_db):
+    """Verify HTTP endpoint registration, authorization, and response shape."""
+    doc_id = "doc-test-101"
+    user_doc_id = "u-doc-101"
+    user_rec_id = "u-rec-101"
+    user_bad_rec_id = "u-rec-999"
+
+    mock_db.doctors.find_one = AsyncMock(return_value={
+        "id": doc_id,
+        "user_id": user_doc_id,
+        "hospital_id": "HOSP_ALPHA",
+        "status": "active",
+    })
+    session_data = {
+        "id": f"{doc_id}_2026-10-15",
+        "doctor_id": doc_id,
+        "date": "2026-10-15",
+        "status": "not_started",
+        "doctor_in_cabin": False,
+        "cabin_entered_at": None,
+        "version": 1,
+    }
+    mock_db.doctor_sessions.find_one = AsyncMock(return_value=session_data)
+
+    async def mock_find_and_update(filter_q, update_q, **kwargs):
+        res = {**session_data, **update_q.get("$set", {})}
+        return res
+    mock_db.doctor_sessions.find_one_and_update = mock_find_and_update
+
+    users_map = {
+        user_doc_id: {"id": user_doc_id, "role": "doctor", "hospital_id": "HOSP_ALPHA"},
+        user_rec_id: {"id": user_rec_id, "role": "receptionist", "hospital_id": "HOSP_ALPHA"},
+        user_bad_rec_id: {"id": user_bad_rec_id, "role": "receptionist", "hospital_id": "HOSP_BETA"},
+        "p-1": {"id": "p-1", "role": "patient"},
+    }
+    mock_db.users = MagicMock()
+    mock_db.users.find_one = AsyncMock(side_effect=lambda q, *args, **kwargs: users_map.get(q.get("id")))
+
+    # Tokens
+    doc_token = server.create_token(user_doc_id, "doctor")
+    rec_token = server.create_token(user_rec_id, "receptionist")
+    bad_rec_token = server.create_token(user_bad_rec_id, "receptionist")
+    patient_token = server.create_token("p-1", "patient")
+
+    with TestClient(server.app) as client:
+        # 1. Unauthenticated -> 401/403
+        r_unauth = client.post(f"/api/doctor/{doc_id}/session/cabin-presence", json={"doctor_in_cabin": True})
+        assert r_unauth.status_code in (401, 403)
+
+        # 2. Patient -> 403 Forbidden
+        r_patient = client.post(
+            f"/api/doctor/{doc_id}/session/cabin-presence",
+            json={"doctor_in_cabin": True},
+            headers={"Authorization": f"Bearer {patient_token}"}
+        )
+        assert r_patient.status_code == 403
+
+        # 3. Receptionist of different hospital -> 403 Forbidden
+        r_bad_rec = client.post(
+            f"/api/doctor/{doc_id}/session/cabin-presence",
+            json={"doctor_in_cabin": True},
+            headers={"Authorization": f"Bearer {bad_rec_token}"}
+        )
+        assert r_bad_rec.status_code == 403
+
+        # 4. Authorized Doctor -> 200 OK
+        r_doc = client.post(
+            f"/api/doctor/{doc_id}/session/cabin-presence",
+            json={"doctor_in_cabin": True, "date": "2026-10-15"},
+            headers={"Authorization": f"Bearer {doc_token}"}
+        )
+        assert r_doc.status_code == 200
+        data = r_doc.json()
+        assert data["ok"] is True
+        assert data["doctor_in_cabin"] is True
+        assert data["cabin_entered_at"] is not None
+
+        # 5. Authorized Receptionist -> 200 OK
+        r_rec = client.post(
+            f"/api/doctor/{doc_id}/session/cabin-presence",
+            json={"doctor_in_cabin": False, "date": "2026-10-15"},
+            headers={"Authorization": f"Bearer {rec_token}"}
+        )
+        assert r_rec.status_code == 200
+        data_rec = r_rec.json()
+        assert data_rec["ok"] is True
+        assert data_rec["doctor_in_cabin"] is False
+

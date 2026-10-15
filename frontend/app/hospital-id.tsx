@@ -14,12 +14,13 @@ import {
 import { useRouter, useLocalSearchParams } from "expo-router";
 import { api, ApiError } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 
 export default function HospitalId() {
   const router = useRouter();
   const params = useLocalSearchParams<{ redirect?: string }>();
+  const insets = useSafeAreaInsets();
   const [hospitalId, setHospitalId] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -76,7 +77,10 @@ export default function HospitalId() {
         style={{ flex: 1 }}
       >
         <ScrollView
-          contentContainerStyle={styles.container}
+          contentContainerStyle={[
+            styles.scrollContent,
+            { paddingBottom: Math.max(insets.bottom + 24, spacing.xxl) },
+          ]}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
@@ -128,7 +132,7 @@ export default function HospitalId() {
             <Pressable
               onPress={onValidate}
               disabled={loading}
-              style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }]}
+              style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }, loading && { opacity: 0.7 }]}
             >
               {loading ? (
                 <ActivityIndicator color={colors.onBrandPrimary} />
@@ -160,9 +164,12 @@ export default function HospitalId() {
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.surfaceSecondary },
-  container: {
-    flexGrow: 1,
+  scrollContent: {
     padding: spacing.xl,
+    maxWidth: 480,
+    width: "100%",
+    alignSelf: "center",
+    flexGrow: 1,
     justifyContent: "center",
   },
   backWrap: {

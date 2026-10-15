@@ -2,16 +2,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   View, Text, StyleSheet, ScrollView, ActivityIndicator, Pressable,
   RefreshControl, Modal, TextInput, Alert, Image, KeyboardAvoidingView, Platform,
+  useWindowDimensions,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as ImagePicker from "expo-image-picker";
-import { api, getBackendWebSocketBase, isConfirmedAuthError } from "@/src/api/client";
+import { api, getApiBase, getBackendWebSocketBase, isConfirmedAuthError } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import CalendarSummary from "@/src/components/CalendarSummary";
 import DoctorSessionBar from "@/src/components/DoctorSessionBar";
+import DoctorSessionManagerModal from "@/src/components/DoctorSessionManagerModal";
 import PatientDetailsModal from "@/src/components/PatientDetailsModal";
 import { printPatientList } from "@/src/utils/printPatientList";
 
@@ -38,6 +41,9 @@ const STATUS_COLORS: Record<string, string> = {
 
 export default function DoctorDashboard() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
+  const { width: windowWidth } = useWindowDimensions();
+  const isSmallScreen = windowWidth < 600;
   const { user, loading: authLoading, signOut } = useAuth();
   const [docSession, setDocSession]   = useState<any | null>(null);
   const [data, setData]       = useState<any | null>(null);
@@ -66,6 +72,12 @@ export default function DoctorDashboard() {
   const [editPassword, setEditPassword] = useState("");
   const [editError, setEditError]     = useState<string | null>(null);
   const [editSaving, setEditSaving]   = useState(false);
+  const [sessionManagerOpen, setSessionManagerOpen] = useState(false);
+  const [actionLoadingMap, setActionLoadingMap] = useState<Record<string, string>>({});
+  const [statusLoading, setStatusLoading] = useState(false);
+  const [exportLoading, setExportLoading] = useState(false);
+  const verifiedDocIdRef = useRef<string | null>(null);
+  const requestIdRef = useRef(0);
 
   // Receptionist add state
   const [recModalOpen, setRecModalOpen] = useState(false);
@@ -77,6 +89,7 @@ export default function DoctorDashboard() {
   const [recError, setRecError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const wsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isFocused = useRef(true);
@@ -96,57 +109,78 @@ export default function DoctorDashboard() {
   }, [router, signOut]);
 
   const load = useCallback(async (silent = false, bypassCache = false) => {
-    const shouldBypass = bypassCache;
+    const curReqId = ++requestIdRef.current;
+    const shouldBypass = silent || bypassCache;
     const targetDate = selectedDateRef.current;
+    const verifiedDocId = verifiedDocIdRef.current || (user as any)?.doctor_id || data?.doctor?.id;
 
-    // 1. Independent Doctor Profile & Status load
     try {
-      const d = await api.get("/doctor/dashboard", { bypassCache: shouldBypass });
+      let d: any;
+      let a: any[];
+      let sum: any[];
+      let recs: any[];
+      let sessRes: any = null;
+
+      if (verifiedDocId) {
+        const [dashRes, apptsRes, sumRes, recsRes, sRes] = await Promise.all([
+          api.get("/doctor/dashboard", { bypassCache: shouldBypass }),
+          api.get(`/doctor/appointments?date=${targetDate}`, { bypassCache: shouldBypass }),
+          api.get("/appointments/calendar-summary", { bypassCache: shouldBypass }).catch(() => []),
+          api.get("/doctor/receptionists", { bypassCache: shouldBypass }).catch(() => []),
+          api.get(`/doctor/${verifiedDocId}/session?date=${targetDate}`, { bypassCache: shouldBypass }).catch(() => null),
+        ]);
+        d = dashRes;
+        a = apptsRes;
+        sum = sumRes;
+        recs = recsRes;
+        sessRes = sRes;
+      } else {
+        const [dashRes, apptsRes, sumRes, recsRes] = await Promise.all([
+          api.get("/doctor/dashboard", { bypassCache: shouldBypass }),
+          api.get(`/doctor/appointments?date=${targetDate}`, { bypassCache: shouldBypass }),
+          api.get("/appointments/calendar-summary", { bypassCache: shouldBypass }).catch(() => []),
+          api.get("/doctor/receptionists", { bypassCache: shouldBypass }).catch(() => []),
+        ]);
+        d = dashRes;
+        a = apptsRes;
+        sum = sumRes;
+        recs = recsRes;
+
+        const docId = d?.doctor?.id;
+        if (docId) {
+          verifiedDocIdRef.current = docId;
+          sessRes = await api.get(`/doctor/${docId}/session?date=${targetDate}`, { bypassCache: shouldBypass }).catch(() => null);
+        }
+      }
+
+      if (curReqId !== requestIdRef.current) return;
+
       if (d && typeof d === "object") {
         setData(d);
         setProfileError(null);
-        const docId = d?.doctor?.id;
-        if (docId) {
-          api.get(`/doctor/${docId}/session?date=${targetDate}`, { bypassCache: shouldBypass })
-            .then((res) => { if (res?.session) setDocSession(res.session); })
-            .catch(() => {});
-        }
+        if (d.doctor?.id) verifiedDocIdRef.current = d.doctor.id;
       }
-    } catch (err: any) {
-      if (isConfirmedAuthError(err)) {
-        await handleAuthExpired();
-        return;
-      }
-      setProfileError(err?.message || "Failed to load doctor profile");
-    }
-
-    // 2. Independent Appointments load
-    try {
-      const a = await api.get(`/doctor/appointments?date=${targetDate}`, { bypassCache: shouldBypass });
       if (Array.isArray(a)) {
         setAppts(a);
         setApptsError(null);
       }
+      if (Array.isArray(sum)) setSummaryData(sum);
+      if (Array.isArray(recs)) setReceptionists(recs);
+      if (sessRes?.session) setDocSession(sessRes.session);
     } catch (err: any) {
+      if (curReqId !== requestIdRef.current) return;
       if (isConfirmedAuthError(err)) {
         await handleAuthExpired();
         return;
       }
-      setApptsError(err?.message || "Failed to load appointments");
+      setProfileError(err?.message || "Failed to load doctor dashboard");
+    } finally {
+      if (curReqId === requestIdRef.current) {
+        if (!silent) setLoading(false);
+        setRefreshing(false);
+      }
     }
-
-    // 3. Non-essential sections (Calendar Summary & Receptionists)
-    api.get("/appointments/calendar-summary", { bypassCache: shouldBypass })
-      .then((sum) => { if (Array.isArray(sum)) setSummaryData(sum); })
-      .catch(() => {});
-
-    api.get("/doctor/receptionists", { bypassCache: shouldBypass })
-      .then((recs) => { if (Array.isArray(recs)) setReceptionists(recs); })
-      .catch(() => {});
-
-    if (!silent) setLoading(false);
-    setRefreshing(false);
-  }, [handleAuthExpired]);
+  }, [handleAuthExpired, user, data?.doctor?.id]);
 
   // Online & Visibility Listener for Mobile Backgrounding
   useEffect(() => {
@@ -198,7 +232,12 @@ export default function DoctorDashboard() {
             const msg = typeof e?.data === "string" ? JSON.parse(e.data) : e?.data;
             if (msg?.type === "ping" || msg?.type === "pong" || msg?.type === "connected") return;
           } catch {}
-          if (isFocused.current) load(true);
+          if (isFocused.current) {
+            if (wsDebounceRef.current) clearTimeout(wsDebounceRef.current);
+            wsDebounceRef.current = setTimeout(() => {
+              load(true);
+            }, 300);
+          }
         };
 
         ws.onerror = () => setWsConnected(false);
@@ -228,6 +267,7 @@ export default function DoctorDashboard() {
 
     return () => {
       isDisposed = true;
+      if (wsDebounceRef.current) { clearTimeout(wsDebounceRef.current); wsDebounceRef.current = null; }
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       if (wsRef.current) {
         try { wsRef.current.close(); } catch {}
@@ -257,11 +297,70 @@ export default function DoctorDashboard() {
   );
 
   const changeStatus = async (status: string) => {
-    try { await api.post("/doctor/status", { status }); load(true); } catch { /* ignore */ }
+    if (statusLoading || currentMode === status) return;
+    setStatusLoading(true);
+    // Optimistic local update
+    setData((prev: any) => (prev ? { ...prev, status } : prev));
+    try {
+      await api.post("/doctor/status", { status });
+      if (status === "emergency") {
+        const pendingCount = appts.filter((a) => ["booked", "arrived"].includes(a.status)).length;
+        if (pendingCount > 0) {
+          const doAutoRefer = async () => {
+            try {
+              const res = await api.post("/doctor/auto-refer", { from_doctor_id: data?.doctor?.id });
+              Alert.alert("Auto-Referral", res?.message || `Transferred ${res?.count || 0} patient(s) successfully.`);
+              load(true, true);
+            } catch (err: any) {
+              Alert.alert("Auto-Referral Error", err?.message || "Failed to auto-refer waiting queue.");
+            }
+          };
+          if (Platform.OS === "web") {
+            if (window.confirm(`Status switched to Emergency. Would you like to auto-refer ${pendingCount} waiting patient(s) to an available colleague?`)) {
+              doAutoRefer();
+            }
+          } else {
+            Alert.alert(
+              "Emergency Duty",
+              `Status switched to Emergency. Would you like to auto-refer ${pendingCount} waiting patient(s) to an available colleague?`,
+              [
+                { text: "Keep Queue Here", style: "cancel" },
+                { text: "Auto-Refer All", style: "destructive", onPress: doAutoRefer },
+              ]
+            );
+          }
+        }
+      }
+      await load(true, true);
+    } catch (err: any) {
+      Alert.alert("Status Error", err?.message || "Failed to update doctor working mode");
+      load(true, true);
+    } finally {
+      setStatusLoading(false);
+    }
   };
 
-  const doAction = async (path: string, appt_id: string) => {
-    try { await api.post(path, { appointment_id: appt_id }); load(true); } catch { /* ignore */ }
+  const doAction = async (path: string, appt_id: string, optimisticStatus?: string, actionName?: string) => {
+    if (actionLoadingMap[appt_id]) return; // Per-patient immediate guard
+    setActionLoadingMap((prev) => ({ ...prev, [appt_id]: actionName || "loading" }));
+    try {
+      await api.post(path, { appointment_id: appt_id });
+      // Optimistic local update upon confirmed backend write
+      if (optimisticStatus) {
+        setAppts((prev) =>
+          prev.map((a) => (a.id === appt_id ? { ...a, status: optimisticStatus } : a))
+        );
+      }
+      await load(true, true);
+    } catch (err: any) {
+      Alert.alert("Action Error", err.message || "Failed to update appointment");
+    } finally {
+      setActionLoadingMap((prev) => {
+        const next = { ...prev };
+        delete next[appt_id];
+        return next;
+      });
+    }
   };
 
   const savePresc = async () => {
@@ -446,6 +545,43 @@ export default function DoctorDashboard() {
     appts.find((a) => a.status === "arrived") ||
     appts.find((a) => a.status === "booked");
 
+  const handleDownloadExcel = async () => {
+    const docId = data?.doctor?.id || (user as any)?.doctor_id || (user as any)?.id;
+    if (!docId) {
+      Alert.alert("Error", "Doctor profile not loaded.");
+      return;
+    }
+    setExportLoading(true);
+    try {
+      const token = await AsyncStorage.getItem("cq_token");
+      const url = `${getApiBase()}/reception/export-excel?doctor_id=${docId}&date=${selectedDate}`;
+      if (Platform.OS === "web") {
+        const response = await fetch(url, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (!response.ok) {
+          throw new Error("Failed to export Excel report");
+        }
+        const blob = await response.blob();
+        const blobUrl = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        const docName = (data?.doctor?.full_name || user?.full_name || "Doctor").replace(/[^\w\-]/g, "_");
+        a.download = `DoctorSchedule_${docName}_${selectedDate}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(blobUrl);
+      } else {
+        Alert.alert("Notice", "Excel export is optimized for web browser.");
+      }
+    } catch (err: any) {
+      Alert.alert("Export Error", err?.message || "Failed to download Excel report");
+    } finally {
+      setExportLoading(false);
+    }
+  };
+
   const handlePrintPatientList = () => {
     const clinicTitle = data?.doctor?.hospital_name || data?.doctor?.clinic_name || "MeriBaari Clinic";
     const docTitle = data?.doctor?.full_name || user?.full_name || "Doctor";
@@ -476,6 +612,14 @@ export default function DoctorDashboard() {
             <View style={[styles.liveDot, wsConnected && { backgroundColor: colors.success }]} />
           </View>
         </View>
+        <Pressable
+          onPress={() => setSessionManagerOpen(true)}
+          testID="doctor-open-shifts-modal"
+          style={[styles.iconBtn, { backgroundColor: colors.brandSecondary }]}
+          accessibilityLabel="Manage OPD Shifts and Slots"
+        >
+          <Ionicons name="calendar-outline" size={20} color={colors.brandPrimary} />
+        </Pressable>
         <Pressable onPress={openEditProfile} testID="doctor-edit-profile" style={styles.iconBtn}>
           <Ionicons name="create-outline" size={20} color={colors.brandPrimary} />
         </Pressable>
@@ -489,11 +633,11 @@ export default function DoctorDashboard() {
       </View>
 
       <ScrollView
-        contentContainerStyle={styles.scroll}
+        contentContainerStyle={[styles.scroll, { paddingBottom: Math.max(insets.bottom + 40, 100) }]}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true); }} />}
       >
-        {/* ── Doctor Session Timing Bar & Controls ── */}
-        {data?.doctor?.id && docSession && (
+        {/* ── Doctor Session Timing Bar & Controls (with stable placeholder to eliminate layout jump) ── */}
+        {docSession && data?.doctor?.id ? (
           <DoctorSessionBar
             doctorId={data.doctor.id}
             doctorName={data.doctor.full_name || user?.full_name || "Doctor"}
@@ -501,9 +645,39 @@ export default function DoctorDashboard() {
             waitingCount={appts.filter((a) => ["booked", "arrived"].includes(a.status)).length}
             onRefresh={() => load(true, true)}
           />
+        ) : (
+          <View style={styles.sessionBarPlaceholder}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+              <ActivityIndicator size="small" color={colors.brandPrimary} />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.placeholderTitle}>Consultation Session & Timing</Text>
+                <Text style={styles.placeholderSub}>Loading OPD session status and timings...</Text>
+              </View>
+            </View>
+          </View>
         )}
 
-        {/* ── Status chips ── */}
+        {/* ── Quick Action: Shift & Custom Slot Management ── */}
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border }}>
+          <View style={{ flex: 1, paddingRight: spacing.sm }}>
+            <Text style={{ fontSize: font.sm, fontWeight: "700", color: colors.onSurface }}>OPD Sessions & Shifts</Text>
+            <Text style={{ fontSize: 11, color: colors.muted }}>Day shift, Night shift, Emergency shift & Holidays</Text>
+          </View>
+          <Pressable
+            testID="doctor-opd-sessions-shifts-btn"
+            onPress={() => setSessionManagerOpen(true)}
+            style={{ backgroundColor: colors.brandPrimary, paddingHorizontal: spacing.md, paddingVertical: 8, borderRadius: radius.md, flexDirection: "row", alignItems: "center", gap: 6 }}
+          >
+            <Ionicons name="calendar-outline" size={16} color="#fff" />
+            <Text style={{ color: "#fff", fontWeight: "700", fontSize: font.sm }}>OPD Sessions & Shifts</Text>
+          </Pressable>
+        </View>
+
+        {/* ── Doctor Working Mode / Alert Status ── */}
+        <View style={styles.modeSectionHeader}>
+          <Text style={styles.modeSectionTitle}>Doctor Working Mode / Alert Status</Text>
+          <Text style={styles.modeSectionHint}>Controls triage availability and patient alert banners</Text>
+        </View>
         <View style={styles.modeRow}>
           {modes.map((m) => {
             const active = currentMode === m.key;
@@ -511,8 +685,13 @@ export default function DoctorDashboard() {
               <Pressable
                 key={m.key}
                 testID={`mode-${m.key}`}
+                disabled={statusLoading}
                 onPress={() => changeStatus(m.key)}
-                style={[styles.modeChip, active && { backgroundColor: m.color, borderColor: m.color }]}
+                style={[
+                  styles.modeChip,
+                  active && { backgroundColor: m.color, borderColor: m.color },
+                  statusLoading && { opacity: 0.7 },
+                ]}
               >
                 <Ionicons name={m.icon} size={16} color={active ? "#fff" : m.color} />
                 <Text style={[styles.modeText, active && { color: "#fff" }]}>{m.label}</Text>
@@ -583,22 +762,44 @@ export default function DoctorDashboard() {
               </Text>
             </Pressable>
             {nextPatient.status !== "in_consultation" ? (
-              <Pressable testID="call-next-btn" onPress={() => doAction("/reception/start_consultation", nextPatient.id)} style={styles.callBtn}>
-                <Ionicons name="mic" size={18} color={colors.brandPrimary} />
-                <Text style={styles.callBtnText}>Call Next Patient</Text>
+              <Pressable
+                testID="call-next-btn"
+                onPress={() => doAction("/reception/start_consultation", nextPatient.id, "in_consultation", "Call")}
+                disabled={!!actionLoadingMap[nextPatient.id]}
+                style={[styles.callBtn, !!actionLoadingMap[nextPatient.id] && { opacity: 0.7 }]}
+              >
+                {actionLoadingMap[nextPatient.id] === "Call" ? (
+                  <ActivityIndicator size="small" color={colors.brandPrimary} />
+                ) : (
+                  <>
+                    <Ionicons name="mic" size={18} color={colors.brandPrimary} />
+                    <Text style={styles.callBtnText}>Call Next Patient</Text>
+                  </>
+                )}
               </Pressable>
             ) : (
-              <Pressable testID="complete-btn" onPress={() => doAction("/reception/complete", nextPatient.id)} style={[styles.callBtn, { backgroundColor: colors.success }]}>
-                <Ionicons name="checkmark-circle" size={18} color="#fff" />
-                <Text style={[styles.callBtnText, { color: "#fff" }]}>Mark Consultation Done</Text>
+              <Pressable
+                testID="complete-btn"
+                onPress={() => doAction("/reception/complete", nextPatient.id, "completed", "Done")}
+                disabled={!!actionLoadingMap[nextPatient.id]}
+                style={[styles.callBtn, { backgroundColor: colors.success }, !!actionLoadingMap[nextPatient.id] && { opacity: 0.7 }]}
+              >
+                {actionLoadingMap[nextPatient.id] === "Done" ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <>
+                    <Ionicons name="checkmark-circle" size={18} color="#fff" />
+                    <Text style={[styles.callBtnText, { color: "#fff" }]}>Mark Consultation Done</Text>
+                  </>
+                )}
               </Pressable>
             )}
           </View>
         )}
 
-        {/* ── Patient queue section header with Print button ── */}
+        {/* ── Patient queue section header with Print & Excel buttons ── */}
         <View style={styles.sectionHeaderRow}>
-          <View>
+          <View style={{ flex: 1, minWidth: 160 }}>
             <Text style={styles.sectionTitle}>
               Today&apos;s Schedule · {selectedDate}
             </Text>
@@ -607,14 +808,31 @@ export default function DoctorDashboard() {
             </Text>
           </View>
 
-          <Pressable
-            testID="doctor-print-patient-list-btn"
-            onPress={handlePrintPatientList}
-            style={styles.printBtn}
-          >
-            <Ionicons name="print-outline" size={16} color={colors.brandPrimary} />
-            <Text style={styles.printBtnText}>Print Patient List</Text>
-          </Pressable>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <Pressable
+              testID="doctor-print-patient-list-btn"
+              onPress={handlePrintPatientList}
+              style={styles.printBtn}
+            >
+              <Ionicons name="print-outline" size={16} color={colors.brandPrimary} />
+              <Text style={styles.printBtnText}>Print</Text>
+            </Pressable>
+            <Pressable
+              testID="doctor-export-excel-btn"
+              onPress={handleDownloadExcel}
+              disabled={exportLoading}
+              style={[styles.exportBtn, exportLoading && { opacity: 0.6 }]}
+            >
+              {exportLoading ? (
+                <ActivityIndicator size="small" color="#0F766E" />
+              ) : (
+                <>
+                  <Ionicons name="download-outline" size={16} color="#0F766E" />
+                  <Text style={styles.exportBtnText}>Excel</Text>
+                </>
+              )}
+            </Pressable>
+          </View>
         </View>
 
         {/* ── Filter Tabs ── */}
@@ -671,7 +889,7 @@ export default function DoctorDashboard() {
                     <Text style={[styles.tokenText, a.status === "in_consultation" && { color: colors.onBrandPrimary }]}>#{a.token_number}</Text>
                   </View>
                   <View style={{ flex: 1 }}>
-                    <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                       <Text style={styles.apptName}>{a.patient_name}</Text>
                       <Ionicons name="information-circle-outline" size={14} color={colors.brandPrimary} />
                     </View>
@@ -696,22 +914,38 @@ export default function DoctorDashboard() {
                 </Pressable>
 
                 <View style={styles.rowActions}>
-                  {availableActions.map((act) => (
-                    <Pressable
-                      key={act.label}
-                      testID={`doc-action-${act.label.toLowerCase()}-${a.id}`}
-                      onPress={() => doAction(act.path, a.id)}
-                      style={[styles.rowActBtn, { backgroundColor: act.color + "22" }]}
-                    >
-                      <Ionicons name={act.icon} size={14} color={act.color} />
-                    </Pressable>
-                  ))}
+                  {availableActions.map((act) => {
+                    const isActing = actionLoadingMap[a.id] === act.label;
+                    const targetStatus =
+                      act.label === "Call" ? "in_consultation" :
+                      act.label === "Done" ? "completed" :
+                      act.label === "Arrived" ? "arrived" : "skipped";
+                    return (
+                      <Pressable
+                        key={act.label}
+                        testID={`doc-action-${act.label.toLowerCase()}-${a.id}`}
+                        onPress={() => doAction(act.path, a.id, targetStatus, act.label)}
+                        disabled={!!actionLoadingMap[a.id]}
+                        style={[styles.rowActBtn, { backgroundColor: act.color + "18", borderColor: act.color + "44" }, !!actionLoadingMap[a.id] && { opacity: 0.6 }]}
+                      >
+                        {isActing ? (
+                          <ActivityIndicator size="small" color={act.color} />
+                        ) : (
+                          <>
+                            <Ionicons name={act.icon} size={15} color={act.color} />
+                            <Text style={[styles.rowActBtnLabel, { color: act.color }]}>{act.label}</Text>
+                          </>
+                        )}
+                      </Pressable>
+                    );
+                  })}
                   <Pressable
                     testID={`presc-${a.id}`}
                     onPress={() => { setPrescOpen(a); setPrescText(a.prescription || ""); }}
-                    style={[styles.rowActBtn, { backgroundColor: colors.brandSecondary }]}
+                    style={[styles.rowActBtn, { backgroundColor: colors.brandSecondary, borderColor: colors.brandPrimary + "44" }]}
                   >
-                    <Ionicons name="document-text-outline" size={14} color={colors.brandPrimary} />
+                    <Ionicons name="document-text-outline" size={15} color={colors.brandPrimary} />
+                    <Text style={[styles.rowActBtnLabel, { color: colors.brandPrimary }]}>Rx</Text>
                   </Pressable>
                 </View>
               </View>
@@ -846,18 +1080,32 @@ export default function DoctorDashboard() {
         </KeyboardAvoidingView>
       </Modal>
 
-      {/* ── Patient Details View / Edit Modal ── */}
-      <PatientDetailsModal
-        visible={!!selectedPatientAppt}
-        appointment={selectedPatientAppt}
-        onClose={() => setSelectedPatientAppt(null)}
-        onUpdated={(updated) => {
-          setAppts((prev) =>
-            prev.map((a) => (a.id === updated.id ? { ...a, ...updated } : a))
-          );
-          setSelectedPatientAppt(updated);
-        }}
-      />
+      {/* ── Patient Details View / Edit Modal (deferred until selected) ── */}
+      {!!selectedPatientAppt && (
+        <PatientDetailsModal
+          visible={!!selectedPatientAppt}
+          appointment={selectedPatientAppt}
+          onClose={() => setSelectedPatientAppt(null)}
+          onUpdated={(updated) => {
+            setAppts((prev) =>
+              prev.map((a) => (a.id === updated.id ? { ...a, ...updated } : a))
+            );
+            setSelectedPatientAppt(updated);
+          }}
+        />
+      )}
+
+      {/* ── Shifts & Custom Slots Manager Modal (deferred until opened) ── */}
+      {data?.doctor?.id && sessionManagerOpen && (
+        <DoctorSessionManagerModal
+          visible={sessionManagerOpen}
+          doctorId={data.doctor.id}
+          doctorName={data.doctor.full_name || user?.full_name || "Doctor"}
+          initialDate={selectedDate}
+          onClose={() => setSessionManagerOpen(false)}
+          onSessionsUpdated={() => load(true, true)}
+        />
+      )}
     </SafeAreaView>
   );
 }
@@ -869,6 +1117,39 @@ const styles = StyleSheet.create({
   name: { fontSize: font.xl, fontWeight: "700", color: colors.onSurface },
   liveDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.muted, marginLeft: 4 },
   iconBtn: { width: 40, height: 40, borderRadius: radius.pill, backgroundColor: colors.surface, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.border },
+  sessionBarPlaceholder: {
+    backgroundColor: colors.surface,
+    borderRadius: radius.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.lg,
+    minHeight: 120,
+    justifyContent: "center",
+  },
+  placeholderTitle: {
+    fontSize: font.sm,
+    fontWeight: "700",
+    color: colors.onSurface,
+  },
+  placeholderSub: {
+    fontSize: font.xs,
+    color: colors.muted,
+    marginTop: 2,
+  },
+  modeSectionHeader: {
+    marginTop: spacing.xs,
+    marginBottom: 4,
+  },
+  modeSectionTitle: {
+    fontSize: font.sm,
+    fontWeight: "700",
+    color: colors.onSurface,
+  },
+  modeSectionHint: {
+    fontSize: 11,
+    color: colors.muted,
+    marginTop: 1,
+  },
   scroll: { padding: spacing.lg, paddingTop: 0, gap: spacing.md, paddingBottom: spacing.xxxl },
   modeRow: { flexDirection: "row", gap: spacing.sm },
   modeChip: { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, padding: spacing.md, borderRadius: radius.md, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border },
@@ -914,6 +1195,22 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: colors.brandPrimary,
   },
+  exportBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 7,
+    borderRadius: radius.md,
+    backgroundColor: "#F0FDFA",
+    borderWidth: 1,
+    borderColor: "#0F766E",
+  },
+  exportBtnText: {
+    fontSize: font.sm,
+    fontWeight: "600",
+    color: "#0F766E",
+  },
   filterChipsRow: {
     flexDirection: "row",
     gap: 8,
@@ -942,7 +1239,7 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
   patientInfoPressable: {
-    flex: 1,
+    width: "100%",
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.md,
@@ -954,7 +1251,14 @@ const styles = StyleSheet.create({
   },
   empty: { alignItems: "center", padding: spacing.xl },
   emptyText: { color: colors.muted },
-  apptCard: { flexDirection: "row", alignItems: "center", gap: spacing.md, backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border },
+  apptCard: {
+    backgroundColor: colors.surface,
+    padding: spacing.md,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    gap: spacing.sm,
+  },
   tokenBubble: { width: 44, height: 44, borderRadius: radius.pill, backgroundColor: colors.brandSecondary, alignItems: "center", justifyContent: "center" },
   tokenText: { fontSize: font.sm, fontWeight: "700", color: colors.brandPrimary },
   apptName: { fontSize: font.base, fontWeight: "600", color: colors.onSurface },
@@ -963,8 +1267,31 @@ const styles = StyleSheet.create({
   statusPill: { paddingHorizontal: 8, paddingVertical: 2, borderRadius: radius.pill },
   statusText: { fontSize: 10, fontWeight: "700", textTransform: "capitalize" },
   symptoms: { fontSize: 11, color: colors.onSurfaceSecondary, marginTop: 2 },
-  rowActions: { flexDirection: "row", gap: 4, flexWrap: "wrap", maxWidth: 120, justifyContent: "flex-end" },
-  rowActBtn: { width: 30, height: 30, borderRadius: radius.pill, alignItems: "center", justifyContent: "center" },
+  rowActions: {
+    flexDirection: "row",
+    gap: 8,
+    flexWrap: "wrap",
+    justifyContent: "flex-end",
+    alignItems: "center",
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: colors.border,
+    paddingTop: 8,
+  },
+  rowActBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+    paddingVertical: 7,
+    paddingHorizontal: 12,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    minHeight: 38,
+  },
+  rowActBtnLabel: {
+    fontSize: 12,
+    fontWeight: "700",
+  },
   modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
   sheet: { backgroundColor: colors.surface, padding: spacing.lg, borderTopLeftRadius: 24, borderTopRightRadius: 24, gap: spacing.sm, paddingBottom: spacing.xxl },
   sheetHandle: { width: 40, height: 4, backgroundColor: colors.borderStrong, borderRadius: 2, alignSelf: "center", marginBottom: spacing.md },

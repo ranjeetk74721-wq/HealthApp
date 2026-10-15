@@ -12,7 +12,7 @@ import {
 } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { api, isConfirmedAuthError } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
 import { formatExpectedTimeRange } from "@/src/utils/timeFormat";
@@ -32,6 +32,7 @@ function getDates(count: number) {
 export default function BookAppointment() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const dates = useMemo(() => getDates(7), []);
   const [selectedDate, setSelectedDate] = useState<Date>(dates[0]);
   const [doctor, setDoctor] = useState<any>(null);
@@ -288,7 +289,7 @@ export default function BookAppointment() {
         <View style={{ width: 24 }} />
       </View>
 
-      <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: 130, gap: spacing.md }}>
+      <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: 130 + Math.max(insets.bottom, spacing.md), gap: spacing.md }}>
         {/* Step 1: Doctor & Clinic Header */}
         <View style={styles.docCard}>
           <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -624,7 +625,7 @@ export default function BookAppointment() {
       </ScrollView>
 
       {/* Sticky CTA with Hindi and English requirement: "नंबर लगाएँ (Book Appointment)" */}
-      <SafeAreaView edges={["bottom"]} style={styles.stickyCta}>
+      <View style={[styles.stickyCta, { paddingBottom: Math.max(insets.bottom, spacing.md) }]}>
         <Pressable
           testID="proceed-payment-cta"
           disabled={!canProceedToBook || booking}
@@ -645,7 +646,7 @@ export default function BookAppointment() {
             </>
           )}
         </Pressable>
-      </SafeAreaView>
+      </View>
 
       {/* Payment / Confirmation Modal */}
       <Modal
@@ -662,8 +663,9 @@ export default function BookAppointment() {
             if (!booking) setShowPay(false);
           }}
         >
-          <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+          <Pressable style={[styles.sheet, { maxHeight: "90%" }]} onPress={(e) => e.stopPropagation()}>
             <View style={styles.sheetHandle} />
+            <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
             <Text style={styles.sheetTitle}>Confirm Booking & Payment</Text>
             <Text style={styles.sheetSub}>
               {doctor.full_name} · {iso(selectedDate)}
@@ -743,6 +745,7 @@ export default function BookAppointment() {
                 </Text>
               </View>
             )}
+            </ScrollView>
           </Pressable>
         </Pressable>
       </Modal>
@@ -787,6 +790,7 @@ const styles = StyleSheet.create({
   sectionTitle: { fontSize: font.base, fontWeight: "700", color: colors.onSurface, marginTop: spacing.xs },
   dateChip: {
     width: 68,
+    flexShrink: 0,
     alignItems: "center",
     padding: spacing.sm,
     borderRadius: radius.md,

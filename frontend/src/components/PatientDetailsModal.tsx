@@ -41,6 +41,7 @@ export default function PatientDetailsModal({
   const [saving, setSaving] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [sendingSms, setSendingSms] = useState(false);
 
   // Current active details object
   const [details, setDetails] = useState<any | null>(null);
@@ -175,6 +176,25 @@ export default function PatientDetailsModal({
       setErrorMsg(err.message || "Failed to update patient details.");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleSendSmsLink = async () => {
+    if (!currentData?.id) return;
+    if (!currentData.patient_mobile) {
+      setErrorMsg("Patient does not have a contact number on file.");
+      return;
+    }
+    setSendingSms(true);
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    try {
+      await api.post(`/reception/appointments/${currentData.id}/send-link`, {});
+      setSuccessMsg("Live tracking SMS sent to patient successfully!");
+    } catch (err: any) {
+      setErrorMsg(err.message || "Failed to send SMS tracking link.");
+    } finally {
+      setSendingSms(false);
     }
   };
 
@@ -359,6 +379,37 @@ export default function PatientDetailsModal({
                         : "Not provided"}
                     </Text>
                   </View>
+                </View>
+
+                {/* Section 3: Live Queue SMS Notification */}
+                <View style={styles.card}>
+                  <View style={styles.cardHeader}>
+                    <Ionicons name="chatbubble-ellipses-outline" size={16} color={colors.brandPrimary} />
+                    <Text style={styles.cardTitle}>Live Queue SMS Notification</Text>
+                  </View>
+                  <Text style={styles.helperText}>
+                    Send real-time tracking link and estimated turn time to patient&apos;s phone via SMS.
+                  </Text>
+                  <Pressable
+                    testID="patient-details-send-sms-btn"
+                    disabled={sendingSms || !currentData.patient_mobile}
+                    onPress={handleSendSmsLink}
+                    style={[
+                      styles.sendSmsBtn,
+                      (!currentData.patient_mobile || sendingSms) && { opacity: 0.6 },
+                    ]}
+                  >
+                    {sendingSms ? (
+                      <ActivityIndicator size="small" color="#fff" />
+                    ) : (
+                      <>
+                        <Ionicons name="paper-plane-outline" size={16} color="#fff" />
+                        <Text style={styles.sendSmsBtnText}>
+                          {currentData.patient_mobile ? "Send Live Queue Link via SMS" : "Mobile Number Required for SMS"}
+                        </Text>
+                      </>
+                    )}
+                  </Pressable>
                 </View>
               </View>
             ) : (
@@ -848,5 +899,20 @@ const styles = StyleSheet.create({
     color: colors.onSurfaceSecondary,
     fontSize: font.base,
     fontWeight: "600",
+  },
+  sendSmsBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    backgroundColor: colors.brandPrimary,
+    paddingVertical: spacing.md,
+    borderRadius: radius.md,
+    marginTop: spacing.sm,
+  },
+  sendSmsBtnText: {
+    color: "#fff",
+    fontSize: font.sm,
+    fontWeight: "700",
   },
 });

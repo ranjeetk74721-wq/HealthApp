@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator,
   RefreshControl, Modal, TextInput, KeyboardAvoidingView, Platform, Alert,
+  useWindowDimensions,
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
@@ -12,6 +13,7 @@ import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import CalendarSummary from "@/src/components/CalendarSummary";
 import DoctorSessionBar from "@/src/components/DoctorSessionBar";
+import DoctorSessionManagerModal from "@/src/components/DoctorSessionManagerModal";
 import PatientDetailsModal from "@/src/components/PatientDetailsModal";
 import { printPatientList } from "@/src/utils/printPatientList";
 
@@ -32,10 +34,50 @@ export default function ReceptionistDashboard() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const { user, loading: authLoading, signOut } = useAuth();
+  const { width: windowWidth } = useWindowDimensions();
+  const isSmallScreen = windowWidth < 540;
+  const isExtraSmallScreen = windowWidth < 360;
+
+  // ── Canonical Receptionist Route Guard ──
+  useEffect(() => {
+    if (!authLoading && (!user || user.role !== "receptionist")) {
+      const lastHosp = (typeof window !== "undefined" && window.localStorage?.getItem("cq_receptionist_last_hospital")) || "";
+      if (lastHosp) {
+        router.replace({ pathname: "/staff-login", params: { role: "receptionist", hospitalId: lastHosp } });
+      } else {
+        router.replace("/hospital-id");
+      }
+    }
+  }, [authLoading, user, router]);
+
+  // Safe redirect on authentication expiration
+  const handleAuthExpired = useCallback(async () => {
+    const lastHosp = user?.hospital_id || (typeof window !== "undefined" && window.localStorage?.getItem("cq_receptionist_last_hospital")) || "";
+    await signOut();
+    if (lastHosp) {
+      router.replace({ pathname: "/staff-login", params: { role: "receptionist", hospitalId: lastHosp } });
+    } else {
+      router.replace("/hospital-id");
+    }
+  }, [user, signOut, router]);
+
+  // Doctor List State: explicit loading, success, empty, and error tracking
   const [doctors, setDoctors] = useState<any[]>([]);
   const [doctorsError, setDoctorsError] = useState<string | null>(null);
   const [selectedDoc, setSelectedDoc] = useState<string | null>(null);
+  const [doctorListStatus, setDoctorListStatus] = useState<"idle" | "loading" | "success" | "empty" | "error">("loading");
+  const [doctorListError, setDoctorListError] = useState<string | null>(null);
+
+  // Session State: explicit states to eliminate perpetual spinner
   const [docSession, setDocSession] = useState<any | null>(null);
+  const [sessionState, setSessionState] = useState<{
+    status: "idle" | "loading" | "success" | "empty" | "error";
+    error?: string | null;
+    is403?: boolean;
+    slowLoading?: boolean;
+  }>({ status: "idle" });
+
+  // Queue and Calendar state
   const [queue, setQueue] = useState<any[]>([]);
   const [queueError, setQueueError] = useState<string | null>(null);
   const [summaryData, setSummaryData] = useState<any[]>([]);
@@ -46,7 +88,20 @@ export default function ReceptionistDashboard() {
   const [queueFilter, setQueueFilter] = useState<"all" | "active" | "completed">("all");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
+  const [actionLoadingMap, setActionLoadingMap] = useState<Record<string, string>>({});
+  const [sessionManagerOpen, setSessionManagerOpen] = useState(false);
+
+  // Derived Queue definitions placed safely after queue state
+  const activeQueue = queue.filter(
+    (q) => q.status !== "completed" && q.status !== "cancelled"
+  );
+  const completedQueue = queue.filter((q) => q.status === "completed");
+  const displayedQueue =
+    queueFilter === "completed"
+      ? completedQueue
+      : queueFilter === "all"
+      ? queue.filter((q) => q.status !== "cancelled")
+      : activeQueue;
 
   // Network and stale tracking
   const [isOnline, setIsOnline] = useState(true);
@@ -93,17 +148,22 @@ export default function ReceptionistDashboard() {
   const [addError, setAddError] = useState<string | null>(null);
   const [addToast, setAddToast] = useState<string | null>(null);
   const [exportLoading, setExportLoading] = useState(false);
+  const [autoReferLoading, setAutoReferLoading] = useState(false);
 
   // View completed toggle
   const [showCompleted, setShowCompleted] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const requestIdRef = useRef(0);
+  const sessionReqIdRef = useRef(0);
+  const pollingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isFetchingRef = useRef(false);
+  const hasPendingUpdateRef = useRef(false);
   const isFocused = useRef(true);
   const [wsConnected, setWsConnected] = useState(false);
-  const isLoggingOutRef = useRef(false);
-  const reconnectAttemptsRef = useRef(0);
-  const reconnectTimerRef = useRef<any>(null);
+  const wsConnectedRef = useRef(false);
+  useEffect(() => { wsConnectedRef.current = wsConnected; }, [wsConnected]);
 
   // In-flight synchronous guards against rapid repeated clicks
   const addPatientSubmittingRef = useRef(false);
@@ -111,85 +171,37 @@ export default function ReceptionistDashboard() {
   const rescheduleSubmittingRef = useRef(false);
   const referSubmittingRef = useRef(false);
 
-  // Use a ref so load() always reads the latest selectedDoc without stale closure
+  // Current doc and date refs to eliminate stale closure bugs
   const selectedDocRef = useRef<string | null>(null);
   useEffect(() => { selectedDocRef.current = selectedDoc; }, [selectedDoc]);
 
-  const handleAuthExpired = useCallback(async () => {
-    if (isLoggingOutRef.current) return;
-    isLoggingOutRef.current = true;
-    try {
-      await signOut();
-      router.replace("/hospital-id?redirect=/receptionist/dashboard");
-    } finally {
-      isLoggingOutRef.current = false;
-    }
-  }, [router, signOut]);
+  const selectedDateRef = useRef(selectedDate);
+  useEffect(() => { selectedDateRef.current = selectedDate; }, [selectedDate]);
 
-  useEffect(() => {
-    if (!authLoading && !user) {
-      router.replace("/hospital-id?redirect=/receptionist/dashboard");
-    }
-  }, [authLoading, user, router]);
+  // Stable ref for refreshDoctorData and fetchDoctors
+  const refreshDoctorDataRef = useRef<(doctorId: string, targetDate: string, silent?: boolean) => Promise<void>>(undefined);
+  const fetchDoctorsRef = useRef<(silent?: boolean) => Promise<void>>(undefined);
 
-  const loadDoctorQueue = useCallback(async (doctorId: string, shouldBypass = false) => {
-    try {
-      const q = await api.get(`/reception/queue?doctor_id=${doctorId}&date=${selectedDate}`, { bypassCache: shouldBypass });
-      setQueue(q || []);
-      setQueueError(null);
-      const nowStr = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true });
-      setLastUpdated(nowStr);
-      setIsStale(false);
-    } catch (err: any) {
-      if (isConfirmedAuthError(err)) {
-        await handleAuthExpired();
-        return;
-      }
-      setQueueError(err?.message || "Failed to load queue");
-      setIsStale(true);
-    }
-
-    // Auxiliary non-essential queries (do not block or crash queue)
-    api.get(`/doctor/${doctorId}/session?date=${selectedDate}`, { bypassCache: shouldBypass })
-      .then((sessRes) => { if (sessRes?.session) setDocSession(sessRes.session); })
-      .catch(() => {});
-    api.get(`/appointments/calendar-summary?doctor_id=${doctorId}`, { bypassCache: shouldBypass })
-      .then((sum) => { if (Array.isArray(sum)) setSummaryData(sum); })
-      .catch(() => {});
-    api.get(`/doctor/${doctorId}/sessions?target_date=${selectedDate}`, { bypassCache: shouldBypass })
-      .then((confSessRes) => { if (Array.isArray(confSessRes?.sessions)) setConfiguredSessions(confSessRes.sessions); })
-      .catch(() => {});
-  }, [handleAuthExpired, selectedDate]);
-
-  const load = useCallback(async (silent = false, bypassCache = false) => {
-    const shouldBypass = bypassCache;
-    try {
-      const docs = await api.get("/reception/doctors", { bypassCache: shouldBypass });
-      if (Array.isArray(docs)) {
-        setDoctors(docs);
-        setDoctorsError(null);
-        let doctorId = selectedDocRef.current;
-        if (!doctorId || !docs.some((d: any) => d.id === doctorId)) {
-          doctorId = docs[0]?.id ?? null;
-          setSelectedDoc(doctorId);
-          selectedDocRef.current = doctorId;
-        }
-        if (doctorId) {
-          await loadDoctorQueue(doctorId, shouldBypass);
+  // Single Fallback Polling Timer Controller
+  const startFallbackPolling = useCallback(() => {
+    if (pollingTimerRef.current) return;
+    pollingTimerRef.current = setInterval(() => {
+      if (Platform.OS !== "web" || document.visibilityState === "visible") {
+        const currentDoc = selectedDocRef.current;
+        const currentDate = selectedDateRef.current;
+        if (currentDoc && isFocused.current) {
+          refreshDoctorDataRef.current?.(currentDoc, currentDate, true);
         }
       }
-    } catch (err: any) {
-      if (isConfirmedAuthError(err)) {
-        await handleAuthExpired();
-        return;
-      }
-      setDoctorsError(err?.message || "Failed to load doctor list");
-      setIsStale(true);
-    } finally {
-      if (!silent) setLoading(false);
-      setRefreshing(false);
+    }, POLL_INTERVAL_MS);
+  }, []);
+
+  const stopFallbackPolling = useCallback(() => {
+    if (pollingTimerRef.current) {
+      clearInterval(pollingTimerRef.current);
+      pollingTimerRef.current = null;
     }
-  }, [handleAuthExpired, loadDoctorQueue]);
+  }, []);
 
   // Online / Offline listeners
   useEffect(() => {
@@ -197,7 +209,9 @@ export default function ReceptionistDashboard() {
       const handleOnline = () => {
         setIsOnline(true);
         setIsStale(false);
-        load(true, true);
+        if (selectedDocRef.current && refreshDoctorDataRef.current) {
+          refreshDoctorDataRef.current(selectedDocRef.current, selectedDateRef.current, true);
+        }
       };
       const handleOffline = () => {
         setIsOnline(false);
@@ -205,7 +219,9 @@ export default function ReceptionistDashboard() {
       };
       const handleVisibilityChange = () => {
         if (document.visibilityState === "visible") {
-          load(true, true);
+          if (selectedDocRef.current && refreshDoctorDataRef.current) {
+            refreshDoctorDataRef.current(selectedDocRef.current, selectedDateRef.current, true);
+          }
         }
       };
 
@@ -218,112 +234,348 @@ export default function ReceptionistDashboard() {
         document.removeEventListener("visibilitychange", handleVisibilityChange);
       };
     }
-  }, [load]);
+  }, []);
 
-  // WebSocket with bounded exponential backoff
-  useEffect(() => {
+  // 1. Fetch Doctor List independently (separation of discovery from queue refresh)
+  const fetchDoctors = useCallback(async (silent = false) => {
+    if (!silent) {
+      setDoctorListStatus("loading");
+      setDoctorListError(null);
+    }
+    try {
+      const docs = await api.get("/reception/doctors", { bypassCache: true });
+      if (!Array.isArray(docs) || docs.length === 0) {
+        setDoctors([]);
+        setSelectedDoc(null);
+        selectedDocRef.current = null;
+        setDoctorListStatus("empty");
+        setDoctorListError(null);
+        setQueue([]);
+        setDocSession(null);
+        setSummaryData([]);
+        setConfiguredSessions([]);
+        setSessionState({ status: "idle" });
+        return;
+      }
+
+      setDoctors(docs);
+      setDoctorListStatus("success");
+      setDoctorListError(null);
+
+      // Verify currently selected doc is still in authorized list
+      const prevSelected = selectedDocRef.current;
+      const isStillAuthorized = Boolean(prevSelected && docs.some((d: any) => d.id === prevSelected));
+      const nextDocId = isStillAuthorized ? prevSelected : (docs[0]?.id ?? null);
+
+      if (nextDocId !== prevSelected) {
+        // Doc changed: immediately clear previous doctor's cached data and set initial loading
+        setQueue([]);
+        setDocSession(null);
+        setSummaryData([]);
+        setConfiguredSessions([]);
+        setSessionState({ status: "loading" });
+        setSelectedDoc(nextDocId);
+        selectedDocRef.current = nextDocId;
+      }
+    } catch (err: any) {
+      const is401 = err?.status === 401 || (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired")));
+      if (is401) {
+        await handleAuthExpired();
+        return;
+      }
+      setDoctorListStatus("error");
+      setDoctorListError(err?.message || "Failed to load doctor list");
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [handleAuthExpired]);
+  useEffect(() => { fetchDoctorsRef.current = fetchDoctors; }, [fetchDoctors]);
+
+  // 2. Fetch Doctor Data: queue, session, calendar summary, configured sessions
+  const refreshDoctorData = useCallback(async (doctorId: string, targetDate: string, silent = false) => {
+    if (!doctorId) return;
+
+    // Coalesce overlapping/burst requests
+    if (isFetchingRef.current) {
+      hasPendingUpdateRef.current = true;
+      return;
+    }
+    isFetchingRef.current = true;
+
+    const curReqId = ++requestIdRef.current;
+    const curSessReqId = ++sessionReqIdRef.current;
+
+    // Only show full loading/session placeholder on initial load, NOT on background sync
+    if (!silent) {
+      setRefreshing(true);
+      setSessionState((prev) => ({
+        status: prev.status === "success" && docSession ? prev.status : "loading",
+        error: null,
+        is403: false,
+        slowLoading: false,
+      }));
+    }
+
+    const slowTimer = setTimeout(() => {
+      if (sessionReqIdRef.current === curSessReqId) {
+        setSessionState((prev) => (prev.status === "loading" ? { ...prev, slowLoading: true } : prev));
+      }
+    }, 5000);
+
+    try {
+      const [qRes, sessResult, sumRes, confSessRes] = await Promise.allSettled([
+        api.get(`/reception/queue?doctor_id=${doctorId}&date=${targetDate}`, { bypassCache: true, timeoutMs: 12000 }),
+        api.get(`/doctor/${doctorId}/session?date=${targetDate}`, { bypassCache: true, timeoutMs: 10000 }),
+        api.get(`/appointments/calendar-summary?doctor_id=${doctorId}`, { bypassCache: true, timeoutMs: 12000 }),
+        api.get(`/doctor/${doctorId}/sessions?date=${targetDate}&target_date=${targetDate}`, { bypassCache: true, timeoutMs: 12000 }),
+      ]);
+
+      clearTimeout(slowTimer);
+
+      if (curReqId !== requestIdRef.current) return;
+
+      // 1. Queue handling
+      if (qRes.status === "fulfilled") {
+        setQueue(qRes.value || []);
+      } else {
+        const qErr = qRes.reason;
+        if (qErr?.status === 401 || (qErr?.message && (qErr.message.includes("401") || qErr.message.includes("expired")))) {
+          await handleAuthExpired();
+          return;
+        }
+      }
+
+      // 2. Session handling: isolate 403, error, empty, and success
+      if (sessionReqIdRef.current === curSessReqId) {
+        if (sessResult.status === "fulfilled") {
+          const sessData = sessResult.value?.session;
+          if (sessData) {
+            setDocSession(sessData);
+            setSessionState({ status: "success", error: null, is403: false, slowLoading: false });
+          } else {
+            setDocSession(null);
+            setSessionState({ status: "empty", error: null, is403: false, slowLoading: false });
+          }
+        } else {
+          const errReason = sessResult.reason;
+          const errMsg = errReason?.message || "";
+          const is401 = errReason?.status === 401 || errMsg.includes("401") || errMsg.includes("authenticated") || errMsg.includes("expired");
+          if (is401) {
+            await handleAuthExpired();
+            return;
+          }
+          const is403 = errReason?.status === 403 || errMsg.includes("403") || errMsg.toLowerCase().includes("forbidden") || errMsg.toLowerCase().includes("access denied");
+
+          if (silent && docSession) {
+            // Keep existing session UI visible during background refresh error
+            setIsStale(true);
+          } else {
+            setDocSession(null);
+            setSessionState({
+              status: "error",
+              error: is403
+                ? "Access Denied: You do not have permission to view or manage this doctor's consultation session."
+                : (errMsg || "Failed to load session timings"),
+              is403,
+              slowLoading: false,
+            });
+          }
+        }
+      }
+
+      // 3. Calendar summary handling
+      if (sumRes.status === "fulfilled") {
+        setSummaryData(sumRes.value || []);
+      }
+
+      // 4. Configured sessions handling
+      if (confSessRes.status === "fulfilled") {
+        setConfiguredSessions(confSessRes.value?.sessions || []);
+      }
+
+      const nowStr = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true });
+      setLastUpdated(nowStr);
+      setIsStale(false);
+    } catch (err: any) {
+      clearTimeout(slowTimer);
+      if (curReqId !== requestIdRef.current) return;
+      setIsStale(true);
+      const is401 = err?.status === 401 || (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired")));
+      if (is401) {
+        await handleAuthExpired();
+        return;
+      }
+    } finally {
+      isFetchingRef.current = false;
+      if (curReqId === requestIdRef.current) {
+        if (!silent) setLoading(false);
+        setRefreshing(false);
+      }
+      // Process pending background update if an event arrived while fetching
+      if (hasPendingUpdateRef.current) {
+        hasPendingUpdateRef.current = false;
+        const curD = selectedDocRef.current;
+        const curDt = selectedDateRef.current;
+        if (curD) {
+          refreshDoctorData(curD, curDt, true);
+        }
+      }
+    }
+  }, [docSession, handleAuthExpired]);
+  useEffect(() => { refreshDoctorDataRef.current = refreshDoctorData; }, [refreshDoctorData]);
+
+  // Dedicated Retry for session alone without reloading entire dashboard
+  const retrySessionOnly = async () => {
     if (!selectedDoc) return;
-    loadDoctorQueue(selectedDoc, true);
+    const curSessReqId = ++sessionReqIdRef.current;
+    setSessionState({ status: "loading", error: null, is403: false, slowLoading: false });
+    const slowTimer = setTimeout(() => {
+      if (sessionReqIdRef.current === curSessReqId) {
+        setSessionState((prev) => (prev.status === "loading" ? { ...prev, slowLoading: true } : prev));
+      }
+    }, 5000);
 
-    let isDisposed = false;
+    try {
+      const res = await api.get(`/doctor/${selectedDoc}/session?date=${selectedDateRef.current}`, {
+        bypassCache: true,
+        timeoutMs: 10000,
+      });
+      clearTimeout(slowTimer);
+      if (sessionReqIdRef.current !== curSessReqId) return;
+      if (res?.session) {
+        setDocSession(res.session);
+        setSessionState({ status: "success", error: null, is403: false, slowLoading: false });
+      } else {
+        setDocSession(null);
+        setSessionState({ status: "empty", error: null, is403: false, slowLoading: false });
+      }
+    } catch (err: any) {
+      clearTimeout(slowTimer);
+      if (sessionReqIdRef.current !== curSessReqId) return;
+      const errMsg = err?.message || "";
+      const is401 = err?.status === 401 || errMsg.includes("401") || errMsg.includes("authenticated") || errMsg.includes("expired");
+      if (is401) {
+        await handleAuthExpired();
+        return;
+      }
+      const is403 = err?.status === 403 || errMsg.includes("403") || errMsg.toLowerCase().includes("forbidden") || errMsg.toLowerCase().includes("access denied");
+      setDocSession(null);
+      setSessionState({
+        status: "error",
+        error: is403
+          ? "Access Denied: You do not have permission to view or manage this doctor's consultation session."
+          : (errMsg || "Failed to load session timings"),
+        is403,
+        slowLoading: false,
+      });
+    }
+  };
 
-    const connectWs = () => {
-      if (isDisposed) return;
+  // WebSocket Subscription: tied strictly to selectedDoc, never rebuilt on date change
+  useEffect(() => {
+    if (!selectedDoc) {
       if (wsRef.current) {
         try { wsRef.current.close(); } catch {}
         wsRef.current = null;
       }
+      setWsConnected(false);
+      stopFallbackPolling();
+      return;
+    }
 
-      const url = `${getBackendWebSocketBase()}/api/ws/queue/doctor/${selectedDoc}`;
-      try {
-        const ws = new WebSocket(url);
-        wsRef.current = ws;
-        ws.onopen = () => {
-          if (isDisposed) { ws.close(); return; }
-          setWsConnected(true);
-          reconnectAttemptsRef.current = 0;
-          if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-        };
-        ws.onmessage = (e: any) => {
-          try {
-            const msg = typeof e?.data === "string" ? JSON.parse(e.data) : e?.data;
-            if (msg?.type === "ping" || msg?.type === "pong" || msg?.type === "connected") return;
-          } catch {}
-          if (isFocused.current && (Platform.OS !== "web" || document.visibilityState === "visible")) {
-            loadDoctorQueue(selectedDoc, true);
-          }
-        };
-        ws.onerror = () => setWsConnected(false);
-        ws.onclose = () => {
-          setWsConnected(false);
-          wsRef.current = null;
-          if (!isDisposed) {
-            const attempts = reconnectAttemptsRef.current;
-            reconnectAttemptsRef.current = attempts + 1;
-            const delay = Math.min(30000, Math.max(2000, Math.pow(1.5, attempts) * 1000 + Math.random() * 1000));
-            reconnectTimerRef.current = setTimeout(() => {
-              if (isFocused.current) connectWs();
-            }, delay);
+    // Initial load for this doctor
+    refreshDoctorDataRef.current?.(selectedDoc, selectedDateRef.current, false);
 
-            if (isFocused.current && !timerRef.current) {
-              timerRef.current = setInterval(() => {
-                if (Platform.OS !== "web" || document.visibilityState === "visible") {
-                  loadDoctorQueue(selectedDoc, true);
-                }
-              }, POLL_INTERVAL_MS);
+    if (wsRef.current) {
+      try { wsRef.current.close(); } catch {}
+      wsRef.current = null;
+    }
+
+    const wsBase = getBackendWebSocketBase();
+    const url = `${wsBase}/api/ws/queue/doctor/${selectedDoc}`;
+    try {
+      const ws = new WebSocket(url);
+      wsRef.current = ws;
+      ws.onopen = () => {
+        setWsConnected(true);
+        stopFallbackPolling();
+      };
+      ws.onmessage = (e: any) => {
+        try {
+          const msg = typeof e?.data === "string" ? JSON.parse(e.data) : e?.data;
+          if (msg?.type === "ping" || msg?.type === "pong" || msg?.type === "connected") return;
+        } catch {}
+        if (isFocused.current && (Platform.OS !== "web" || document.visibilityState === "visible")) {
+          if (wsDebounceRef.current) clearTimeout(wsDebounceRef.current);
+          wsDebounceRef.current = setTimeout(() => {
+            const currentDoc = selectedDocRef.current;
+            const currentDate = selectedDateRef.current;
+            if (currentDoc) {
+              refreshDoctorDataRef.current?.(currentDoc, currentDate, true);
             }
-          }
-        };
-      } catch {
+          }, 300);
+        }
+      };
+      ws.onerror = () => {
         setWsConnected(false);
-      }
-    };
-
-    connectWs();
+        startFallbackPolling();
+      };
+      ws.onclose = () => {
+        setWsConnected(false);
+        startFallbackPolling();
+      };
+    } catch {
+      setWsConnected(false);
+      startFallbackPolling();
+    }
 
     return () => {
-      isDisposed = true;
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      if (wsDebounceRef.current) { clearTimeout(wsDebounceRef.current); wsDebounceRef.current = null; }
       if (wsRef.current) {
         try { wsRef.current.close(); } catch {}
         wsRef.current = null;
       }
+      stopFallbackPolling();
     };
-  }, [selectedDoc, loadDoctorQueue]);
+  }, [selectedDoc, startFallbackPolling, stopFallbackPolling]);
 
+  // Screen Focus Effect: performs silent background refresh without recreating intervals or tearing down the screen
   useFocusEffect(
     useCallback(() => {
       isFocused.current = true;
-      load();
-      if (!wsConnected) {
-        timerRef.current = setInterval(() => {
-          if (Platform.OS !== "web" || document.visibilityState === "visible") {
-            load(true);
-          }
-        }, POLL_INTERVAL_MS);
+      if (selectedDocRef.current) {
+        refreshDoctorDataRef.current?.(selectedDocRef.current, selectedDateRef.current, true);
+      } else {
+        fetchDoctorsRef.current?.(false);
       }
+
       return () => {
         isFocused.current = false;
-        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
       };
-    }, [load, wsConnected]),
+    }, []),
   );
 
   // Queue Action Handlers
-  const handleAction = async (path: string, apptId: string, successMsg?: string) => {
-    if (actionLoadingId) return; // Prevent double tap or concurrent actions
-    setActionLoadingId(apptId);
+  const handleAction = async (path: string, apptId: string, actionType: string, successMsg?: string) => {
+    if (actionLoadingMap[apptId]) return;
+    setActionLoadingMap((prev) => ({ ...prev, [apptId]: actionType }));
     try {
       await api.post(path, { appointment_id: apptId });
       if (successMsg) {
         setAddToast(successMsg);
         setTimeout(() => setAddToast(null), 3000);
       }
-      await load(true);
+      if (selectedDocRef.current) {
+        await refreshDoctorData(selectedDocRef.current, selectedDateRef.current, true);
+      }
     } catch (err: any) {
       Alert.alert("Action Failed", err?.message || "Could not complete queue action");
     } finally {
-      setActionLoadingId(null);
+      setActionLoadingMap((prev) => {
+        const next = { ...prev };
+        delete next[apptId];
+        return next;
+      });
     }
   };
 
@@ -331,6 +583,7 @@ export default function ReceptionistDashboard() {
     handleAction(
       "/reception/start_consultation",
       appt.id,
+      "start",
       `Consultation started for Token #${appt.token_number}`
     );
   };
@@ -339,6 +592,7 @@ export default function ReceptionistDashboard() {
     handleAction(
       "/reception/complete",
       appt.id,
+      "complete",
       `Consultation completed for Token #${appt.token_number}. Patient record archived.`
     );
   };
@@ -347,6 +601,7 @@ export default function ReceptionistDashboard() {
     handleAction(
       "/reception/skip",
       appt.id,
+      "skip",
       `Token #${appt.token_number} skipped. Token preserved.`
     );
   };
@@ -355,6 +610,7 @@ export default function ReceptionistDashboard() {
     handleAction(
       "/reception/rejoin",
       appt.id,
+      "rejoin",
       `Token #${appt.token_number} rejoined active queue.`
     );
   };
@@ -363,6 +619,7 @@ export default function ReceptionistDashboard() {
     handleAction(
       "/reception/mark_arrived",
       appt.id,
+      "arrived",
       `Token #${appt.token_number} marked arrived.`
     );
   };
@@ -372,6 +629,7 @@ export default function ReceptionistDashboard() {
       handleAction(
         "/reception/cancel",
         appt.id,
+        "cancel",
         `Token #${appt.token_number} cancelled.`
       );
     };
@@ -428,14 +686,12 @@ export default function ReceptionistDashboard() {
       );
       setRescheduleModalOpen(false);
       setRescheduleAppt(null);
-      await load(true);
+      if (selectedDocRef.current) {
+        await refreshDoctorData(selectedDocRef.current, selectedDateRef.current, true);
+      }
       setTimeout(() => setAddToast(null), 3500);
     } catch (err: any) {
       if (err?.isTimeout || err?.name === "TimeoutError") {
-        // A client timeout does NOT prove the server failed to save.
-        // Before offering a repeated write after an ambiguous timeout,
-        // use existing read endpoints to check whether the change already succeeded.
-        // Do not automatically replay uncertain writes.
         setRescheduleVerifying(true);
         try {
           const check = await api.get(
@@ -448,12 +704,13 @@ export default function ReceptionistDashboard() {
             );
             setRescheduleModalOpen(false);
             setRescheduleAppt(null);
-            await load(true);
+            if (selectedDocRef.current) {
+              await refreshDoctorData(selectedDocRef.current, selectedDateRef.current, true);
+            }
             setTimeout(() => setAddToast(null), 3500);
             return;
           }
         } catch {
-          // Verification read also failed/timed out
         } finally {
           setRescheduleVerifying(false);
         }
@@ -522,6 +779,47 @@ export default function ReceptionistDashboard() {
     }
   };
 
+  const handleAutoReferQueue = async () => {
+    if (!selectedDoc) return;
+    const curDoc = doctors.find((d) => d.id === selectedDoc);
+    const docName = curDoc?.full_name || "Doctor";
+    const pendingCount = activeQueue.length;
+    if (pendingCount === 0) {
+      Alert.alert("No Patients", "There are no active or waiting patients to auto-refer.");
+      return;
+    }
+
+    const doRefer = async () => {
+      setAutoReferLoading(true);
+      try {
+        const res = await api.post("/reception/auto-refer", { from_doctor_id: selectedDoc });
+        Alert.alert("Auto-Refer Complete", res?.message || `Transferred ${res?.count || 0} patient(s) successfully.`);
+        if (selectedDocRef.current) {
+          refreshDoctorData(selectedDocRef.current, selectedDateRef.current, true);
+        }
+      } catch (err: any) {
+        Alert.alert("Auto-Refer Error", err?.message || "Failed to auto-refer queue.");
+      } finally {
+        setAutoReferLoading(false);
+      }
+    };
+
+    if (Platform.OS === "web") {
+      if (window.confirm(`Auto-refer ${pendingCount} waiting patient(s) of ${docName} to available active doctors in the hospital?`)) {
+        doRefer();
+      }
+    } else {
+      Alert.alert(
+        "Auto-Refer Queue",
+        `Auto-refer ${pendingCount} waiting patient(s) of ${docName} to available active doctors in the hospital?`,
+        [
+          { text: "Cancel", style: "cancel" },
+          { text: "Auto-Refer All", style: "destructive", onPress: doRefer },
+        ]
+      );
+    }
+  };
+
   const insertEmergency = async () => {
     if (!selectedDoc || emergencySubmittingRef.current) return;
     emergencySubmittingRef.current = true;
@@ -532,8 +830,11 @@ export default function ReceptionistDashboard() {
       });
       setEmergencyOpen(false);
       setEmergencyName("");
-      load(true);
-    } catch { /* ignore */ } finally {
+      if (selectedDocRef.current) {
+        refreshDoctorData(selectedDocRef.current, selectedDateRef.current, true);
+      }
+    } catch {
+    } finally {
       emergencySubmittingRef.current = false;
     }
   };
@@ -568,7 +869,9 @@ export default function ReceptionistDashboard() {
       );
       setReferModalOpen(false);
       setReferAppt(null);
-      load(true);
+      if (selectedDocRef.current) {
+        refreshDoctorData(selectedDocRef.current, selectedDateRef.current, true);
+      }
       setTimeout(() => setAddToast(null), 3500);
     } catch (e: any) {
       setReferError(e.message || "Failed to refer patient");
@@ -585,14 +888,25 @@ export default function ReceptionistDashboard() {
     setSelectedSessionId(null); setSelectedWindowId(null);
   };
 
+  const onOpenAddPatient = () => {
+    if (!selectedDoc) {
+      Alert.alert(
+        "Doctor Required",
+        "No doctor is linked to your account. Please contact your clinic administrator before registering patients."
+      );
+      return;
+    }
+    setAddOpen(true);
+  };
+
   const onAddPatient = async () => {
-    // Immediate synchronous in-flight guard: prevent duplicate submissions from rapid repeated clicks
     if (addPatientSubmittingRef.current) return;
     setAddError(null);
     setAddIsTimeout(false);
     if (!pName.trim()) return setAddError("Name is required");
     if (pMobile.replace(/[^0-9]/g, "").length < 10) return setAddError("Enter valid 10-digit mobile");
-    if (!selectedDoc) return setAddError("Select a doctor first");
+    const effectiveDocId = selectedDocRef.current || selectedDoc;
+    if (!effectiveDocId) return setAddError("Select a doctor first");
 
     addPatientSubmittingRef.current = true;
     setAddLoading(true);
@@ -613,7 +927,7 @@ export default function ReceptionistDashboard() {
           gender: pGender,
           symptoms: pSymptoms || undefined,
           address: pAddress || undefined,
-          doctor_id: selectedDoc,
+          doctor_id: effectiveDocId,
           session_id: selectedSessionId || undefined,
           booking_window_id: selectedWindowId || undefined,
           slot_time: (selectedWindow ? `${selectedWindow.start_time} - ${selectedWindow.end_time}` : pSlot) || undefined,
@@ -625,14 +939,16 @@ export default function ReceptionistDashboard() {
       setAddToast(`Added: ${res.patient.full_name} · Token #${res.appointment?.token_number}`);
       resetAddForm();
       setAddOpen(false);
-      load(true);
+      if (selectedDocRef.current) {
+        refreshDoctorData(selectedDocRef.current, selectedDateRef.current, true);
+      }
       setTimeout(() => setAddToast(null), 3000);
     } catch (e: any) {
       if (e?.isTimeout || e?.name === "TimeoutError") {
         setAddVerifying(true);
         try {
           const qList = await api.get(
-            `/reception/queue?doctor_id=${selectedDoc}&date=${selectedDate}`,
+            `/reception/queue?doctor_id=${effectiveDocId}&date=${selectedDate}`,
             { bypassCache: true, timeoutMs: 6000 }
           );
           const cleanMob = pMobile.replace(/[^0-9]/g, "");
@@ -647,12 +963,13 @@ export default function ReceptionistDashboard() {
             setAddToast(`Added: ${found.patient_name} · Token #${found.token_number}`);
             resetAddForm();
             setAddOpen(false);
-            load(true);
+            if (selectedDocRef.current) {
+              refreshDoctorData(selectedDocRef.current, selectedDateRef.current, true);
+            }
             setTimeout(() => setAddToast(null), 3000);
             return;
           }
         } catch {
-          // Verification read failed
         } finally {
           setAddVerifying(false);
         }
@@ -660,7 +977,6 @@ export default function ReceptionistDashboard() {
         setAddIsTimeout(true);
         setAddError("Request timed out. Server verification confirmed patient was not added. You can retry.");
       } else {
-        // PRESERVE FORM INPUTS on error for weak connections!
         setAddError(e.message || "Could not add patient. Please check connection and retry.");
       }
     } finally {
@@ -669,27 +985,6 @@ export default function ReceptionistDashboard() {
       setAddVerifying(false);
     }
   };
-
-  if (authLoading || (loading && doctors.length === 0 && !doctorsError)) {
-    return (
-      <SafeAreaView style={styles.safe}>
-        <ActivityIndicator style={{ marginTop: 60 }} color={colors.brandPrimary} />
-      </SafeAreaView>
-    );
-  }
-
-  // Active queue vs Completed/History separation (Requirement 1)
-  const activeQueue = queue.filter(
-    (q) => q.status !== "completed" && q.status !== "cancelled"
-  );
-  const completedQueue = queue.filter((q) => q.status === "completed");
-
-  const displayedQueue =
-    queueFilter === "completed"
-      ? completedQueue
-      : queueFilter === "all"
-      ? queue.filter((q) => q.status !== "cancelled")
-      : activeQueue;
 
   const handlePrintPatientList = () => {
     const curDoc = doctors.find((d) => d.id === selectedDoc);
@@ -724,9 +1019,22 @@ export default function ReceptionistDashboard() {
     skipped: activeQueue.filter((q) => q.status === "skipped").length,
   };
 
+  if (loading && doctorListStatus === "loading") {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <View style={{ flex: 1, justifyContent: "center", alignItems: "center", gap: 12 }}>
+          <ActivityIndicator size="large" color={colors.brand} />
+          <Text style={{ color: colors.muted, fontSize: font.sm, fontWeight: "600" }}>
+            Loading Reception Dashboard...
+          </Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
-      {/* ── Offline & Stale Status Banner (Requirement 6) ── */}
+      {/* ── Offline & Stale Status Banner ── */}
       {!isOnline ? (
         <View style={styles.offlineBanner}>
           <Ionicons name="cloud-offline" size={16} color="#fff" />
@@ -762,7 +1070,7 @@ export default function ReceptionistDashboard() {
           </View>
         </View>
         <Pressable
-          onPress={async () => { await signOut(); router.replace("/login"); }}
+          onPress={async () => { await handleAuthExpired(); }}
           testID="reception-logout"
           style={styles.iconBtn}
         >
@@ -770,8 +1078,54 @@ export default function ReceptionistDashboard() {
         </Pressable>
       </View>
 
-      {/* ── Doctor selection (Requirement 5) ── */}
-      {doctors.length > 0 ? (
+      {/* ── Empty Doctor Banner (when doctor list is empty) ── */}
+      {doctorListStatus === "empty" && (
+        <View style={styles.emptyDoctorBanner}>
+          <View style={styles.emptyDoctorIconWrap}>
+            <Ionicons name="alert-circle-outline" size={28} color="#B45309" />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.emptyDoctorTitle}>No Doctor Assigned</Text>
+            <Text style={styles.emptyDoctorDesc}>
+              No doctor is linked to your account. Please contact your clinic administrator.
+            </Text>
+          </View>
+          <Pressable
+            testID="retry-doctor-list-btn"
+            onPress={() => fetchDoctors(false)}
+            style={styles.emptyDoctorRetryBtn}
+          >
+            <Ionicons name="refresh" size={15} color="#B45309" />
+            <Text style={styles.emptyDoctorRetryBtnText}>Retry</Text>
+          </Pressable>
+        </View>
+      )}
+
+      {/* ── Error Doctor Banner (when doctor list fetch fails) ── */}
+      {doctorListStatus === "error" && (
+        <View style={[styles.emptyDoctorBanner, { backgroundColor: "#FEF2F2", borderColor: "#FCA5A5" }]}>
+          <View style={[styles.emptyDoctorIconWrap, { backgroundColor: "#FEE2E2" }]}>
+            <Ionicons name="cloud-offline" size={28} color="#DC2626" />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={[styles.emptyDoctorTitle, { color: "#991B1B" }]}>Failed to Load Doctors</Text>
+            <Text style={[styles.emptyDoctorDesc, { color: "#7F1D1D" }]}>
+              {doctorListError || "Could not connect to clinic server. Please check your network."}
+            </Text>
+          </View>
+          <Pressable
+            testID="retry-doctor-list-btn"
+            onPress={() => fetchDoctors(false)}
+            style={[styles.emptyDoctorRetryBtn, { borderColor: "#DC2626", backgroundColor: "#fff" }]}
+          >
+            <Ionicons name="refresh" size={15} color="#DC2626" />
+            <Text style={[styles.emptyDoctorRetryBtnText, { color: "#DC2626" }]}>Retry</Text>
+          </Pressable>
+        </View>
+      )}
+
+      {/* ── Doctor selection ── */}
+      {doctors.length > 0 && (
         <View style={styles.docPickerWrap}>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.docPickerRow}>
             {doctors.map((d) => {
@@ -780,7 +1134,15 @@ export default function ReceptionistDashboard() {
                 <Pressable
                   key={d.id}
                   testID={`select-doc-${d.id}`}
-                  onPress={() => setSelectedDoc(d.id)}
+                  onPress={() => {
+                    if (d.id !== selectedDoc) {
+                      setQueue([]);
+                      setDocSession(null);
+                      setSessionState({ status: "idle" });
+                      setSelectedDoc(d.id);
+                      selectedDocRef.current = d.id;
+                    }
+                  }}
                   style={[styles.docChip, active && styles.docChipActive]}
                 >
                   <Text style={[styles.docChipText, active && { color: colors.onBrandPrimary }]} numberOfLines={1}>
@@ -791,468 +1153,617 @@ export default function ReceptionistDashboard() {
             })}
           </ScrollView>
         </View>
-      ) : (
-        <View style={{ backgroundColor: colors.surface, padding: spacing.md, marginHorizontal: spacing.lg, marginVertical: spacing.sm, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border }}>
-          {doctorsError ? (
-            <View style={{ alignItems: "center", gap: 8, paddingVertical: 10 }}>
-              <Ionicons name="alert-circle-outline" size={32} color={colors.error} />
-              <Text style={{ fontSize: font.sm, color: colors.error, fontWeight: "600", textAlign: "center" }}>{doctorsError}</Text>
-              <Pressable
-                onPress={() => load(false, true)}
-                style={{ backgroundColor: colors.brandPrimary, paddingHorizontal: 16, paddingVertical: 8, borderRadius: radius.md }}
-              >
-                <Text style={{ color: "#fff", fontWeight: "600", fontSize: font.sm }}>Retry Loading Doctors</Text>
-              </Pressable>
-            </View>
-          ) : (
-            <View style={{ alignItems: "center", gap: 6, paddingVertical: 12 }}>
-              <Ionicons name="people-outline" size={36} color={colors.muted} />
-              <Text style={{ fontSize: font.base, fontWeight: "700", color: colors.onSurface }}>No Doctors Assigned</Text>
-              <Text style={{ fontSize: font.xs, color: colors.muted, textAlign: "center", maxWidth: 320 }}>
-                No active doctors are currently assigned to this hospital (ID: {(user as any)?.hospital_id || "your hospital"}). Contact your hospital administrator or doctor to ensure their account is registered under this hospital ID.
-              </Text>
-            </View>
-          )}
+      )}
+
+      {/* ── KPIs (Only shown when a doctor is selected and authorized) ── */}
+      {selectedDoc && doctorListStatus === "success" && (
+        <View style={styles.kpiRow}>
+          <View style={[styles.kpiCard, isSmallScreen && styles.kpiCardSmall]}>
+            <Text style={styles.kpiLabel}>Waiting</Text>
+            <Text style={styles.kpiValue}>{stats.active}</Text>
+          </View>
+          <View style={[styles.kpiCard, isSmallScreen && styles.kpiCardSmall]}>
+            <Text style={styles.kpiLabel}>In Cabin</Text>
+            <Text style={[styles.kpiValue, { color: colors.brandPrimary }]}>{stats.consulting}</Text>
+          </View>
+          <View style={[styles.kpiCard, isSmallScreen && styles.kpiCardSmall]}>
+            <Text style={styles.kpiLabel}>Completed</Text>
+            <Text style={[styles.kpiValue, { color: colors.success }]}>{stats.completed}</Text>
+          </View>
+          <View style={[styles.kpiCard, isSmallScreen && styles.kpiCardSmall]}>
+            <Text style={styles.kpiLabel}>Skipped</Text>
+            <Text style={[styles.kpiValue, { color: colors.warning }]}>{stats.skipped}</Text>
+          </View>
         </View>
       )}
 
-      {/* ── KPIs ── */}
-      <View style={styles.kpiRow}>
-        <View style={styles.kpiCard}><Text style={styles.kpiLabel}>Waiting</Text><Text style={styles.kpiValue}>{stats.active}</Text></View>
-        <View style={styles.kpiCard}><Text style={styles.kpiLabel}>In Cabin</Text><Text style={[styles.kpiValue, { color: colors.brandPrimary }]}>{stats.consulting}</Text></View>
-        <View style={styles.kpiCard}><Text style={styles.kpiLabel}>Completed</Text><Text style={[styles.kpiValue, { color: colors.success }]}>{stats.completed}</Text></View>
-        <View style={styles.kpiCard}><Text style={styles.kpiLabel}>Skipped</Text><Text style={[styles.kpiValue, { color: colors.warning }]}>{stats.skipped}</Text></View>
-      </View>
-
-      {/* ── Main Dashboard Scroll (Layout order matching Requirement 5) ── */}
+      {/* ── Main Dashboard Scroll ── */}
       <ScrollView
-        contentContainerStyle={styles.scroll}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true, true); }} />}
-      >
-        {/* 1. Doctor Session Timing & Availability Controls (Requirements 4 & 5) */}
-        {selectedDoc && docSession && (
-          <DoctorSessionBar
-            doctorId={selectedDoc}
-            doctorName={doctors.find((d) => d.id === selectedDoc)?.full_name || "Doctor"}
-            session={docSession}
-            waitingCount={activeQueue.filter((q) => ["booked", "arrived"].includes(q.status)).length}
-            onRefresh={() => load(true, true)}
-          />
-        )}
-
-        {/* 2. Today's Patient Bookings and Active Queue (Requirement 5) */}
-        <View style={styles.sectionHeaderRow}>
-          <View>
-            <Text style={styles.sectionTitle}>
-              Patient Queue · {selectedDate}
-            </Text>
-            <Text style={styles.sectionSub}>
-              {displayedQueue.length} patient(s) · Tap any patient to view or edit details
-            </Text>
-          </View>
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <Pressable
-              onPress={handlePrintPatientList}
-              style={styles.printBtn}
-              testID="reception-print-patient-list-btn"
-            >
-              <Ionicons name="print-outline" size={15} color={colors.brandPrimary} />
-              <Text style={styles.printBtnText}>Print Patient List</Text>
-            </Pressable>
-            <Pressable
-              onPress={handleDownloadExcel}
-              disabled={exportLoading}
-              style={[styles.exportBtn, exportLoading && { opacity: 0.6 }]}
-              testID="export-excel-btn"
-            >
-              {exportLoading ? (
-                <ActivityIndicator size="small" color="#0F766E" />
-              ) : (
-                <>
-                  <Ionicons name="download-outline" size={15} color="#0F766E" />
-                  <Text style={styles.exportBtnText}>Excel</Text>
-                </>
-              )}
-            </Pressable>
-            <Pressable
-              onPress={() => load(true, true)}
-              style={styles.refreshBtn}
-              testID="manual-refresh-btn"
-            >
-              <Ionicons name="refresh" size={16} color={colors.brandPrimary} />
-              <Text style={styles.refreshBtnText}>Sync</Text>
-            </Pressable>
-          </View>
-        </View>
-
-        {/* ── Queue Filter Tabs ── */}
-        <View style={styles.filterChipsRow}>
-          <Pressable
-            testID="reception-filter-all"
-            onPress={() => setQueueFilter("all")}
-            style={[styles.filterChip, queueFilter === "all" && styles.filterChipActive]}
-          >
-            <Text style={[styles.filterChipText, queueFilter === "all" && styles.filterChipTextActive]}>
-              All ({queue.filter((q) => q.status !== "cancelled").length})
-            </Text>
-          </Pressable>
-          <Pressable
-            testID="reception-filter-active"
-            onPress={() => setQueueFilter("active")}
-            style={[styles.filterChip, queueFilter === "active" && styles.filterChipActive]}
-          >
-            <Text style={[styles.filterChipText, queueFilter === "active" && styles.filterChipTextActive]}>
-              Active ({activeQueue.length})
-            </Text>
-          </Pressable>
-          <Pressable
-            testID="reception-filter-completed"
-            onPress={() => setQueueFilter("completed")}
-            style={[styles.filterChip, queueFilter === "completed" && styles.filterChipActive]}
-          >
-            <Text style={[styles.filterChipText, queueFilter === "completed" && styles.filterChipTextActive]}>
-              Completed ({completedQueue.length})
-            </Text>
-          </Pressable>
-        </View>
-
-        {displayedQueue.length === 0 ? (
-          <View style={styles.empty}>
-            <Ionicons name="people-outline" size={44} color={colors.muted} />
-            <Text style={styles.emptyText}>No patients match the selected filter for {selectedDate}. Tap &quot;+ Add Patient&quot; to register a walk-in.</Text>
-          </View>
-        ) : (
-          displayedQueue.map((a) => {
-            const isConsulting = a.status === "in_consultation";
-            const isSkipped = a.status === "skipped";
-            const isArrived = a.status === "arrived";
-            const isBooked = a.status === "booked";
-            const isCompleted = a.status === "completed";
-            const isItemBusy = actionLoadingId === a.id;
-
-            return (
-              <View key={a.id} style={[styles.apptCard, isConsulting && styles.apptCardConsulting, isCompleted && { opacity: 0.8 }]}>
-                {/* Clickable Patient Info Area */}
-                <Pressable
-                  testID={`reception-patient-row-${a.id}`}
-                  onPress={() => setSelectedPatientAppt(a)}
-                  style={styles.patientInfoPressable}
-                >
-                  <View style={[styles.tokenBubble, isConsulting && { backgroundColor: colors.brandPrimary }, isCompleted && { backgroundColor: colors.surfaceTertiary }]}>
-                    <Text style={[styles.tokenText, isConsulting && { color: colors.onBrandPrimary }, isCompleted && { color: colors.onSurfaceSecondary }]}>
-                      #{a.token_number}
-                    </Text>
-                  </View>
-
-                  <View style={{ flex: 1 }}>
-                    <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                      <Text style={styles.apptName}>{a.patient_name}</Text>
-                      <Ionicons name="information-circle-outline" size={14} color={colors.brandPrimary} />
-                      {isConsulting && (
-                        <View style={styles.consultingBadge}>
-                          <Text style={styles.consultingBadgeText}>CONSULTING</Text>
-                        </View>
-                      )}
-                      {isSkipped && (
-                        <View style={styles.skippedBadge}>
-                          <Text style={styles.skippedBadgeText}>SKIPPED</Text>
-                        </View>
-                      )}
-                      {isCompleted && (
-                        <View style={[styles.consultingBadge, { backgroundColor: colors.success }]}>
-                          <Text style={[styles.consultingBadgeText, { color: "#fff" }]}>COMPLETED</Text>
-                        </View>
-                      )}
-                    </View>
-
-                    <Text style={styles.apptMeta}>
-                      {a.slot} · <Text style={{ fontWeight: "600" }}>{a.status.replace("_", " ").toUpperCase()}</Text>
-                      {a.consultation_started_at ? ` · Started ${formatTime(a.consultation_started_at)}` : ""}
-                    </Text>
-                    {a.patient_mobile ? (
-                      <Text style={styles.patientContactMeta}>📞 {a.patient_mobile}</Text>
-                    ) : null}
-                    {a.expected_turn_time && !isCompleted ? (
-                      <View style={styles.etaRow}>
-                        <Ionicons
-                          name={a.is_estimate_pending ? "alert-circle-outline" : "time-outline"}
-                          size={13}
-                          color={a.is_estimate_pending ? "#D97706" : colors.brandPrimary}
-                        />
-                        <Text
-                          style={[
-                            styles.etaText,
-                            a.is_estimate_pending && { color: "#D97706", fontWeight: "600" },
-                          ]}
-                        >
-                          {a.is_estimate_pending ? a.expected_turn_time : `Expected: ${a.expected_turn_time}`}
-                        </Text>
-                      </View>
-                    ) : null}
-                    {a.symptoms ? <Text style={styles.symptoms} numberOfLines={1}>💊 {a.symptoms}</Text> : null}
-                  </View>
-                </Pressable>
-
-                {/* Patient-specific utility icons (SMS link & Transfer) */}
-                <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginRight: 4 }}>
-                  {a.patient_mobile ? (
-                    <Pressable
-                      testID={`action-send-link-${a.id}`}
-                      onPress={() => sendAppointmentLink(a)}
-                      style={[styles.smallIconBtn, { backgroundColor: colors.brandSecondary }]}
-                    >
-                      <Ionicons name="send" size={13} color={colors.brandPrimary} />
-                    </Pressable>
-                  ) : null}
-                  {doctors.length > 1 && (
-                    <Pressable
-                      testID={`action-refer-${a.id}`}
-                      onPress={() => openReferModal(a)}
-                      style={[styles.smallIconBtn, { backgroundColor: colors.surfaceSecondary, borderWidth: 1, borderColor: colors.border }]}
-                    >
-                      <Ionicons name="swap-horizontal" size={14} color={colors.brandPrimary} />
-                    </Pressable>
-                  )}
-                </View>
-
-                {/* Relevant Queue Actions: Visible text label below every action icon (Requirement 5) */}
-                <View style={styles.actionsContainer}>
-                  {/* For BOOKED status */}
-                  {isBooked && (
-                    <>
-                      <Pressable
-                        testID={`action-arrived-${a.id}`}
-                        onPress={() => markArrived(a)}
-                        disabled={isItemBusy}
-                        style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
-                      >
-                        <Ionicons name="checkmark-circle-outline" size={18} color={colors.info} />
-                        <Text style={styles.actionColBtnLabel}>Arrived</Text>
-                      </Pressable>
-
-                      <Pressable
-                        testID={`action-start-${a.id}`}
-                        onPress={() => startConsultation(a)}
-                        disabled={isItemBusy}
-                        style={[styles.actionColBtn, styles.actionColBtnPrimary, isItemBusy && { opacity: 0.5 }]}
-                      >
-                        <Ionicons name="play" size={18} color="#fff" />
-                        <Text style={[styles.actionColBtnLabel, { color: "#fff", fontWeight: "700" }]}>
-                          Start Consultation
-                        </Text>
-                      </Pressable>
-
-                      <Pressable
-                        testID={`action-skip-${a.id}`}
-                        onPress={() => skipPatient(a)}
-                        disabled={isItemBusy}
-                        style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
-                      >
-                        <Ionicons name="arrow-forward-circle-outline" size={18} color={colors.warning} />
-                        <Text style={styles.actionColBtnLabel}>Skip Patient</Text>
-                      </Pressable>
-
-                      <Pressable
-                        testID={`action-reschedule-${a.id}`}
-                        onPress={() => openRescheduleModal(a)}
-                        disabled={isItemBusy}
-                        style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
-                      >
-                        <Ionicons name="calendar-outline" size={18} color={colors.brandPrimary} />
-                        <Text style={styles.actionColBtnLabel}>Reschedule</Text>
-                      </Pressable>
-
-                      <Pressable
-                        testID={`action-cancel-${a.id}`}
-                        onPress={() => cancelAppointment(a)}
-                        disabled={isItemBusy}
-                        style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
-                      >
-                        <Ionicons name="close-circle-outline" size={18} color={colors.error} />
-                        <Text style={[styles.actionColBtnLabel, { color: colors.error }]}>Cancel</Text>
-                      </Pressable>
-                    </>
-                  )}
-
-                  {/* For ARRIVED status */}
-                  {isArrived && (
-                    <>
-                      <Pressable
-                        testID={`action-start-${a.id}`}
-                        onPress={() => startConsultation(a)}
-                        disabled={isItemBusy}
-                        style={[styles.actionColBtn, styles.actionColBtnPrimary, isItemBusy && { opacity: 0.5 }]}
-                      >
-                        <Ionicons name="play" size={18} color="#fff" />
-                        <Text style={[styles.actionColBtnLabel, { color: "#fff", fontWeight: "700" }]}>
-                          Start Consultation
-                        </Text>
-                      </Pressable>
-
-                      <Pressable
-                        testID={`action-skip-${a.id}`}
-                        onPress={() => skipPatient(a)}
-                        disabled={isItemBusy}
-                        style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
-                      >
-                        <Ionicons name="arrow-forward-circle-outline" size={18} color={colors.warning} />
-                        <Text style={styles.actionColBtnLabel}>Skip Patient</Text>
-                      </Pressable>
-
-                      <Pressable
-                        testID={`action-reschedule-${a.id}`}
-                        onPress={() => openRescheduleModal(a)}
-                        disabled={isItemBusy}
-                        style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
-                      >
-                        <Ionicons name="calendar-outline" size={18} color={colors.brandPrimary} />
-                        <Text style={styles.actionColBtnLabel}>Reschedule</Text>
-                      </Pressable>
-
-                      <Pressable
-                        testID={`action-cancel-${a.id}`}
-                        onPress={() => cancelAppointment(a)}
-                        disabled={isItemBusy}
-                        style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
-                      >
-                        <Ionicons name="close-circle-outline" size={18} color={colors.error} />
-                        <Text style={[styles.actionColBtnLabel, { color: colors.error }]}>Cancel</Text>
-                      </Pressable>
-                    </>
-                  )}
-
-                  {/* For IN_CONSULTATION status */}
-                  {isConsulting && (
-                    <Pressable
-                      testID={`action-complete-${a.id}`}
-                      onPress={() => completeConsultation(a)}
-                      disabled={isItemBusy}
-                      style={[styles.actionColBtn, styles.actionColBtnSuccess, isItemBusy && { opacity: 0.5 }]}
-                    >
-                      {isItemBusy ? (
-                        <ActivityIndicator size="small" color="#fff" />
-                      ) : (
-                        <>
-                          <Ionicons name="checkmark-done" size={20} color="#fff" />
-                          <Text style={[styles.actionColBtnLabel, { color: "#fff", fontWeight: "700" }]}>
-                            Complete Consultation
-                          </Text>
-                        </>
-                      )}
-                    </Pressable>
-                  )}
-
-                  {/* For SKIPPED status */}
-                  {isSkipped && (
-                    <>
-                      <Pressable
-                        testID={`action-rejoin-${a.id}`}
-                        onPress={() => rejoinQueue(a)}
-                        disabled={isItemBusy}
-                        style={[styles.actionColBtn, { backgroundColor: "#FEF3C7", borderColor: "#FCD34D" }, isItemBusy && { opacity: 0.5 }]}
-                      >
-                        <Ionicons name="refresh-circle-outline" size={18} color="#B45309" />
-                        <Text style={[styles.actionColBtnLabel, { color: "#92400E" }]}>
-                          Rejoin Queue
-                        </Text>
-                      </Pressable>
-
-                      <Pressable
-                        testID={`action-cancel-${a.id}`}
-                        onPress={() => cancelAppointment(a)}
-                        disabled={isItemBusy}
-                        style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
-                      >
-                        <Ionicons name="close-circle-outline" size={18} color={colors.error} />
-                        <Text style={[styles.actionColBtnLabel, { color: colors.error }]}>Cancel</Text>
-                      </Pressable>
-                    </>
-                  )}
-                </View>
-              </View>
-            );
-          })
-        )}
-
-        {/* Lower-Page Order 1: Completed / History Records Section (Requirement 5) */}
-        <View style={styles.historySection}>
-          <Pressable
-            onPress={() => setShowCompleted(!showCompleted)}
-            style={styles.historyHeader}
-            testID="toggle-completed-records-btn"
-          >
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-              <Ionicons name="file-tray-full-outline" size={18} color={colors.onSurface} />
-              <Text style={styles.historyTitle}>
-                Completed Records ({completedQueue.length})
-              </Text>
-            </View>
-            <Ionicons
-              name={showCompleted ? "chevron-up" : "chevron-down"}
-              size={18}
-              color={colors.muted}
-            />
-          </Pressable>
-
-          {showCompleted && (
-            <View style={{ gap: spacing.xs, marginTop: spacing.sm }}>
-              {completedQueue.length === 0 ? (
-                <Text style={styles.historyEmptyText}>No consultations completed yet today.</Text>
-              ) : (
-                completedQueue.map((item) => (
-                  <Pressable
-                    key={item.id}
-                    testID={`reception-completed-row-${item.id}`}
-                    onPress={() => setSelectedPatientAppt(item)}
-                    style={styles.historyItemCard}
-                  >
-                    <View style={styles.historyToken}>
-                      <Text style={styles.historyTokenText}>#{item.token_number}</Text>
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                        <Text style={styles.historyPatientName}>{item.patient_name}</Text>
-                        <Ionicons name="information-circle-outline" size={13} color={colors.brandPrimary} />
-                      </View>
-                      <Text style={styles.historyTimeText}>
-                        Started: {formatTime(item.consultation_started_at || item.started_at)} · Completed: {formatTime(item.consultation_completed_at || item.completed_at)}
-                      </Text>
-                      {item.patient_mobile ? (
-                        <Text style={styles.patientContactMeta}>📞 {item.patient_mobile}</Text>
-                      ) : null}
-                    </View>
-                    <View style={styles.completedBadge}>
-                      <Ionicons name="checkmark-done" size={14} color="#065F46" />
-                      <Text style={styles.completedBadgeText}>Completed</Text>
-                    </View>
-                  </Pressable>
-                ))
-              )}
-            </View>
-          )}
-        </View>
-
-        {/* Lower-Page Order 2: Daily Patient Calendar immediately above footer (Requirement 5) */}
-        <View style={styles.calendarSection}>
-          <View style={styles.sectionHeaderRow}>
-            <View>
-              <Text style={styles.sectionTitle}>Daily Patient Calendar</Text>
-              <Text style={styles.sectionSub}>Selected Date: <Text style={{ fontWeight: "700", color: colors.brandPrimary }}>{selectedDate}</Text></Text>
-            </View>
-          </View>
-          <CalendarSummary
-            summaryData={summaryData}
-            selectedDate={selectedDate}
-            onSelectDate={(date) => {
-              setSelectedDate(date);
+        contentContainerStyle={[styles.scroll, { paddingBottom: 160 + insets.bottom }]}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={() => {
+              fetchDoctors(true);
+              if (selectedDocRef.current) {
+                refreshDoctorData(selectedDocRef.current, selectedDateRef.current, false);
+              }
             }}
           />
-        </View>
+        }
+      >
+        {/* Empty state when no doctor is authorized */}
+        {doctorListStatus === "empty" && (
+          <View style={styles.emptyDoctorCard}>
+            <Ionicons name="person-circle-outline" size={54} color={colors.muted} />
+            <Text style={styles.emptyDoctorCardTitle}>Doctor Assignment Required</Text>
+            <Text style={styles.emptyDoctorCardDesc}>
+              Your receptionist account is not currently linked to an active doctor in this clinic. Queue management, token issuance, and appointment booking require an active doctor.
+            </Text>
+            <Pressable
+              testID="empty-retry-doctor-btn"
+              onPress={() => fetchDoctors(false)}
+              style={styles.primaryBtn}
+            >
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <Ionicons name="refresh" size={18} color="#fff" />
+                <Text style={styles.primaryBtnText}>Retry Loading Doctors</Text>
+              </View>
+            </Pressable>
+          </View>
+        )}
 
-        {/* Lower-Page Order 3: Footer (Requirement 5) */}
-        <View style={styles.dashboardFooter}>
-          <Text style={styles.dashboardFooterText}>MeriBaari Healthcare · Clinic Queue Management</Text>
-        </View>
+        {/* 1. Doctor Session Timing & Availability Controls */}
+        {selectedDoc && doctorListStatus === "success" && (
+          sessionState.status === "success" && docSession ? (
+            <DoctorSessionBar
+              doctorId={selectedDoc}
+              doctorName={doctors.find((d) => d.id === selectedDoc)?.full_name || "Doctor"}
+              session={docSession}
+              waitingCount={activeQueue.filter((q) => ["booked", "arrived"].includes(q.status)).length}
+              onRefresh={() => refreshDoctorData(selectedDoc, selectedDateRef.current, true)}
+            />
+          ) : sessionState.status === "error" ? (
+            <View style={[styles.sessionBarPlaceholder, { borderColor: sessionState.is403 ? "#FCD34D" : "#FECACA", backgroundColor: sessionState.is403 ? "#FFFBEB" : "#FEF2F2" }]}>
+              <Ionicons
+                name={sessionState.is403 ? "lock-closed" : "alert-circle"}
+                size={24}
+                color={sessionState.is403 ? "#D97706" : colors.error}
+              />
+              <Text style={[styles.sessionErrorTitle, sessionState.is403 && { color: "#92400E" }]}>
+                {sessionState.is403 ? "Session Access Denied" : "Session Timing Unavailable"}
+              </Text>
+              <Text style={[styles.sessionErrorDesc, sessionState.is403 && { color: "#B45309" }]}>
+                {sessionState.error}
+              </Text>
+              <Pressable
+                testID="retry-session-timing-btn"
+                onPress={retrySessionOnly}
+                style={[styles.sessionRetryBtn, sessionState.is403 && { borderColor: "#D97706" }]}
+              >
+                <Ionicons name="refresh" size={14} color={sessionState.is403 ? "#92400E" : colors.brandPrimary} />
+                <Text style={[styles.sessionRetryBtnText, sessionState.is403 && { color: "#92400E" }]}>Retry Session Timing</Text>
+              </Pressable>
+            </View>
+          ) : sessionState.status === "empty" ? (
+            <View style={[styles.sessionBarPlaceholder, { backgroundColor: colors.surface }]}>
+              <Ionicons name="calendar-outline" size={24} color={colors.muted} />
+              <Text style={styles.sessionEmptyTitle}>No Active Session Configured</Text>
+              <Text style={styles.sessionEmptyDesc}>No consultation session has been scheduled for this doctor on {selectedDate}.</Text>
+              <Pressable
+                testID="create-doctor-session-prompt-btn"
+                onPress={() => setSessionManagerOpen(true)}
+                style={styles.sessionManageBtn}
+              >
+                <Ionicons name="calendar" size={14} color="#fff" />
+                <Text style={styles.sessionManageBtnText}>Configure Shift / Session</Text>
+              </Pressable>
+            </View>
+          ) : (
+            <View style={styles.sessionBarPlaceholder}>
+              <ActivityIndicator size="small" color={colors.brandPrimary} />
+              <Text style={styles.sessionBarPlaceholderText}>
+                {sessionState.slowLoading
+                  ? "Session details taking longer to load than usual..."
+                  : "Loading doctor session & cabin state..."}
+              </Text>
+            </View>
+          )
+        )}
+
+        {/* Doctor Shifts & Cabin Slots Management */}
+        {selectedDoc && doctorListStatus === "success" && (
+          <View style={styles.shiftCardWrap}>
+            <View style={{ flex: 1, minWidth: 180 }}>
+              <Text style={{ fontSize: font.sm, fontWeight: "700", color: colors.onSurface }}>
+                {doctors.find((d) => d.id === selectedDoc)?.full_name || "Doctor"}&apos;s Shifts & Cabin Slots
+              </Text>
+              <Text style={{ fontSize: 11, color: colors.muted }}>Day shift, Night shift, Emergency shift & Holidays</Text>
+            </View>
+            <Pressable
+              testID="receptionist-manage-doctor-shifts-btn"
+              onPress={() => setSessionManagerOpen(true)}
+              style={styles.manageShiftsBtn}
+            >
+              <Ionicons name="calendar-outline" size={16} color="#fff" />
+              <Text style={{ color: "#fff", fontWeight: "700", fontSize: font.sm }}>Manage Doctor Shifts</Text>
+            </Pressable>
+          </View>
+        )}
+
+        {/* 2. Today's Patient Bookings and Active Queue */}
+        {selectedDoc && doctorListStatus === "success" && (
+          <>
+            <View style={styles.sectionHeaderRow}>
+              <View style={styles.sectionHeaderTitleCol}>
+                <Text style={styles.sectionTitle}>
+                  Patient Queue · {selectedDate}
+                </Text>
+                <Text style={styles.sectionSub}>
+                  {displayedQueue.length} patient(s) · Tap any patient to view or edit details
+                </Text>
+              </View>
+              <View style={styles.sectionHeaderActionsRow}>
+                <Pressable
+                  onPress={handlePrintPatientList}
+                  style={styles.printBtn}
+                  testID="reception-print-patient-list-btn"
+                >
+                  <Ionicons name="print-outline" size={15} color={colors.brandPrimary} />
+                  <Text style={styles.printBtnText}>Print Patient List</Text>
+                </Pressable>
+                <Pressable
+                  onPress={handleDownloadExcel}
+                  disabled={exportLoading}
+                  style={[styles.exportBtn, exportLoading && { opacity: 0.6 }]}
+                  testID="export-excel-btn"
+                >
+                  {exportLoading ? (
+                    <ActivityIndicator size="small" color="#0F766E" />
+                  ) : (
+                    <>
+                      <Ionicons name="download-outline" size={15} color="#0F766E" />
+                      <Text style={styles.exportBtnText}>Excel</Text>
+                    </>
+                  )}
+                </Pressable>
+                <Pressable
+                  onPress={handleAutoReferQueue}
+                  disabled={autoReferLoading || activeQueue.length === 0}
+                  style={[styles.autoReferBtn, (autoReferLoading || activeQueue.length === 0) && { opacity: 0.6 }]}
+                  testID="reception-auto-refer-queue-btn"
+                >
+                  {autoReferLoading ? (
+                    <ActivityIndicator size="small" color="#7C3AED" />
+                  ) : (
+                    <>
+                      <Ionicons name="git-branch-outline" size={15} color="#7C3AED" />
+                      <Text style={styles.autoReferBtnText}>Auto-Refer</Text>
+                    </>
+                  )}
+                </Pressable>
+                <Pressable
+                  onPress={() => {
+                    if (selectedDocRef.current) {
+                      refreshDoctorData(selectedDocRef.current, selectedDateRef.current, false);
+                    }
+                  }}
+                  style={styles.refreshBtn}
+                  testID="manual-refresh-btn"
+                >
+                  <Ionicons name="refresh" size={16} color={colors.brandPrimary} />
+                  <Text style={styles.refreshBtnText}>Sync</Text>
+                </Pressable>
+              </View>
+            </View>
+
+            {/* ── Queue Filter Tabs ── */}
+            <View style={styles.filterChipsRow}>
+              <Pressable
+                testID="reception-filter-all"
+                onPress={() => setQueueFilter("all")}
+                style={[styles.filterChip, queueFilter === "all" && styles.filterChipActive]}
+              >
+                <Text style={[styles.filterChipText, queueFilter === "all" && styles.filterChipTextActive]}>
+                  All ({queue.filter((q) => q.status !== "cancelled").length})
+                </Text>
+              </Pressable>
+              <Pressable
+                testID="reception-filter-active"
+                onPress={() => setQueueFilter("active")}
+                style={[styles.filterChip, queueFilter === "active" && styles.filterChipActive]}
+              >
+                <Text style={[styles.filterChipText, queueFilter === "active" && styles.filterChipTextActive]}>
+                  Active ({activeQueue.length})
+                </Text>
+              </Pressable>
+              <Pressable
+                testID="reception-filter-completed"
+                onPress={() => setQueueFilter("completed")}
+                style={[styles.filterChip, queueFilter === "completed" && styles.filterChipActive]}
+              >
+                <Text style={[styles.filterChipText, queueFilter === "completed" && styles.filterChipTextActive]}>
+                  Completed ({completedQueue.length})
+                </Text>
+              </Pressable>
+            </View>
+
+            {displayedQueue.length === 0 ? (
+              <View style={styles.empty}>
+                <Ionicons name="people-outline" size={44} color={colors.muted} />
+                <Text style={styles.emptyText}>No patients match the selected filter for {selectedDate}. Tap &quot;+ Add Patient&quot; to register a walk-in.</Text>
+              </View>
+            ) : (
+              displayedQueue.map((a) => {
+                const isConsulting = a.status === "in_consultation";
+                const isSkipped = a.status === "skipped";
+                const isArrived = a.status === "arrived";
+                const isBooked = a.status === "booked";
+                const isCompleted = a.status === "completed";
+                const currentAction = actionLoadingMap[a.id];
+                const isItemBusy = Boolean(currentAction);
+
+                return (
+                  <View key={a.id} style={[styles.apptCard, isConsulting && styles.apptCardConsulting, isCompleted && { opacity: 0.8 }]}>
+                    {/* Clickable Patient Info Area */}
+                    <Pressable
+                      testID={`reception-patient-row-${a.id}`}
+                      onPress={() => setSelectedPatientAppt(a)}
+                      style={styles.patientInfoPressable}
+                    >
+                      <View style={[styles.tokenBubble, isConsulting && { backgroundColor: colors.brandPrimary }, isCompleted && { backgroundColor: colors.surfaceTertiary }]}>
+                        <Text style={[styles.tokenText, isConsulting && { color: colors.onBrandPrimary }, isCompleted && { color: colors.onSurfaceSecondary }]}>
+                          #{a.token_number}
+                        </Text>
+                      </View>
+
+                      <View style={{ flex: 1 }}>
+                        <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                          <Text style={styles.apptName}>{a.patient_name}</Text>
+                          <Ionicons name="information-circle-outline" size={14} color={colors.brandPrimary} />
+                          {isConsulting && (
+                            <View style={styles.consultingBadge}>
+                              <Text style={styles.consultingBadgeText}>CONSULTING</Text>
+                            </View>
+                          )}
+                          {isSkipped && (
+                            <View style={styles.skippedBadge}>
+                              <Text style={styles.skippedBadgeText}>SKIPPED</Text>
+                            </View>
+                          )}
+                          {isCompleted && (
+                            <View style={[styles.consultingBadge, { backgroundColor: colors.success }]}>
+                              <Text style={[styles.consultingBadgeText, { color: "#fff" }]}>COMPLETED</Text>
+                            </View>
+                          )}
+                        </View>
+
+                        <Text style={styles.apptMeta}>
+                          {a.slot} · <Text style={{ fontWeight: "600" }}>{a.status.replace("_", " ").toUpperCase()}</Text>
+                          {a.consultation_started_at ? ` · Started ${formatTime(a.consultation_started_at)}` : ""}
+                        </Text>
+                        {a.patient_mobile ? (
+                          <Text style={styles.patientContactMeta}>📞 {a.patient_mobile}</Text>
+                        ) : null}
+                        {a.expected_turn_time && !isCompleted ? (
+                          <View style={styles.etaRow}>
+                            <Ionicons
+                              name={a.is_estimate_pending ? "alert-circle-outline" : "time-outline"}
+                              size={13}
+                              color={a.is_estimate_pending ? "#D97706" : colors.brandPrimary}
+                            />
+                            <Text
+                              style={[
+                                styles.etaText,
+                                a.is_estimate_pending && { color: "#D97706", fontWeight: "600" },
+                              ]}
+                            >
+                              {a.is_estimate_pending ? a.expected_turn_time : `Expected: ${a.expected_turn_time}`}
+                            </Text>
+                          </View>
+                        ) : null}
+                        {a.symptoms ? <Text style={styles.symptoms} numberOfLines={1}>💊 {a.symptoms}</Text> : null}
+                      </View>
+                    </Pressable>
+
+                    {/* Patient-specific utility icons (SMS link & Transfer) */}
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginRight: 4 }}>
+                      {a.patient_mobile ? (
+                        <Pressable
+                          testID={`action-send-link-${a.id}`}
+                          onPress={() => sendAppointmentLink(a)}
+                          style={[styles.smallIconBtn, { backgroundColor: colors.brandSecondary }]}
+                        >
+                          <Ionicons name="send" size={13} color={colors.brandPrimary} />
+                        </Pressable>
+                      ) : null}
+                      {doctors.length > 1 && (
+                        <Pressable
+                          testID={`action-refer-${a.id}`}
+                          onPress={() => openReferModal(a)}
+                          style={[styles.smallIconBtn, { backgroundColor: colors.surfaceSecondary, borderWidth: 1, borderColor: colors.border }]}
+                        >
+                          <Ionicons name="swap-horizontal" size={14} color={colors.brandPrimary} />
+                        </Pressable>
+                      )}
+                    </View>
+
+                    {/* Standardized Patient Action Layout: Prominent primary action + balanced secondary row */}
+                    {isBooked && (
+                      <View style={styles.actionsContainer}>
+                        <Pressable
+                          testID={`action-start-${a.id}`}
+                          onPress={() => startConsultation(a)}
+                          disabled={isItemBusy}
+                          style={[styles.primaryActionBtn, isItemBusy && { opacity: 0.5 }]}
+                        >
+                          {currentAction === "start" ? (
+                            <ActivityIndicator size="small" color="#fff" />
+                          ) : (
+                            <Ionicons name="play" size={16} color="#fff" />
+                          )}
+                          <Text style={styles.primaryActionBtnLabel}>Start Consultation</Text>
+                        </Pressable>
+
+                        <View style={styles.secondaryActionsRow}>
+                          <Pressable
+                            testID={`action-arrived-${a.id}`}
+                            onPress={() => markArrived(a)}
+                            disabled={isItemBusy}
+                            style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
+                          >
+                            {currentAction === "arrived" ? (
+                              <ActivityIndicator size="small" color={colors.info} />
+                            ) : (
+                              <Ionicons name="checkmark-circle-outline" size={17} color={colors.info} />
+                            )}
+                            <Text style={styles.actionColBtnLabel}>Arrived</Text>
+                          </Pressable>
+
+                          <Pressable
+                            testID={`action-skip-${a.id}`}
+                            onPress={() => skipPatient(a)}
+                            disabled={isItemBusy}
+                            style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
+                          >
+                            {currentAction === "skip" ? (
+                              <ActivityIndicator size="small" color={colors.warning} />
+                            ) : (
+                              <Ionicons name="arrow-forward-circle-outline" size={17} color={colors.warning} />
+                            )}
+                            <Text style={styles.actionColBtnLabel}>Skip Patient</Text>
+                          </Pressable>
+
+                          <Pressable
+                            testID={`action-reschedule-${a.id}`}
+                            onPress={() => openRescheduleModal(a)}
+                            disabled={isItemBusy}
+                            style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
+                          >
+                            <Ionicons name="calendar-outline" size={17} color={colors.brandPrimary} />
+                            <Text style={styles.actionColBtnLabel}>Reschedule</Text>
+                          </Pressable>
+
+                          <Pressable
+                            testID={`action-cancel-${a.id}`}
+                            onPress={() => cancelAppointment(a)}
+                            disabled={isItemBusy}
+                            style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
+                          >
+                            {currentAction === "cancel" ? (
+                              <ActivityIndicator size="small" color={colors.error} />
+                            ) : (
+                              <Ionicons name="close-circle-outline" size={17} color={colors.error} />
+                            )}
+                            <Text style={[styles.actionColBtnLabel, { color: colors.error }]}>Cancel</Text>
+                          </Pressable>
+                        </View>
+                      </View>
+                    )}
+
+                    {isArrived && (
+                      <View style={styles.actionsContainer}>
+                        <Pressable
+                          testID={`action-start-${a.id}`}
+                          onPress={() => startConsultation(a)}
+                          disabled={isItemBusy}
+                          style={[styles.primaryActionBtn, isItemBusy && { opacity: 0.5 }]}
+                        >
+                          {currentAction === "start" ? (
+                            <ActivityIndicator size="small" color="#fff" />
+                          ) : (
+                            <Ionicons name="play" size={16} color="#fff" />
+                          )}
+                          <Text style={styles.primaryActionBtnLabel}>Start Consultation</Text>
+                        </Pressable>
+
+                        <View style={styles.secondaryActionsRow}>
+                          <Pressable
+                            testID={`action-skip-${a.id}`}
+                            onPress={() => skipPatient(a)}
+                            disabled={isItemBusy}
+                            style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
+                          >
+                            {currentAction === "skip" ? (
+                              <ActivityIndicator size="small" color={colors.warning} />
+                            ) : (
+                              <Ionicons name="arrow-forward-circle-outline" size={17} color={colors.warning} />
+                            )}
+                            <Text style={styles.actionColBtnLabel}>Skip Patient</Text>
+                          </Pressable>
+
+                          <Pressable
+                            testID={`action-reschedule-${a.id}`}
+                            onPress={() => openRescheduleModal(a)}
+                            disabled={isItemBusy}
+                            style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
+                          >
+                            <Ionicons name="calendar-outline" size={17} color={colors.brandPrimary} />
+                            <Text style={styles.actionColBtnLabel}>Reschedule</Text>
+                          </Pressable>
+
+                          <Pressable
+                            testID={`action-cancel-${a.id}`}
+                            onPress={() => cancelAppointment(a)}
+                            disabled={isItemBusy}
+                            style={[styles.actionColBtn, isItemBusy && { opacity: 0.5 }]}
+                          >
+                            {currentAction === "cancel" ? (
+                              <ActivityIndicator size="small" color={colors.error} />
+                            ) : (
+                              <Ionicons name="close-circle-outline" size={17} color={colors.error} />
+                            )}
+                            <Text style={[styles.actionColBtnLabel, { color: colors.error }]}>Cancel</Text>
+                          </Pressable>
+                        </View>
+                      </View>
+                    )}
+
+                    {isConsulting && (
+                      <View style={styles.actionsContainer}>
+                        <Pressable
+                          testID={`action-complete-${a.id}`}
+                          onPress={() => completeConsultation(a)}
+                          disabled={isItemBusy}
+                          style={[styles.actionColBtnSuccess, isItemBusy && { opacity: 0.5 }]}
+                        >
+                          {currentAction === "complete" ? (
+                            <ActivityIndicator size="small" color="#fff" />
+                          ) : (
+                            <Ionicons name="checkmark-done" size={20} color="#fff" />
+                          )}
+                          <Text style={[styles.actionColBtnLabel, { color: "#fff", fontWeight: "700", fontSize: 13 }]}>
+                            Complete Consultation
+                          </Text>
+                        </Pressable>
+                      </View>
+                    )}
+
+                    {isSkipped && (
+                      <View style={styles.actionsContainer}>
+                        <View style={styles.secondaryActionsRow}>
+                          <Pressable
+                            testID={`action-rejoin-${a.id}`}
+                            onPress={() => rejoinQueue(a)}
+                            disabled={isItemBusy}
+                            style={[styles.actionColBtn, { backgroundColor: "#FEF3C7", borderColor: "#FCD34D", flex: 1 }, isItemBusy && { opacity: 0.5 }]}
+                          >
+                            {currentAction === "rejoin" ? (
+                              <ActivityIndicator size="small" color="#B45309" />
+                            ) : (
+                              <Ionicons name="refresh-circle-outline" size={17} color="#B45309" />
+                            )}
+                            <Text style={[styles.actionColBtnLabel, { color: "#92400E" }]}>
+                              Rejoin Queue
+                            </Text>
+                          </Pressable>
+
+                          <Pressable
+                            testID={`action-cancel-${a.id}`}
+                            onPress={() => cancelAppointment(a)}
+                            disabled={isItemBusy}
+                            style={[styles.actionColBtn, { flex: 1 }, isItemBusy && { opacity: 0.5 }]}
+                          >
+                            {currentAction === "cancel" ? (
+                              <ActivityIndicator size="small" color={colors.error} />
+                            ) : (
+                              <Ionicons name="close-circle-outline" size={17} color={colors.error} />
+                            )}
+                            <Text style={[styles.actionColBtnLabel, { color: colors.error }]}>Cancel</Text>
+                          </Pressable>
+                        </View>
+                      </View>
+                    )}
+                  </View>
+                );
+              })
+            )}
+
+            {/* Lower-Page: Completed / History Records Section */}
+            <View style={styles.historySection}>
+              <Pressable
+                onPress={() => setShowCompleted(!showCompleted)}
+                style={styles.historyHeader}
+                testID="toggle-completed-records-btn"
+              >
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                  <Ionicons name="file-tray-full-outline" size={18} color={colors.onSurface} />
+                  <Text style={styles.historyTitle}>
+                    Completed Records ({completedQueue.length})
+                  </Text>
+                </View>
+                <Ionicons
+                  name={showCompleted ? "chevron-up" : "chevron-down"}
+                  size={18}
+                  color={colors.muted}
+                />
+              </Pressable>
+
+              {showCompleted && (
+                <View style={{ gap: spacing.xs, marginTop: spacing.sm }}>
+                  {completedQueue.length === 0 ? (
+                    <Text style={styles.historyEmptyText}>No consultations completed yet today.</Text>
+                  ) : (
+                    completedQueue.map((item) => (
+                      <Pressable
+                        key={item.id}
+                        testID={`reception-completed-row-${item.id}`}
+                        onPress={() => setSelectedPatientAppt(item)}
+                        style={styles.historyItemCard}
+                      >
+                        <View style={styles.historyToken}>
+                          <Text style={styles.historyTokenText}>#{item.token_number}</Text>
+                        </View>
+                        <View style={{ flex: 1 }}>
+                          <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                            <Text style={styles.historyPatientName}>{item.patient_name}</Text>
+                            <Ionicons name="information-circle-outline" size={13} color={colors.brandPrimary} />
+                          </View>
+                          <Text style={styles.historyTimeText}>
+                            Started: {formatTime(item.consultation_started_at || item.started_at)} · Completed: {formatTime(item.consultation_completed_at || item.completed_at)}
+                          </Text>
+                          {item.patient_mobile ? (
+                            <Text style={styles.patientContactMeta}>📞 {item.patient_mobile}</Text>
+                          ) : null}
+                        </View>
+                        <View style={styles.completedBadge}>
+                          <Ionicons name="checkmark-done" size={14} color="#065F46" />
+                          <Text style={styles.completedBadgeText}>Completed</Text>
+                        </View>
+                      </Pressable>
+                    ))
+                  )}
+                </View>
+              )}
+            </View>
+
+            {/* Lower-Page: Daily Patient Calendar */}
+            <View style={styles.calendarSection}>
+              <View style={styles.sectionHeaderRow}>
+                <View>
+                  <Text style={styles.sectionTitle}>Daily Patient Calendar</Text>
+                  <Text style={styles.sectionSub}>Selected Date: <Text style={{ fontWeight: "700", color: colors.brandPrimary }}>{selectedDate}</Text></Text>
+                </View>
+              </View>
+              <CalendarSummary
+                summaryData={summaryData}
+                selectedDate={selectedDate}
+                onSelectDate={(date) => {
+                  setSelectedDate(date);
+                  selectedDateRef.current = date;
+                  if (selectedDocRef.current) {
+                    refreshDoctorData(selectedDocRef.current, date, false);
+                  }
+                }}
+              />
+            </View>
+
+            {/* Lower-Page: Footer */}
+            <View style={styles.dashboardFooter}>
+              <Text style={styles.dashboardFooterText}>MeriBaari Healthcare · Clinic Queue Management</Text>
+            </View>
+          </>
+        )}
       </ScrollView>
 
       {/* ── Toast ── */}
@@ -1263,32 +1774,50 @@ export default function ReceptionistDashboard() {
         </View>
       ) : null}
 
-      {/* ── FABs ── */}
-      <View style={[styles.fabRow, { bottom: Math.max(20, insets.bottom + 8) }]}>
+      {/* ── FABs (Add Patient & Emergency) ── */}
+      <View style={[styles.fabRow, { bottom: Math.max(insets.bottom + 12, 20) }]} pointerEvents="box-none">
         <Pressable
           testID="add-patient-btn"
-          disabled={addLoading}
-          onPress={() => setAddOpen(true)}
-          style={[styles.fab, { backgroundColor: colors.brandPrimary }, addLoading && { opacity: 0.6 }]}
+          disabled={addLoading || !selectedDoc}
+          onPress={onOpenAddPatient}
+          style={[
+            styles.fab,
+            { backgroundColor: colors.brandPrimary },
+            isExtraSmallScreen && { paddingHorizontal: spacing.sm },
+            (!selectedDoc || addLoading) && { opacity: 0.6 },
+          ]}
         >
           {addLoading ? (
             <ActivityIndicator size="small" color="#fff" />
           ) : (
-            <Ionicons name="person-add" size={20} color="#fff" />
+            <Ionicons name="person-add" size={18} color="#fff" />
           )}
-          <Text style={styles.fabText}>{addLoading ? "Saving…" : "Add Patient"}</Text>
+          <Text style={[styles.fabText, isExtraSmallScreen && { fontSize: 13 }]}>{addLoading ? "Saving…" : "Add Patient"}</Text>
         </Pressable>
+
         <Pressable
           testID="emergency-insert-btn"
-          onPress={() => setEmergencyOpen(true)}
-          style={[styles.fab, { backgroundColor: colors.error }]}
+          disabled={!selectedDoc}
+          onPress={() => {
+            if (!selectedDoc) {
+              Alert.alert("Doctor Required", "Please select an active doctor before inserting emergency patients.");
+              return;
+            }
+            setEmergencyOpen(true);
+          }}
+          style={[
+            styles.fab,
+            { backgroundColor: colors.error },
+            isExtraSmallScreen && { paddingHorizontal: spacing.sm },
+            !selectedDoc && { opacity: 0.6 },
+          ]}
         >
-          <Ionicons name="alert" size={20} color="#fff" />
-          <Text style={styles.fabText}>Emergency</Text>
+          <Ionicons name="alert" size={18} color="#fff" />
+          <Text style={[styles.fabText, isExtraSmallScreen && { fontSize: 13 }]}>Emergency</Text>
         </Pressable>
       </View>
 
-      {/* ── Add Patient Modal (Preserves inputs during connection glitches) ── */}
+      {/* ── Add Patient Modal (Fixed Backdrop and Keyboard handling) ── */}
       <Modal
         transparent
         visible={addOpen}
@@ -1298,180 +1827,197 @@ export default function ReceptionistDashboard() {
         }}
       >
         <KeyboardAvoidingView
-          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
           style={styles.modalBackdrop}
         >
+          {/* Distinct backdrop layer preventing input clicks from bubbling to dismiss */}
           <Pressable
-            style={{ flex: 1, justifyContent: "flex-end", width: "100%" }}
+            style={StyleSheet.absoluteFill}
             onPress={() => {
               if (!addLoading && !addVerifying) setAddOpen(false);
             }}
-          >
-            <Pressable style={[styles.sheet, { maxHeight: "92%" }]} onPress={(e) => e.stopPropagation()}>
-              <View style={styles.sheetHandle} />
-              <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: spacing.xl }}>
+          />
+
+          <View style={[styles.sheet, { maxHeight: "92%" }]}>
+            <View style={styles.sheetHandle} />
+            <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: spacing.xl }}>
+              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: spacing.xs }}>
                 <Text style={styles.sheetTitle}>Add Patient to Queue</Text>
-                <Text style={styles.sheetSub}>Select doctor session & slot (receptionist override enabled). Date: {selectedDate}</Text>
-
-                {/* 1. Doctor Sessions Selection (All configured sessions accessible to receptionist) */}
-                <Text style={styles.label}>1. Doctor Session (सत्र चुनें)</Text>
-                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 4 }}>
-                  <Pressable
-                    onPress={() => {
-                      setSelectedSessionId(null);
-                      setSelectedWindowId(null);
-                    }}
-                    style={[
-                      styles.recSessionChip,
-                      selectedSessionId === null && styles.recSessionChipActive,
-                    ]}
-                  >
-                    <Text style={[styles.recSessionText, selectedSessionId === null && { color: "#fff" }]}>
-                      General Walk-in
-                    </Text>
-                  </Pressable>
-                  {configuredSessions.map((sess) => {
-                    const isSessActive = selectedSessionId === sess.id;
-                    return (
-                      <Pressable
-                        key={sess.id}
-                        onPress={() => {
-                          setSelectedSessionId(sess.id);
-                          setSelectedWindowId(null);
-                          setPSlot(`${sess.start_time} - ${sess.end_time}`);
-                        }}
-                        style={[
-                          styles.recSessionChip,
-                          isSessActive && styles.recSessionChipActive,
-                        ]}
-                      >
-                        <Text style={[styles.recSessionText, isSessActive && { color: "#fff" }]}>
-                          {sess.session_name} ({sess.start_time} - {sess.end_time})
-                        </Text>
-                      </Pressable>
-                    );
-                  })}
-                </ScrollView>
-
-                {/* 2. Booking Windows / Slots (Receptionist has access to ALL windows including local-only) */}
-                {selectedSessionId && (
-                  (() => {
-                    const chosen = configuredSessions.find((s) => s.id === selectedSessionId);
-                    const wins = chosen?.booking_windows || [];
-                    if (wins.length === 0) return null;
-                    return (
-                      <View style={{ marginTop: spacing.xs, marginBottom: spacing.sm }}>
-                        <Text style={styles.label}>2. Booking Window / Slot (Receptionist Override: All Windows Available)</Text>
-                        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 4 }}>
-                          {wins.map((w: any) => {
-                            const isWinActive = selectedWindowId === w.id;
-                            const target = w.target_patient_category || "all";
-                            const badge = target === "local" ? "Local" : target === "distant" ? "Distant" : "All";
-                            return (
-                              <Pressable
-                                key={w.id}
-                                onPress={() => {
-                                  setSelectedWindowId(w.id);
-                                  setPSlot(`${w.start_time} - ${w.end_time}`);
-                                }}
-                                style={[
-                                  styles.recWindowChip,
-                                  isWinActive && styles.recWindowChipActive,
-                                ]}
-                              >
-                                <Text style={[styles.recWindowTime, isWinActive && { color: "#fff" }]}>
-                                  {w.start_time} - {w.end_time}
-                                </Text>
-                                <Text style={[styles.recWindowBadge, isWinActive && { color: "#E0E7FF" }]}>
-                                  [{badge}]
-                                </Text>
-                              </Pressable>
-                            );
-                          })}
-                        </ScrollView>
-                      </View>
-                    );
-                  })()
-                )}
-
-                {/* 3. Patient Details */}
-                <Text style={styles.label}>3. Patient Full Name*</Text>
-                <TextInput testID="ap-name" editable={!addLoading} placeholder="Patient name" placeholderTextColor={colors.muted} value={pName} onChangeText={setPName} style={styles.input} />
-                <Text style={styles.label}>Mobile Number*</Text>
-                <View style={styles.mobileWrap}>
-                  <View style={styles.ccBadge}><Text style={styles.ccText}>+91</Text></View>
-                  <TextInput testID="ap-mobile" editable={!addLoading} placeholder="98765 43210" placeholderTextColor={colors.muted} value={pMobile} onChangeText={(t) => setPMobile(t.replace(/[^0-9]/g, "").slice(0, 10))} keyboardType="phone-pad" style={styles.mobileInput} />
-                </View>
-                <View style={{ flexDirection: "row", gap: spacing.sm }}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.label}>Age</Text>
-                    <TextInput testID="ap-age" editable={!addLoading} placeholder="32" placeholderTextColor={colors.muted} value={pAge} onChangeText={(t) => setPAge(t.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" style={styles.input} />
-                  </View>
-                  <View style={{ flex: 2 }}>
-                    <Text style={styles.label}>Gender</Text>
-                    <View style={styles.genderRow}>
-                      {GENDERS.map((g) => (
-                        <Pressable key={g} testID={`ap-gender-${g}`} disabled={addLoading} onPress={() => setPGender(g)} style={[styles.genderChip, pGender === g && styles.genderChipActive, addLoading && { opacity: 0.6 }]}>
-                          <Text style={[styles.genderText, pGender === g && { color: colors.onBrandPrimary }]}>{g}</Text>
-                        </Pressable>
-                      ))}
-                    </View>
-                  </View>
-                </View>
-                <Text style={styles.label}>Symptoms / Reason</Text>
-                <TextInput testID="ap-symptoms" editable={!addLoading} placeholder="Fever, cough..." placeholderTextColor={colors.muted} value={pSymptoms} onChangeText={setPSymptoms} multiline style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]} />
-                <Text style={styles.label}>Address / Area (Optional - ऐच्छिक)</Text>
-                <TextInput testID="ap-address" editable={!addLoading} placeholder="Area, city (optional for receptionist)" placeholderTextColor={colors.muted} value={pAddress} onChangeText={setPAddress} style={styles.input} />
-                <Text style={styles.label}>Custom Slot / Note (optional)</Text>
-                <TextInput testID="ap-slot" editable={!addLoading} placeholder="e.g. 11:00 AM (or leave blank)" placeholderTextColor={colors.muted} value={pSlot} onChangeText={setPSlot} style={styles.input} />
-                {addError ? <Text style={styles.error}>{addError}</Text> : null}
                 <Pressable
-                  testID="ap-submit"
-                  onPress={onAddPatient}
-                  disabled={addLoading || addVerifying}
-                  style={({ pressed }) => [
-                    styles.primaryBtn,
-                    (pressed || addLoading || addVerifying) && { opacity: 0.75 },
+                  testID="close-add-patient-modal-btn"
+                  onPress={() => {
+                    if (!addLoading && !addVerifying) setAddOpen(false);
+                  }}
+                  style={{ padding: 4 }}
+                >
+                  <Ionicons name="close" size={22} color={colors.muted} />
+                </Pressable>
+              </View>
+              <Text style={styles.sheetSub}>
+                Doctor: <Text style={{ fontWeight: "700", color: colors.brandPrimary }}>{doctors.find((d) => d.id === selectedDoc)?.full_name || "Selected Doctor"}</Text> · Date: {selectedDate}
+              </Text>
+
+              {/* 1. Doctor Sessions Selection */}
+              <Text style={styles.label}>1. Doctor Session (सत्र चुनें)</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 4 }}>
+                <Pressable
+                  onPress={() => {
+                    setSelectedSessionId(null);
+                    setSelectedWindowId(null);
+                  }}
+                  style={[
+                    styles.recSessionChip,
+                    selectedSessionId === null && styles.recSessionChipActive,
                   ]}
                 >
-                  {addLoading || addVerifying ? (
-                    <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8 }}>
-                      <ActivityIndicator size="small" color="#fff" />
-                      <Text style={styles.primaryBtnText}>
-                        {addVerifying ? "Verifying..." : "Saving…"}
-                      </Text>
-                    </View>
-                  ) : (
-                    <Text style={styles.primaryBtnText}>
-                      {addIsTimeout ? "Retry Add Patient" : "Confirm Booking & Add to Queue"}
-                    </Text>
-                  )}
+                  <Text style={[styles.recSessionText, selectedSessionId === null && { color: "#fff" }]}>
+                    General Walk-in
+                  </Text>
                 </Pressable>
-                <View style={{ height: spacing.xl }} />
+                {configuredSessions.map((sess) => {
+                  const isSessActive = selectedSessionId === sess.id;
+                  return (
+                    <Pressable
+                      key={sess.id}
+                      onPress={() => {
+                        setSelectedSessionId(sess.id);
+                        setSelectedWindowId(null);
+                        setPSlot(`${sess.start_time} - ${sess.end_time}`);
+                      }}
+                      style={[
+                        styles.recSessionChip,
+                        isSessActive && styles.recSessionChipActive,
+                      ]}
+                    >
+                      <Text style={[styles.recSessionText, isSessActive && { color: "#fff" }]}>
+                        {sess.session_name} ({sess.start_time} - {sess.end_time})
+                      </Text>
+                    </Pressable>
+                  );
+                })}
               </ScrollView>
-            </Pressable>
-          </Pressable>
+
+              {/* 2. Booking Windows / Slots */}
+              {selectedSessionId && (
+                (() => {
+                  const chosen = configuredSessions.find((s) => s.id === selectedSessionId);
+                  const wins = chosen?.booking_windows || [];
+                  if (wins.length === 0) return null;
+                  return (
+                    <View style={{ marginTop: spacing.xs, marginBottom: spacing.sm }}>
+                      <Text style={styles.label}>2. Booking Window / Slot (Receptionist Override: All Windows Available)</Text>
+                      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 4 }}>
+                        {wins.map((w: any) => {
+                          const isWinActive = selectedWindowId === w.id;
+                          const target = w.target_patient_category || "all";
+                          const badge = target === "local" ? "Local" : target === "distant" ? "Distant" : "All";
+                          return (
+                            <Pressable
+                              key={w.id}
+                              onPress={() => {
+                                setSelectedWindowId(w.id);
+                                setPSlot(`${w.start_time} - ${w.end_time}`);
+                              }}
+                              style={[
+                                styles.recWindowChip,
+                                isWinActive && styles.recWindowChipActive,
+                              ]}
+                            >
+                              <Text style={[styles.recWindowTime, isWinActive && { color: "#fff" }]}>
+                                {w.start_time} - {w.end_time}
+                              </Text>
+                              <Text style={[styles.recWindowBadge, isWinActive && { color: "#E0E7FF" }]}>
+                                [{badge}]
+                              </Text>
+                            </Pressable>
+                          );
+                        })}
+                      </ScrollView>
+                    </View>
+                  );
+                })()
+              )}
+
+              {/* 3. Patient Details */}
+              <Text style={styles.label}>3. Patient Full Name*</Text>
+              <TextInput testID="ap-name" editable={!addLoading} placeholder="Patient name" placeholderTextColor={colors.muted} value={pName} onChangeText={setPName} style={styles.input} />
+              <Text style={styles.label}>Mobile Number*</Text>
+              <View style={styles.mobileWrap}>
+                <View style={styles.ccBadge}><Text style={styles.ccText}>+91</Text></View>
+                <TextInput testID="ap-mobile" editable={!addLoading} placeholder="98765 43210" placeholderTextColor={colors.muted} value={pMobile} onChangeText={(t) => setPMobile(t.replace(/[^0-9]/g, "").slice(0, 10))} keyboardType="phone-pad" style={styles.mobileInput} />
+              </View>
+              <View style={{ flexDirection: "row", gap: spacing.sm }}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.label}>Age</Text>
+                  <TextInput testID="ap-age" editable={!addLoading} placeholder="32" placeholderTextColor={colors.muted} value={pAge} onChangeText={(t) => setPAge(t.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" style={styles.input} />
+                </View>
+                <View style={{ flex: 2 }}>
+                  <Text style={styles.label}>Gender</Text>
+                  <View style={styles.genderRow}>
+                    {GENDERS.map((g) => (
+                      <Pressable key={g} testID={`ap-gender-${g}`} disabled={addLoading} onPress={() => setPGender(g)} style={[styles.genderChip, pGender === g && styles.genderChipActive, addLoading && { opacity: 0.6 }]}>
+                        <Text style={[styles.genderText, pGender === g && { color: colors.onBrandPrimary }]}>{g}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
+              </View>
+              <Text style={styles.label}>Symptoms / Reason</Text>
+              <TextInput testID="ap-symptoms" editable={!addLoading} placeholder="Fever, cough..." placeholderTextColor={colors.muted} value={pSymptoms} onChangeText={setPSymptoms} multiline style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]} />
+              <Text style={styles.label}>Address / Area (Optional - ऐच्छिक)</Text>
+              <TextInput testID="ap-address" editable={!addLoading} placeholder="Area, city (optional for receptionist)" placeholderTextColor={colors.muted} value={pAddress} onChangeText={setPAddress} style={styles.input} />
+              <Text style={styles.label}>Custom Slot / Note (optional)</Text>
+              <TextInput testID="ap-slot" editable={!addLoading} placeholder="e.g. 11:00 AM (or leave blank)" placeholderTextColor={colors.muted} value={pSlot} onChangeText={setPSlot} style={styles.input} />
+              {addError ? <Text style={styles.error}>{addError}</Text> : null}
+              <Pressable
+                testID="ap-submit"
+                onPress={onAddPatient}
+                disabled={addLoading || addVerifying}
+                style={({ pressed }) => [
+                  styles.primaryBtn,
+                  (pressed || addLoading || addVerifying) && { opacity: 0.75 },
+                ]}
+              >
+                {addLoading || addVerifying ? (
+                  <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                    <ActivityIndicator size="small" color="#fff" />
+                    <Text style={styles.primaryBtnText}>
+                      {addVerifying ? "Verifying..." : "Saving…"}
+                    </Text>
+                  </View>
+                ) : (
+                  <Text style={styles.primaryBtnText}>
+                    {addIsTimeout ? "Retry Add Patient" : "Confirm Booking & Add to Queue"}
+                  </Text>
+                )}
+              </Pressable>
+              <View style={{ height: spacing.xl }} />
+            </ScrollView>
+          </View>
         </KeyboardAvoidingView>
       </Modal>
 
       {/* ── Emergency Modal ── */}
       <Modal transparent visible={emergencyOpen} animationType="slide" onRequestClose={() => setEmergencyOpen(false)}>
         <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
-          <Pressable style={styles.modalBackdrop} onPress={() => setEmergencyOpen(false)}>
-            <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+          <View style={styles.modalBackdrop}>
+            <Pressable style={StyleSheet.absoluteFill} onPress={() => setEmergencyOpen(false)} />
+            <View style={[styles.sheet, { maxHeight: "90%" }]}>
               <View style={styles.sheetHandle} />
-              <Text style={styles.sheetTitle}>Emergency Priority Insert</Text>
-              <Text style={styles.sheetSub}>Patient will be inserted with highest priority without disturbing existing token numbers.</Text>
-              <TextInput testID="emergency-name-input" placeholder="Patient name" placeholderTextColor={colors.muted} value={emergencyName} onChangeText={setEmergencyName} style={styles.emergencyInput} />
-              <Pressable testID="emergency-confirm" onPress={insertEmergency} style={styles.emergencyBtn}>
-                <Text style={styles.emergencyBtnText}>Insert as Priority</Text>
-              </Pressable>
-            </Pressable>
-          </Pressable>
+              <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+                <Text style={styles.sheetTitle}>Emergency Priority Insert</Text>
+                <Text style={styles.sheetSub}>Patient will be inserted with highest priority without disturbing existing token numbers.</Text>
+                <TextInput testID="emergency-name-input" placeholder="Patient name" placeholderTextColor={colors.muted} value={emergencyName} onChangeText={setEmergencyName} style={styles.emergencyInput} />
+                <Pressable testID="emergency-confirm" onPress={insertEmergency} style={styles.emergencyBtn}>
+                  <Text style={styles.emergencyBtnText}>Insert as Priority</Text>
+                </Pressable>
+              </ScrollView>
+            </View>
+          </View>
         </KeyboardAvoidingView>
       </Modal>
 
-      {/* ── Reschedule Appointment Modal (Requirement 5) ── */}
+      {/* ── Reschedule Appointment Modal ── */}
       <Modal
         transparent
         visible={rescheduleModalOpen}
@@ -1483,11 +2029,12 @@ export default function ReceptionistDashboard() {
           style={{ flex: 1 }}
           keyboardVerticalOffset={Platform.OS === "ios" ? 40 : 0}
         >
-          <Pressable
-            style={styles.modalBackdrop}
-            onPress={() => !rescheduleLoading && !rescheduleVerifying && setRescheduleModalOpen(false)}
-          >
-            <Pressable style={[styles.sheet, { maxHeight: "90%" }]} onPress={(e) => e.stopPropagation()}>
+          <View style={styles.modalBackdrop}>
+            <Pressable
+              style={StyleSheet.absoluteFill}
+              onPress={() => !rescheduleLoading && !rescheduleVerifying && setRescheduleModalOpen(false)}
+            />
+            <View style={[styles.sheet, { maxHeight: "90%" }]}>
               <View style={styles.sheetHandle} />
               <ScrollView
                 keyboardShouldPersistTaps="handled"
@@ -1565,18 +2112,19 @@ export default function ReceptionistDashboard() {
                   </Pressable>
                 </View>
               </ScrollView>
-            </Pressable>
-          </Pressable>
+            </View>
+          </View>
         </KeyboardAvoidingView>
       </Modal>
 
       {/* ── Refer / Transfer Patient Modal ── */}
       <Modal transparent visible={referModalOpen} animationType="slide" onRequestClose={() => setReferModalOpen(false)}>
         <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
-          <Pressable style={styles.modalBackdrop} onPress={() => setReferModalOpen(false)}>
-            <Pressable style={[styles.sheet, { maxHeight: "90%" }]} onPress={(e) => e.stopPropagation()}>
+          <View style={styles.modalBackdrop}>
+            <Pressable style={StyleSheet.absoluteFill} onPress={() => setReferModalOpen(false)} />
+            <View style={[styles.sheet, { maxHeight: "90%" }]}>
               <View style={styles.sheetHandle} />
-              <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: spacing.lg }}>
+              <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
                 <Text style={styles.sheetTitle}>Refer / Transfer Patient</Text>
                 <Text style={styles.sheetSub}>
                   Transfer {referAppt?.patient_name} (Token #{referAppt?.token_number}) to another doctor in the hospital.
@@ -1619,23 +2167,41 @@ export default function ReceptionistDashboard() {
                   {referLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Confirm Transfer</Text>}
                 </Pressable>
               </ScrollView>
-            </Pressable>
-          </Pressable>
+            </View>
+          </View>
         </KeyboardAvoidingView>
       </Modal>
 
       {/* ── Patient Details View / Edit Modal ── */}
-      <PatientDetailsModal
-        visible={!!selectedPatientAppt}
-        appointment={selectedPatientAppt}
-        onClose={() => setSelectedPatientAppt(null)}
-        onUpdated={(updated) => {
-          setQueue((prev) =>
-            prev.map((a) => (a.id === updated.id ? { ...a, ...updated } : a))
-          );
-          setSelectedPatientAppt(updated);
-        }}
-      />
+      {Boolean(selectedPatientAppt) && (
+        <PatientDetailsModal
+          visible={Boolean(selectedPatientAppt)}
+          appointment={selectedPatientAppt}
+          onClose={() => setSelectedPatientAppt(null)}
+          onUpdated={(updated) => {
+            setQueue((prev) =>
+              prev.map((a) => (a.id === updated.id ? { ...a, ...updated } : a))
+            );
+            setSelectedPatientAppt(updated);
+          }}
+        />
+      )}
+
+      {/* ── Shifts & Custom Slots Manager Modal ── */}
+      {selectedDoc && sessionManagerOpen && (
+        <DoctorSessionManagerModal
+          visible={sessionManagerOpen}
+          doctorId={selectedDoc}
+          doctorName={doctors.find((d) => d.id === selectedDoc)?.full_name || "Doctor"}
+          initialDate={selectedDate}
+          onClose={() => setSessionManagerOpen(false)}
+          onSessionsUpdated={() => {
+            if (selectedDocRef.current) {
+              refreshDoctorData(selectedDocRef.current, selectedDateRef.current, true);
+            }
+          }}
+        />
+      )}
     </SafeAreaView>
   );
 }
@@ -1726,6 +2292,76 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: "600",
   },
+  emptyDoctorBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+    backgroundColor: "#FFFBEB",
+    borderWidth: 1,
+    borderColor: "#FDE68A",
+    marginHorizontal: spacing.lg,
+    marginTop: spacing.sm,
+    padding: spacing.md,
+    borderRadius: radius.md,
+  },
+  emptyDoctorIconWrap: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "#FEF3C7",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  emptyDoctorTitle: {
+    fontSize: font.base,
+    fontWeight: "700",
+    color: "#92400E",
+  },
+  emptyDoctorDesc: {
+    fontSize: font.xs,
+    color: "#B45309",
+    marginTop: 2,
+  },
+  emptyDoctorRetryBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    borderColor: "#D97706",
+    backgroundColor: "#fff",
+  },
+  emptyDoctorRetryBtnText: {
+    fontSize: font.xs,
+    fontWeight: "700",
+    color: "#B45309",
+  },
+  emptyDoctorCard: {
+    alignItems: "center",
+    justifyContent: "center",
+    padding: spacing.xxl,
+    backgroundColor: colors.surface,
+    borderRadius: radius.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+    marginVertical: spacing.md,
+    gap: spacing.md,
+  },
+  emptyDoctorCardTitle: {
+    fontSize: font.lg,
+    fontWeight: "700",
+    color: colors.onSurface,
+    textAlign: "center",
+  },
+  emptyDoctorCardDesc: {
+    fontSize: font.sm,
+    color: colors.muted,
+    textAlign: "center",
+    lineHeight: 20,
+    maxWidth: 420,
+  },
   header: { flexDirection: "row", padding: spacing.lg, paddingBottom: spacing.sm, alignItems: "center" },
   hello: { fontSize: font.xs, color: colors.muted, textTransform: "uppercase", letterSpacing: 0.5 },
   name: { fontSize: font.lg, fontWeight: "700", color: colors.onSurface },
@@ -1737,16 +2373,72 @@ const styles = StyleSheet.create({
   docChip: { flexShrink: 0, paddingHorizontal: spacing.md, height: 36, justifyContent: "center", borderRadius: radius.pill, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border, maxWidth: 200 },
   docChipActive: { backgroundColor: colors.brandPrimary, borderColor: colors.brandPrimary },
   docChipText: { fontSize: font.sm, color: colors.onSurface, fontWeight: "500" },
-  kpiRow: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm, padding: spacing.lg, paddingBottom: 0 },
-  kpiCard: { flex: 1, minWidth: "22%", backgroundColor: colors.surface, padding: spacing.sm, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, alignItems: "center" },
+  kpiRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: spacing.sm,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    paddingBottom: 0,
+  },
+  kpiCard: {
+    flex: 1,
+    minWidth: 100,
+    backgroundColor: colors.surface,
+    padding: spacing.sm,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: "center",
+  },
+  kpiCardSmall: {
+    flexBasis: "47%",
+    flexGrow: 1,
+    minWidth: "45%",
+    maxWidth: "49%",
+  },
   kpiLabel: { fontSize: 11, color: colors.muted },
   kpiValue: { fontSize: font.xl, fontWeight: "800", color: colors.onSurface },
-  scroll: { padding: spacing.lg, gap: spacing.md, paddingBottom: 140 },
+  scroll: { padding: spacing.lg, gap: spacing.md, paddingBottom: 160 },
+  shiftCardWrap: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    justifyContent: "space-between",
+    alignItems: "center",
+    backgroundColor: colors.surface,
+    padding: spacing.md,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    marginBottom: spacing.md,
+    gap: spacing.sm,
+  },
+  manageShiftsBtn: {
+    backgroundColor: colors.brandPrimary,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 8,
+    borderRadius: radius.md,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
   sectionHeaderRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
     marginTop: spacing.xs,
+    flexWrap: "wrap",
+    gap: spacing.sm,
+  },
+  sectionHeaderTitleCol: {
+    flexShrink: 1,
+    minWidth: 160,
+  },
+  sectionHeaderActionsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
   },
   sectionTitle: { fontSize: font.base, fontWeight: "700", color: colors.onSurface },
   sectionSub: { fontSize: font.xs, color: colors.muted, marginTop: 1 },
@@ -1812,40 +2504,57 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   actionsContainer: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 6,
     paddingTop: 8,
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: colors.border,
+    gap: 8,
   },
-  actionColBtn: {
+  primaryActionBtn: {
+    flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    paddingVertical: 6,
-    paddingHorizontal: 10,
+    backgroundColor: colors.brandPrimary,
+    borderRadius: radius.sm,
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+    gap: 6,
+  },
+  primaryActionBtnLabel: {
+    fontSize: font.sm,
+    fontWeight: "700",
+    color: "#fff",
+  },
+  secondaryActionsRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+  },
+  actionColBtn: {
+    flex: 1,
+    minWidth: 70,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 7,
+    paddingHorizontal: 8,
     borderRadius: radius.sm,
     borderWidth: 1,
     borderColor: colors.border,
     backgroundColor: colors.surface,
     gap: 2,
-    minWidth: 64,
-  },
-  actionColBtnPrimary: {
-    backgroundColor: colors.brandPrimary,
-    borderColor: colors.brandPrimary,
   },
   actionColBtnSuccess: {
-    backgroundColor: "#059669",
-    borderColor: "#059669",
-    flex: 1,
     flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#059669",
+    borderRadius: radius.sm,
     paddingVertical: 10,
+    paddingHorizontal: 14,
     gap: 8,
   },
   actionColBtnLabel: {
-    fontSize: 9,
-    fontWeight: "700",
+    fontSize: 10,
+    fontWeight: "600",
     color: colors.onSurface,
     textAlign: "center",
   },
@@ -1926,11 +2635,49 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#065F46",
   },
-  fabRow: { position: "absolute", bottom: 24, left: 20, right: 20, flexDirection: "row", justifyContent: "space-between", gap: spacing.sm },
-  fab: { flex: 1, paddingHorizontal: spacing.lg, paddingVertical: spacing.md, borderRadius: radius.pill, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, elevation: 4, shadowColor: "#000", shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.2, shadowRadius: 8 },
+  fabRow: {
+    position: "absolute",
+    bottom: 24,
+    left: 20,
+    right: 20,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: spacing.sm,
+  },
+  fab: {
+    flex: 1,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+    borderRadius: radius.pill,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    elevation: 4,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+  },
   fabText: { color: "#fff", fontWeight: "700", fontSize: font.base },
   empty: { alignItems: "center", padding: spacing.xxl, gap: spacing.md },
-  emptyText: { color: colors.muted, fontSize: font.base, textAlign: "center" },
+  emptyTitle: { fontSize: font.lg, fontWeight: "700", color: colors.onSurface, textAlign: "center" },
+  emptyText: { color: colors.muted, fontSize: font.base, textAlign: "center", maxWidth: 400 },
+  retryPrimaryBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: colors.brandPrimary,
+    paddingHorizontal: spacing.xl,
+    paddingVertical: 12,
+    borderRadius: radius.md,
+    marginTop: spacing.sm,
+  },
+  retryPrimaryBtnText: {
+    color: "#fff",
+    fontSize: font.base,
+    fontWeight: "700",
+  },
   modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
   sheet: { backgroundColor: colors.surface, padding: spacing.lg, borderTopLeftRadius: 24, borderTopRightRadius: 24, gap: spacing.sm, paddingBottom: spacing.xxl },
   sheetHandle: { width: 40, height: 4, backgroundColor: colors.borderStrong, borderRadius: 2, alignSelf: "center", marginBottom: spacing.md },
@@ -1967,6 +2714,22 @@ const styles = StyleSheet.create({
     fontSize: font.xs,
     fontWeight: "700",
     color: "#0F766E",
+  },
+  autoReferBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: "#F5F3FF",
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 6,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    borderColor: "#DDD6FE",
+  },
+  autoReferBtnText: {
+    fontSize: font.xs,
+    fontWeight: "700",
+    color: "#7C3AED",
   },
   etaRow: {
     flexDirection: "row",
@@ -2032,5 +2795,78 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: "700",
     color: colors.brandPrimary,
+  },
+  sessionBarPlaceholder: {
+    minHeight: 120,
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    marginBottom: spacing.md,
+    justifyContent: "center",
+    alignItems: "center",
+    gap: spacing.sm,
+    padding: spacing.md,
+  },
+  sessionBarPlaceholderText: {
+    fontSize: font.sm,
+    color: colors.muted,
+    textAlign: "center",
+  },
+  sessionErrorTitle: {
+    fontSize: font.base,
+    fontWeight: "700",
+    color: colors.error,
+    textAlign: "center",
+  },
+  sessionErrorDesc: {
+    fontSize: font.xs,
+    color: colors.muted,
+    textAlign: "center",
+    maxWidth: 360,
+  },
+  sessionRetryBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    borderColor: colors.brandPrimary,
+    backgroundColor: colors.surface,
+    marginTop: 4,
+  },
+  sessionRetryBtnText: {
+    fontSize: font.xs,
+    fontWeight: "700",
+    color: colors.brandPrimary,
+  },
+  sessionEmptyTitle: {
+    fontSize: font.base,
+    fontWeight: "700",
+    color: colors.onSurface,
+    textAlign: "center",
+  },
+  sessionEmptyDesc: {
+    fontSize: font.xs,
+    color: colors.muted,
+    textAlign: "center",
+    maxWidth: 380,
+  },
+  sessionManageBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: colors.brandPrimary,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: radius.md,
+    marginTop: 4,
+  },
+  sessionManageBtnText: {
+    fontSize: font.sm,
+    fontWeight: "700",
+    color: "#fff",
   },
 });

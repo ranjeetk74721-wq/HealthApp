@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import {
   View,
   Text,
@@ -39,46 +39,101 @@ const STANDARD_REASONS = [
   { key: "other", label: "Other: enter a custom message / अन्य (कस्टम संदेश)" },
 ];
 
-// Parse a 12-hour time string like "10:30 AM" → { h: 10, m: 30, meridiem: "AM" } | null
-function parseTime12(str: string): { h: number; m: number; meridiem: "AM" | "PM" } | null {
-  if (!str) return null;
-  const clean = str.trim().toUpperCase();
-  const match = clean.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/);
-  if (!match) return null;
-  const h = parseInt(match[1], 10);
-  const m = parseInt(match[2] || "0", 10);
-  const meridiem = match[3] as "AM" | "PM";
-  if (h < 1 || h > 12 || m < 0 || m > 59) return null;
-  return { h, m, meridiem };
+// Format { h, m, meridiem } → "10:30 AM" or "03:00 PM"
+function formatTime12(h: number, m: number, meridiem: "AM" | "PM"): string {
+  const hPad = h < 10 ? `0${h}` : `${h}`;
+  const minPad = m < 10 ? `0${m}` : `${m}`;
+  return `${hPad}:${minPad} ${meridiem}`;
 }
 
-// Format { h, m, meridiem } → "10:30 AM"
-function formatTime12(h: number, m: number, meridiem: "AM" | "PM"): string {
-  const minPad = m < 10 ? `0${m}` : `${m}`;
-  return `${h}:${minPad} ${meridiem}`;
+// Parse user typed time string with optional meridiem.
+// Flexible: accepts "03:00 PM", "3:00 PM", "3:00", "03:00", "3", "3:30", "15:00", "10:30 AM".
+function parseTimeInput(
+  val: string,
+  fallbackMeridiem: "AM" | "PM" = "AM"
+): {
+  h: number;
+  m: number;
+  meridiem: "AM" | "PM";
+  formatted12: string;
+  explicitMeridiem?: "AM" | "PM";
+} | null {
+  if (!val) return null;
+  const clean = val.trim().toUpperCase().replace(/\s+/g, " ");
+  if (!clean) return null;
+
+  const match = clean.match(/^(\d{1,2})(?::(\d{1,2}))?\s*(AM|PM)?$/);
+  if (!match) return null;
+
+  let h = parseInt(match[1], 10);
+  const m = match[2] !== undefined ? parseInt(match[2], 10) : 0;
+  const explicitMeridiem = match[3] as ("AM" | "PM" | undefined);
+
+  if (m < 0 || m > 59) return null;
+
+  // 24-hr format handling (e.g. 15:00 -> 03:00 PM, 00:30 -> 12:30 AM)
+  if (h === 0) {
+    return {
+      h: 12,
+      m,
+      meridiem: "AM",
+      formatted12: formatTime12(12, m, "AM"),
+      explicitMeridiem: "AM",
+    };
+  }
+  if (h > 12 && h < 24) {
+    const h12 = h - 12;
+    return {
+      h: h12,
+      m,
+      meridiem: "PM",
+      formatted12: formatTime12(h12, m, "PM"),
+      explicitMeridiem: "PM",
+    };
+  }
+
+  if (h < 1 || h > 12) return null;
+
+  const meridiem = explicitMeridiem || fallbackMeridiem;
+  return {
+    h,
+    m,
+    meridiem,
+    formatted12: formatTime12(h, m, meridiem),
+    explicitMeridiem,
+  };
+}
+
+function validateTimeInput(val: string, fallbackMeridiem: "AM" | "PM" = "AM"): string | null {
+  if (!val || !val.trim()) return null;
+  const parsed = parseTimeInput(val, fallbackMeridiem);
+  if (!parsed) return "Enter a valid time: e.g. 03:00 PM or 10:30 AM";
+  return null;
 }
 
 // Add minutes to a 12-hour time string → new 12-hour string
 function addMinutesToTime(timeStr: string, minutes: number): string {
-  const parsed = parseTime12(timeStr);
+  const parsed = parseTimeInput(timeStr, "AM");
   if (!parsed) return timeStr || "10:00 AM";
   let { h, m, meridiem } = parsed;
-  let h24 = h % 12 + (meridiem === "PM" ? 12 : 0);
+  let h24 = (h % 12) + (meridiem === "PM" ? 12 : 0);
   const totalMin = h24 * 60 + m + minutes;
-  const newH24 = Math.floor(totalMin / 60) % 24;
-  const newMin = totalMin % 60;
+  const newH24 = (Math.floor(totalMin / 60) % 24 + 24) % 24;
+  const newMin = (totalMin % 60 + 60) % 60;
   const newMeridiem: "AM" | "PM" = newH24 >= 12 ? "PM" : "AM";
   let newH12 = newH24 % 12;
   if (newH12 === 0) newH12 = 12;
   return formatTime12(newH12, newMin, newMeridiem);
 }
 
-// Validate a typed time string — returns error message or null
-function validateTimeInput(val: string): string | null {
-  if (!val.trim()) return null; // empty ok — caller validates required
-  const parsed = parseTime12(val);
-  if (!parsed) return "Use 12-hour format: e.g. 10:30 AM or 03:00 PM";
-  return null;
+// Calculate minute difference between two 12-hour time strings
+function getMinuteDifference(startStr: string, endStr: string): number {
+  const pStart = parseTimeInput(startStr, "AM");
+  const pEnd = parseTimeInput(endStr, "AM");
+  if (!pStart || !pEnd) return 0;
+  const startMin = (pStart.h % 12 + (pStart.meridiem === "PM" ? 12 : 0)) * 60 + pStart.m;
+  const endMin = (pEnd.h % 12 + (pEnd.meridiem === "PM" ? 12 : 0)) * 60 + pEnd.m;
+  return endMin - startMin;
 }
 
 export default function DoctorTimingAdjustmentModal({
@@ -93,8 +148,7 @@ export default function DoctorTimingAdjustmentModal({
   const sessionStarted = Boolean(sessionData?.actual_start_time);
 
   // ── State ─────────────────────────────────────────────────────────────────
-  // Editable Scheduled Start (updates original_start_time in DB)
-  const [editingScheduled, setEditingScheduled] = useState(false);
+  // Scheduled Start state (original_start_time)
   const [scheduledStartInput, setScheduledStartInput] = useState("");
   const [scheduledAMPM, setScheduledAMPM] = useState<"AM" | "PM">("AM");
   const [scheduledInputError, setScheduledInputError] = useState<string | null>(null);
@@ -105,6 +159,8 @@ export default function DoctorTimingAdjustmentModal({
   const [customTime, setCustomTime] = useState("");
   const [customTimeAMPM, setCustomTimeAMPM] = useState<"AM" | "PM">("AM");
   const [customTimeError, setCustomTimeError] = useState<string | null>(null);
+  // Preserved active delay delta (in minutes) if doctor was already delayed
+  const [activeDelayDelta, setActiveDelayDelta] = useState<number>(0);
 
   // Reason
   const [selectedReasonKey, setSelectedReasonKey] = useState("emergency");
@@ -117,54 +173,31 @@ export default function DoctorTimingAdjustmentModal({
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // ── Derived values (local, no server round-trip) ───────────────────────────
-  // Use editingScheduled value if changed, otherwise fall back to session
-  const resolvedScheduledStart = (() => {
-    if (editingScheduled && scheduledStartInput.trim()) {
-      const err = validateTimeInput(scheduledStartInput.trim());
-      if (!err) {
-        const raw = scheduledStartInput.trim();
-        // Ensure correct AM/PM if user didn't type it
-        if (!/AM|PM/i.test(raw)) return `${raw} ${scheduledAMPM}`;
-        return raw.toUpperCase().replace(/am/i, "AM").replace(/pm/i, "PM");
-      }
-    }
-    return sessionData?.original_start_time || "10:00 AM";
-  })();
-
-  // What time the shortcuts calculate FROM — always latest Scheduled Start
-  const shortcutBase = resolvedScheduledStart;
-
-  // The final expected time to submit
-  const targetExpectedTime = (() => {
-    if (returnTimeUnconfirmed) return null;
-    if (selectedMinutes !== null) return addMinutesToTime(shortcutBase, selectedMinutes);
-    const raw = customTime.trim();
-    if (raw) {
-      if (!/AM|PM/i.test(raw)) return `${raw} ${customTimeAMPM}`;
-      return raw.toUpperCase().replace(/am/i, "AM").replace(/pm/i, "PM");
-    }
-    return sessionData?.expected_start_time || shortcutBase;
-  })();
-
   // ── Reset on open ──────────────────────────────────────────────────────────
   useEffect(() => {
     if (!visible) return;
     const origStart = sessionData?.original_start_time || "10:00 AM";
     const currentExp = sessionData?.expected_start_time || origStart;
-    const isUnconfirmed = Boolean(sessionData?.return_time_unconfirmed);
+    const isUnconfirmed = Boolean(sessionData?.return_time_unconfirmed || sessionData?.start_time_unconfirmed);
 
-    setEditingScheduled(false);
-    setScheduledStartInput(origStart);
-    // Parse AM/PM from existing value
-    const parsedOrig = parseTime12(origStart);
+    // Parse Scheduled Start
+    const parsedOrig = parseTimeInput(origStart, "AM");
+    setScheduledStartInput(parsedOrig ? formatTime12(parsedOrig.h, parsedOrig.m, parsedOrig.meridiem) : origStart);
     setScheduledAMPM(parsedOrig?.meridiem || "AM");
     setScheduledInputError(null);
 
+    // Compute existing active delay difference
+    const diff = getMinuteDifference(origStart, currentExp);
+    const existingDelay = diff > 0 ? diff : 0;
+    setActiveDelayDelta(existingDelay);
+
+    // Check if current delay matches one of the shortcut buttons
+    const matchingShortcut = DELAY_SHORTCUTS.find((s) => s.minutes === existingDelay);
+    setSelectedMinutes(matchingShortcut ? matchingShortcut.minutes : null);
+
     setReturnTimeUnconfirmed(isUnconfirmed);
-    setSelectedMinutes(null);
-    setCustomTime(isUnconfirmed ? "" : currentExp);
-    const parsedExp = parseTime12(isUnconfirmed ? currentExp : currentExp);
+    const parsedExp = parseTimeInput(currentExp, "AM");
+    setCustomTime(isUnconfirmed ? "" : (parsedExp ? formatTime12(parsedExp.h, parsedExp.m, parsedExp.meridiem) : currentExp));
     setCustomTimeAMPM(parsedExp?.meridiem || "AM");
     setCustomTimeError(null);
 
@@ -189,32 +222,110 @@ export default function DoctorTimingAdjustmentModal({
     setError(null);
   }, [visible, sessionData]);
 
+  // ── Derived Scheduled Start (purely local, instant) ────────────────────────
+  const resolvedScheduledStart = useMemo(() => {
+    if (sessionStarted) {
+      return sessionData?.original_start_time || "10:00 AM";
+    }
+    if (scheduledStartInput.trim()) {
+      const parsed = parseTimeInput(scheduledStartInput.trim(), scheduledAMPM);
+      if (parsed) return parsed.formatted12;
+    }
+    return sessionData?.original_start_time || "10:00 AM";
+  }, [scheduledStartInput, scheduledAMPM, sessionStarted, sessionData]);
+
+  // Baseline for shortcuts: always latest Scheduled Start
+  const shortcutBase = resolvedScheduledStart;
+
+  // The final expected time to submit / preview
+  const targetExpectedTime = useMemo(() => {
+    if (returnTimeUnconfirmed) return null;
+
+    // Shortcut has precedence if actively clicked
+    if (selectedMinutes !== null) {
+      return addMinutesToTime(shortcutBase, selectedMinutes);
+    }
+
+    // Explicit custom time entered by user
+    if (customTime.trim()) {
+      const parsed = parseTimeInput(customTime.trim(), customTimeAMPM);
+      if (parsed) return parsed.formatted12;
+    }
+
+    // Preserve active delay delta if one was active previously
+    if (activeDelayDelta > 0) {
+      return addMinutesToTime(shortcutBase, activeDelayDelta);
+    }
+
+    // When no delay active, Current Expected follows Scheduled Start
+    return shortcutBase;
+  }, [returnTimeUnconfirmed, selectedMinutes, shortcutBase, customTime, customTimeAMPM, activeDelayDelta]);
+
   // ── Handlers ───────────────────────────────────────────────────────────────
   const handleShortcutPress = useCallback((mins: number) => {
     if (selectedMinutes === mins) {
-      // Toggle off — clear shortcut, keep typed value or fall back to current expected
+      // Toggle off — clear shortcut, clear active delay, revert Expected to Scheduled Start
       setSelectedMinutes(null);
-      setCustomTime(sessionData?.expected_start_time || resolvedScheduledStart);
+      setActiveDelayDelta(0);
+      setCustomTime(shortcutBase);
+      const p = parseTimeInput(shortcutBase, "AM");
+      if (p) setCustomTimeAMPM(p.meridiem);
     } else {
       setSelectedMinutes(mins);
+      setActiveDelayDelta(mins);
       const computed = addMinutesToTime(shortcutBase, mins);
       setCustomTime(computed);
-      const p = parseTime12(computed);
+      const p = parseTimeInput(computed, "AM");
       if (p) setCustomTimeAMPM(p.meridiem);
     }
-  }, [selectedMinutes, shortcutBase, sessionData, resolvedScheduledStart]);
+  }, [selectedMinutes, shortcutBase]);
 
   const handleCustomTimeChange = (text: string) => {
-    setSelectedMinutes(null); // typing clears shortcut selection
+    // Typing clears shortcut selection and preserved delta
+    setSelectedMinutes(null);
+    setActiveDelayDelta(0);
     setCustomTime(text);
-    setCustomTimeError(validateTimeInput(text));
+
+    // Auto-detect AM/PM typed in text
+    const parsed = parseTimeInput(text, customTimeAMPM);
+    if (parsed && parsed.explicitMeridiem) {
+      setCustomTimeAMPM(parsed.explicitMeridiem);
+    }
+    setCustomTimeError(validateTimeInput(text, customTimeAMPM));
   };
 
   const handleScheduledStartChange = (text: string) => {
     setScheduledStartInput(text);
-    setScheduledInputError(validateTimeInput(text));
-    // When scheduled start changes, clear shortcut so preview recalculates
+    // Auto-detect AM/PM typed in text
+    const parsed = parseTimeInput(text, scheduledAMPM);
+    if (parsed && parsed.explicitMeridiem) {
+      setScheduledAMPM(parsed.explicitMeridiem);
+    }
+    setScheduledInputError(validateTimeInput(text, scheduledAMPM));
+  };
+
+  const handleScheduledAMPMChange = (period: "AM" | "PM") => {
+    setScheduledAMPM(period);
+    // If input already has text, revalidate with new period
+    if (scheduledStartInput.trim()) {
+      const parsed = parseTimeInput(scheduledStartInput.trim(), period);
+      if (parsed) {
+        setScheduledStartInput(formatTime12(parsed.h, parsed.m, period));
+        setScheduledInputError(null);
+      }
+    }
+  };
+
+  const handleCustomAMPMChange = (period: "AM" | "PM") => {
+    setCustomTimeAMPM(period);
     setSelectedMinutes(null);
+    if (customTime.trim()) {
+      const parsed = parseTimeInput(customTime.trim(), period);
+      if (parsed) {
+        setCustomTime(formatTime12(parsed.h, parsed.m, period));
+        setCustomTimeError(null);
+      }
+    }
   };
 
   const getResolvedReason = (): string => {
@@ -222,50 +333,53 @@ export default function DoctorTimingAdjustmentModal({
     return STANDARD_REASONS.find((r) => r.key === selectedReasonKey)?.label || customReasonText.trim();
   };
 
-  // ── Preview (purely local — no API call) ───────────────────────────────────
+  // ── Preview (purely local — 0ms roundtrip) ─────────────────────────────────
   const previewExpected = returnTimeUnconfirmed
     ? "Time Awaited"
     : targetExpectedTime || resolvedScheduledStart;
 
   const previewReason = getResolvedReason() || "Doctor is delayed";
 
-  // Show preview of queue impact: Scheduled Start changed → all ETAs shift
-  const scheduledChanged =
-    editingScheduled &&
-    scheduledStartInput.trim() &&
-    !scheduledInputError &&
+  const isScheduledChanged =
+    !sessionStarted &&
     resolvedScheduledStart !== (sessionData?.original_start_time || "10:00 AM");
 
-  // Example 5-min interval preview for first 3 patients
-  const previewPatientETAs = (() => {
+  const isDelayActive =
+    returnTimeUnconfirmed ||
+    (targetExpectedTime && targetExpectedTime !== resolvedScheduledStart) ||
+    Boolean(sessionData?.delay_reason);
+
+  // Preview ETAs with rolling 30-min window for first 3 waiting patients
+  const previewPatientETAs = useMemo(() => {
     if (returnTimeUnconfirmed || !previewExpected || previewExpected === "Time Awaited") return null;
-    const base = resolvedScheduledStart;
-    const expTime = targetExpectedTime || base;
-    // Use whichever is later: scheduled start or expected time
-    const baseForQueue = expTime;
-    return [0, 1, 2].map((i) => ({
-      token: i + 1,
-      eta: addMinutesToTime(baseForQueue, i * 5),
-    }));
-  })();
+    const baseForQueue = targetExpectedTime || resolvedScheduledStart;
+    return [0, 1, 2].map((i) => {
+      const startEta = addMinutesToTime(baseForQueue, i * 5);
+      const endEta = addMinutesToTime(startEta, 30);
+      return {
+        token: i + 1,
+        eta: `${startEta} – ${endEta}`,
+      };
+    });
+  }, [returnTimeUnconfirmed, previewExpected, targetExpectedTime, resolvedScheduledStart]);
 
   // ── Save ───────────────────────────────────────────────────────────────────
   const handleSave = async () => {
     setError(null);
     setSuccessMsg(null);
 
-    // Validate scheduled start if being edited
-    if (editingScheduled && scheduledStartInput.trim()) {
-      const err = validateTimeInput(scheduledStartInput.trim());
+    // Validate scheduled start if session not started
+    if (!sessionStarted && scheduledStartInput.trim()) {
+      const err = validateTimeInput(scheduledStartInput.trim(), scheduledAMPM);
       if (err) {
         setScheduledInputError(err);
         return;
       }
     }
 
-    // Validate expected time if set
+    // Validate expected time if not unconfirmed
     if (!returnTimeUnconfirmed && customTime.trim()) {
-      const err = validateTimeInput(customTime.trim());
+      const err = validateTimeInput(customTime.trim(), customTimeAMPM);
       if (err) {
         setCustomTimeError(err);
         return;
@@ -296,23 +410,16 @@ export default function DoctorTimingAdjustmentModal({
         return_time_unconfirmed: returnTimeUnconfirmed,
       };
 
-      // Editable Scheduled Start — send only if changed and session not yet started
-      if (editingScheduled && scheduledStartInput.trim() && !scheduledInputError && !sessionStarted) {
-        const raw = scheduledStartInput.trim();
-        payload.new_scheduled_start_time = /AM|PM/i.test(raw)
-          ? raw.toUpperCase().replace(/am/i, "AM").replace(/pm/i, "PM")
-          : `${raw} ${scheduledAMPM}`;
+      // Send new_scheduled_start_time if session has not started and value changed
+      if (!sessionStarted && isScheduledChanged) {
+        payload.new_scheduled_start_time = resolvedScheduledStart;
       }
 
       if (!returnTimeUnconfirmed) {
-        // If shortcut selected, send delay_minutes (backend calculates from new scheduled start)
         if (selectedMinutes !== null) {
           payload.delay_minutes = selectedMinutes;
-        } else if (customTime.trim()) {
-          const raw = customTime.trim();
-          payload.new_start_time = /AM|PM/i.test(raw)
-            ? raw.toUpperCase().replace(/am/i, "AM").replace(/pm/i, "PM")
-            : `${raw} ${customTimeAMPM}`;
+        } else if (targetExpectedTime) {
+          payload.new_start_time = targetExpectedTime;
         }
       }
 
@@ -321,7 +428,7 @@ export default function DoctorTimingAdjustmentModal({
       setTimeout(() => {
         onSuccess(res.session);
         onClose();
-      }, 700);
+      }, 600);
     } catch (err: any) {
       if (err?.isTimeout || err?.name === "TimeoutError") {
         // A client timeout does not prove the server failed to save.
@@ -392,6 +499,10 @@ export default function DoctorTimingAdjustmentModal({
         behavior={Platform.OS === "ios" ? "padding" : undefined}
         style={styles.backdrop}
       >
+        <Pressable
+          style={StyleSheet.absoluteFill}
+          onPress={() => { if (!loading && !verifyingServerState) onClose(); }}
+        />
         <View style={styles.modalCard}>
           {/* ── Header ── */}
           <View style={styles.header}>
@@ -401,137 +512,141 @@ export default function DoctorTimingAdjustmentModal({
                 {doctorName} · {sessionData?.date || "Today"}
               </Text>
             </View>
-            <Pressable onPress={() => { if (!loading && !verifyingServerState) onClose(); }} style={styles.closeBtn} testID="close-timing-modal">
+            <Pressable
+              onPress={() => { if (!loading && !verifyingServerState) onClose(); }}
+              style={styles.closeBtn}
+              testID="close-timing-modal"
+              hitSlop={10}
+            >
               <Ionicons name="close" size={22} color={colors.onSurfaceSecondary} />
             </Pressable>
           </View>
 
           <ScrollView style={styles.scroll} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
 
-            {/* ── Section 1: Scheduled Start (editable) ── */}
+            {/* ── Status & Baseline Overview (Always Visible) ── */}
+            <View style={styles.baselineCard}>
+              <View style={styles.baselineCol}>
+                <Text style={styles.baselineLabel}>Scheduled Start</Text>
+                <Text style={styles.baselineValue}>{origStart}</Text>
+              </View>
+
+              <Ionicons name="arrow-forward" size={16} color={colors.muted} />
+
+              <View style={styles.baselineCol}>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+                  <Text style={styles.baselineLabel}>Current Expected</Text>
+                  {(sessionData?.return_time_unconfirmed || sessionData?.delay_reason) && (
+                    <View style={styles.delayedPill}>
+                      <Text style={styles.delayedPillText}>
+                        {sessionData?.return_time_unconfirmed ? "AWAITED" : "DELAYED"}
+                      </Text>
+                    </View>
+                  )}
+                </View>
+                <Text style={[
+                  styles.baselineValue,
+                  sessionData?.return_time_unconfirmed
+                    ? { color: "#D97706" }
+                    : sessionData?.delay_reason
+                    ? { color: colors.brandPrimary }
+                    : {},
+                ]}>
+                  {sessionData?.return_time_unconfirmed ? "Time Awaited" : currentExpected}
+                </Text>
+              </View>
+
+              <View style={[styles.statusPill, {
+                backgroundColor: sessionData?.status === "in_consultation" ? "#D1FAE5" :
+                  sessionData?.status === "paused" ? "#FEF3C7" : "#E0E7FF",
+              }]}>
+                <Text style={[styles.statusText, {
+                  color: sessionData?.status === "in_consultation" ? "#065F46" :
+                    sessionData?.status === "paused" ? "#92400E" : "#4338CA",
+                }]}>
+                  {(sessionData?.status || "not_started").replace("_", " ").toUpperCase()}
+                </Text>
+              </View>
+            </View>
+
+            {/* ── Section 1: Scheduled Start Editing ── */}
             <View style={styles.section}>
               <View style={styles.sectionHeaderRow}>
-                <Text style={styles.sectionTitle}>Scheduled Start</Text>
-                {!sessionStarted && (
-                  <Pressable
-                    onPress={() => setEditingScheduled(!editingScheduled)}
-                    style={styles.editToggleBtn}
-                    testID="edit-scheduled-start-btn"
-                  >
-                    <Ionicons
-                      name={editingScheduled ? "close-circle-outline" : "create-outline"}
-                      size={16}
-                      color={colors.brandPrimary}
-                    />
-                    <Text style={styles.editToggleBtnText}>
-                      {editingScheduled ? "Cancel Edit" : "Edit"}
-                    </Text>
-                  </Pressable>
+                <Text style={styles.sectionTitle}>Daily Scheduled Start (नियत समय)</Text>
+                {sessionStarted && (
+                  <View style={styles.lockedBadge}>
+                    <Ionicons name="lock-closed" size={12} color={colors.muted} />
+                    <Text style={styles.lockedBadgeText}>Locked</Text>
+                  </View>
                 )}
               </View>
 
-              {editingScheduled && !sessionStarted ? (
-                <View style={styles.timeInputRow}>
-                  <TextInput
-                    style={[styles.timeInput, scheduledInputError ? styles.inputError : null]}
-                    value={scheduledStartInput}
-                    onChangeText={handleScheduledStartChange}
-                    placeholder="e.g. 10:00"
-                    placeholderTextColor={colors.muted}
-                    keyboardType="numbers-and-punctuation"
-                    testID="scheduled-start-input"
-                    autoCorrect={false}
-                  />
-                  <View style={styles.ampmRow}>
-                    {(["AM", "PM"] as const).map((period) => (
-                      <Pressable
-                        key={period}
-                        onPress={() => {
-                          setScheduledAMPM(period);
-                          setSelectedMinutes(null);
-                        }}
-                        style={[styles.ampmBtn, scheduledAMPM === period && styles.ampmBtnActive]}
-                        testID={`scheduled-ampm-${period}`}
-                      >
-                        <Text style={[styles.ampmText, scheduledAMPM === period && styles.ampmTextActive]}>
-                          {period}
-                        </Text>
-                      </Pressable>
-                    ))}
-                  </View>
-                </View>
-              ) : (
-                <View style={styles.baselineCard}>
-                  <View style={styles.baselineCol}>
-                    <Text style={styles.baselineLabel}>Scheduled Start</Text>
-                    <Text style={styles.baselineValue}>{origStart}</Text>
-                  </View>
-                  <Ionicons name="arrow-forward" size={16} color={colors.muted} />
-                  <View style={styles.baselineCol}>
-                    <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-                      <Text style={styles.baselineLabel}>Current Expected</Text>
-                      {(sessionData?.return_time_unconfirmed || sessionData?.delay_reason) && (
-                        <View style={styles.delayedPill}>
-                          <Text style={styles.delayedPillText}>
-                            {sessionData?.return_time_unconfirmed ? "AWAITED" : "DELAYED"}
-                          </Text>
-                        </View>
-                      )}
-                    </View>
-                    <Text style={[
-                      styles.baselineValue,
-                      sessionData?.return_time_unconfirmed
-                        ? { color: "#D97706" }
-                        : sessionData?.delay_reason
-                        ? { color: colors.brandPrimary }
-                        : {},
-                    ]}>
-                      {sessionData?.return_time_unconfirmed ? "Time Awaited" : currentExpected}
-                    </Text>
-                  </View>
-                  <View style={[styles.statusPill, {
-                    backgroundColor: sessionData?.status === "in_consultation" ? "#D1FAE5" :
-                      sessionData?.status === "paused" ? "#FEF3C7" : "#E0E7FF",
-                  }]}>
-                    <Text style={[styles.statusText, {
-                      color: sessionData?.status === "in_consultation" ? "#065F46" :
-                        sessionData?.status === "paused" ? "#92400E" : "#4338CA",
-                    }]}>
-                      {(sessionData?.status || "not_started").replace("_", " ").toUpperCase()}
-                    </Text>
-                  </View>
-                </View>
-              )}
-
-              {scheduledInputError && (
-                <Text style={styles.fieldError}>{scheduledInputError}</Text>
-              )}
-
-              {editingScheduled && !sessionStarted && (
-                <View style={styles.infoNotice}>
-                  <Ionicons name="information-circle-outline" size={14} color={colors.brandPrimary} />
-                  <Text style={styles.infoNoticeText}>
-                    Updates the daily Scheduled Start for today only. Queue estimates and delay shortcuts will recalculate from this new baseline. Does not affect recurring schedules or other dates.
+              {!sessionStarted ? (
+                <>
+                  <Text style={styles.fieldHelpText}>
+                    Directly type doctor's start time for today (e.g. 03:00 PM or 10:00).
                   </Text>
-                </View>
-              )}
+                  <View style={styles.timeInputRow}>
+                    <TextInput
+                      style={[styles.timeInput, scheduledInputError ? styles.inputError : null]}
+                      value={scheduledStartInput}
+                      onChangeText={handleScheduledStartChange}
+                      placeholder="e.g. 03:00 PM"
+                      placeholderTextColor={colors.muted}
+                      keyboardType="numbers-and-punctuation"
+                      testID="scheduled-start-input"
+                      autoCorrect={false}
+                    />
+                    <View style={styles.ampmRow}>
+                      {(["AM", "PM"] as const).map((period) => (
+                        <Pressable
+                          key={period}
+                          onPress={() => handleScheduledAMPMChange(period)}
+                          style={[styles.ampmBtn, scheduledAMPM === period && styles.ampmBtnActive]}
+                          testID={`scheduled-ampm-${period}`}
+                        >
+                          <Text style={[styles.ampmText, scheduledAMPM === period && styles.ampmTextActive]}>
+                            {period}
+                          </Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                  </View>
+                  {scheduledInputError ? (
+                    <Text style={styles.fieldError}>{scheduledInputError}</Text>
+                  ) : null}
 
-              {sessionStarted && (
+                  <View style={styles.infoNotice}>
+                    <Ionicons name="information-circle-outline" size={14} color={colors.brandPrimary} />
+                    <Text style={styles.infoNoticeText}>
+                      Applies only to this doctor, date, and session. Delay shortcuts and queue estimates recalculate from this new baseline. Recurring doctor schedules and other dates remain untouched.
+                    </Text>
+                  </View>
+                </>
+              ) : (
                 <View style={styles.lockedNotice}>
-                  <Ionicons name="lock-closed-outline" size={14} color={colors.muted} />
+                  <Ionicons name="lock-closed-outline" size={16} color={colors.muted} />
                   <Text style={styles.lockedNoticeText}>
-                    Scheduled Start is locked — consultation has already begun. Use delay shortcuts or enter a specific time below to adjust the Expected time.
+                    Scheduled Start is locked ({origStart}) because consultation has already begun. Remaining queue estimates calculate from actual progress and delay adjustments below.
                   </Text>
                 </View>
               )}
             </View>
 
-            {/* ── Section 2: Return Time Unconfirmed Toggle ── */}
+            {/* ── Section 2: Expected Availability & Delay Shortcuts ── */}
             <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Expected Availability</Text>
+              <Text style={styles.sectionTitle}>Expected Availability (अनुमानित उपलब्धता)</Text>
+
+              {/* Return Time Unconfirmed Checkbox */}
               <Pressable
                 testID="toggle-unconfirmed-time"
-                onPress={() => setReturnTimeUnconfirmed(!returnTimeUnconfirmed)}
+                onPress={() => {
+                  const nextVal = !returnTimeUnconfirmed;
+                  setReturnTimeUnconfirmed(nextVal);
+                  if (nextVal) {
+                    setSelectedMinutes(null);
+                  }
+                }}
                 style={[styles.unconfirmedToggle, returnTimeUnconfirmed && styles.unconfirmedToggleActive]}
               >
                 <Ionicons
@@ -544,7 +659,7 @@ export default function DoctorTimingAdjustmentModal({
                     Return time not confirmed / समय अभी तय नहीं है
                   </Text>
                   <Text style={styles.unconfirmedSub}>
-                    Select this if the doctor cannot give a reliable return time yet. Patients will see a "Time Awaited" notice instead of an incorrect ETA.
+                    Select this if doctor return/availability time is uncertain. Patients see a "Time Awaited" notice instead of an inaccurate ETA.
                   </Text>
                 </View>
               </Pressable>
@@ -553,7 +668,7 @@ export default function DoctorTimingAdjustmentModal({
                 <View style={styles.unconfirmedNotice}>
                   <Ionicons name="time" size={16} color="#D97706" />
                   <Text style={styles.unconfirmedNoticeText}>
-                    Patients will see: "Doctor is unavailable — consultation resume time not yet confirmed. Your estimated turn will update once the clinic confirms availability." Time input and shortcuts are disabled until a confirmed time is provided.
+                    Patients will see: "Doctor is unavailable — consultation resume time not yet confirmed. Your estimated turn will update once the clinic confirms availability." Specific time controls are disabled.
                   </Text>
                 </View>
               ) : (
@@ -565,7 +680,7 @@ export default function DoctorTimingAdjustmentModal({
                   <View style={styles.shortcutsRow}>
                     {DELAY_SHORTCUTS.map((s) => {
                       const active = selectedMinutes === s.minutes;
-                      const previewTime = addMinutesToTime(resolvedScheduledStart, s.minutes);
+                      const previewTime = addMinutesToTime(shortcutBase, s.minutes);
                       return (
                         <Pressable
                           key={s.minutes}
@@ -589,14 +704,14 @@ export default function DoctorTimingAdjustmentModal({
                     })}
                   </View>
 
-                  {/* Or manual time entry */}
-                  <Text style={styles.fieldLabel}>Or enter a specific expected time</Text>
+                  {/* Manual Expected Time Entry */}
+                  <Text style={styles.fieldLabel}>Or enter specific expected availability time</Text>
                   <View style={styles.timeInputRow}>
                     <TextInput
                       style={[styles.timeInput, customTimeError ? styles.inputError : null, { flex: 1 }]}
                       value={customTime}
                       onChangeText={handleCustomTimeChange}
-                      placeholder="e.g. 11:30"
+                      placeholder="e.g. 03:30 PM"
                       placeholderTextColor={colors.muted}
                       keyboardType="numbers-and-punctuation"
                       testID="timing-custom-time-input"
@@ -606,14 +721,7 @@ export default function DoctorTimingAdjustmentModal({
                       {(["AM", "PM"] as const).map((period) => (
                         <Pressable
                           key={period}
-                          onPress={() => {
-                            setCustomTimeAMPM(period);
-                            setSelectedMinutes(null);
-                            // Update displayed time to reflect new period
-                            if (customTime.trim() && !/AM|PM/i.test(customTime)) {
-                              // time entered without period — just keep it, period will be appended on save
-                            }
-                          }}
+                          onPress={() => handleCustomAMPMChange(period)}
                           style={[styles.ampmBtn, customTimeAMPM === period && styles.ampmBtnActive]}
                           testID={`expected-ampm-${period}`}
                         >
@@ -637,11 +745,11 @@ export default function DoctorTimingAdjustmentModal({
                 Patient-Visible Delay Reason (मरीजों को दिखने वाला कारण)
               </Text>
 
-              {/* Privacy warning */}
+              {/* Privacy Warning */}
               <View style={styles.privacyNotice}>
                 <Ionicons name="shield-checkmark-outline" size={15} color="#047857" />
                 <Text style={styles.privacyNoticeText}>
-                  ⚠️ Visible to all patients: Do NOT include another patient's name or confidential medical details in this message.
+                  ⚠️ Visible to all waiting patients: Do NOT enter another patient's name, disease details, or confidential information.
                 </Text>
               </View>
 
@@ -676,17 +784,18 @@ export default function DoctorTimingAdjustmentModal({
                   placeholder="Enter custom patient-visible message (keep it general, no patient names)..."
                   placeholderTextColor={colors.muted}
                   multiline
+                  numberOfLines={2}
                   testID="custom-reason-input"
                 />
               )}
             </View>
 
-            {/* ── Section 4: Patient Screen Preview ── */}
+            {/* ── Section 4: Patient Screen Preview (Local & Immediate) ── */}
             <View style={styles.impactCard}>
               <View style={styles.impactHeader}>
                 <Ionicons name="phone-portrait-outline" size={16} color="#D97706" />
                 <Text style={styles.impactTitle}>Patient Screen Preview</Text>
-                <Text style={styles.impactSubtitle}>(preview only — not saved yet)</Text>
+                <Text style={styles.impactSubtitle}>(instant preview — not saved yet)</Text>
               </View>
 
               {returnTimeUnconfirmed ? (
@@ -695,18 +804,20 @@ export default function DoctorTimingAdjustmentModal({
                     <Text style={[styles.previewBadgeText, { color: "#C2410C" }]}>DELAYED · TIME AWAITED</Text>
                   </View>
                   <Text style={styles.previewMessage}>
-                    "Doctor is unavailable — consultation resume time not yet confirmed."
+                    "Doctor is unavailable — consultation resume time not yet confirmed. Your estimated turn will update once the clinic confirms availability."
                   </Text>
                 </View>
               ) : (
                 <View style={styles.previewBlock}>
-                  <View style={[styles.previewBadge, { backgroundColor: "#DBEAFE" }]}>
-                    <Text style={[styles.previewBadgeText, { color: "#1D4ED8" }]}>DELAYED</Text>
+                  <View style={[styles.previewBadge, { backgroundColor: isDelayActive ? "#DBEAFE" : "#DCFCE7" }]}>
+                    <Text style={[styles.previewBadgeText, { color: isDelayActive ? "#1D4ED8" : "#166534" }]}>
+                      {isDelayActive ? "DELAYED" : "ON SCHEDULE"}
+                    </Text>
                   </View>
                   <Text style={styles.previewText}>
                     Expected availability: <Text style={{ fontWeight: "700", color: colors.brandPrimary }}>{previewExpected}</Text>
                   </Text>
-                  {scheduledChanged && (
+                  {isScheduledChanged && (
                     <Text style={[styles.previewText, { color: "#7C3AED", marginTop: 2 }]}>
                       Scheduled Start: <Text style={{ fontWeight: "700" }}>{resolvedScheduledStart}</Text> (updated)
                     </Text>
@@ -720,7 +831,7 @@ export default function DoctorTimingAdjustmentModal({
 
               {previewPatientETAs && (
                 <View style={styles.previewEtas}>
-                  <Text style={styles.previewEtaTitle}>Queue estimate preview (5 min/patient):</Text>
+                  <Text style={styles.previewEtaTitle}>Queue estimate preview (5 min/patient, 30 min window):</Text>
                   {previewPatientETAs.map(({ token, eta }) => (
                     <Text key={token} style={styles.previewEtaRow}>
                       Token #{token} → {eta}
@@ -730,17 +841,17 @@ export default function DoctorTimingAdjustmentModal({
               )}
 
               <Text style={styles.impactSub}>
-                • {affectedCount} waiting patient(s) will get recalculated ETAs via live update — no refresh needed.
+                • {affectedCount} waiting patient(s) will receive recalculated ETAs via real-time WebSocket update.
               </Text>
               <Text style={styles.impactSub}>
-                • Completed appointments and actual consultation timestamps are not affected.
+                • Token numbers, booking order, and completed records are preserved.
               </Text>
               <Text style={styles.impactSub}>
-                • Changes apply to this doctor, this date, and this session only.
+                • Changes apply to this doctor, date, and session only.
               </Text>
             </View>
 
-            {/* ── Error ── */}
+            {/* ── Error Feedback ── */}
             {error ? (
               <View style={styles.errorBox}>
                 <Ionicons name="alert-circle" size={16} color={colors.error} />
@@ -759,7 +870,7 @@ export default function DoctorTimingAdjustmentModal({
               </View>
             ) : null}
 
-            {/* ── Success ── */}
+            {/* ── Success Feedback ── */}
             {successMsg ? (
               <View style={styles.successBox}>
                 <Ionicons name="checkmark-circle" size={16} color="#166534" />
@@ -780,6 +891,7 @@ export default function DoctorTimingAdjustmentModal({
             >
               <Text style={styles.cancelBtnText}>Cancel</Text>
             </Pressable>
+
             <Pressable
               onPress={handleSave}
               disabled={loading || verifyingServerState || Boolean(scheduledInputError) || Boolean(customTimeError)}
@@ -870,22 +982,28 @@ const styles = StyleSheet.create({
     color: colors.onSurface,
     marginBottom: spacing.xs,
   },
-  editToggleBtn: {
+  fieldHelpText: {
+    fontSize: font.xs,
+    color: colors.muted,
+    marginBottom: spacing.xs,
+  },
+  lockedBadge: {
     flexDirection: "row",
     alignItems: "center",
     gap: 4,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
     borderRadius: radius.pill,
-    backgroundColor: colors.brandSecondary,
+    backgroundColor: colors.surfaceSecondary,
   },
-  editToggleBtnText: {
-    fontSize: font.xs,
+  lockedBadgeText: {
+    fontSize: 10,
     fontWeight: "700",
-    color: colors.brandPrimary,
+    color: colors.muted,
+    textTransform: "uppercase",
   },
 
-  // Baseline card (read-only view)
+  // Baseline card (overview)
   baselineCard: {
     flexDirection: "row",
     alignItems: "center",
@@ -894,6 +1012,7 @@ const styles = StyleSheet.create({
     padding: spacing.sm,
     borderRadius: radius.md,
     gap: spacing.xs,
+    marginBottom: spacing.md,
     flexWrap: "wrap",
   },
   baselineCol: { alignItems: "flex-start", flex: 1, minWidth: 80 },
@@ -968,13 +1087,13 @@ const styles = StyleSheet.create({
   lockedNotice: {
     flexDirection: "row",
     alignItems: "flex-start",
-    gap: 6,
+    gap: 8,
     backgroundColor: colors.surfaceSecondary,
     padding: spacing.sm,
     borderRadius: radius.sm,
     marginTop: spacing.xs,
   },
-  lockedNoticeText: { fontSize: 11, color: colors.muted, flex: 1, lineHeight: 16, fontStyle: "italic" },
+  lockedNoticeText: { fontSize: 11, color: colors.muted, flex: 1, lineHeight: 16 },
 
   // Unconfirmed toggle
   unconfirmedToggle: {

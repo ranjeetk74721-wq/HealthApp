@@ -15,7 +15,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { useAuth } from "@/src/context/AuthContext";
 import { api, ApiError } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
 export default function StaffLogin() {
   const router = useRouter();
@@ -26,9 +26,11 @@ export default function StaffLogin() {
     redirect?: string;
   }>();
   const { signIn } = useAuth();
+  const insets = useSafeAreaInsets();
 
-  const hospitalId = (params.hospitalId as string) || "Unknown Hospital";
-  const hospitalName = (params.hospitalName as string) || "";
+  const savedHospitalId = typeof window !== "undefined" ? window.localStorage?.getItem("cq_receptionist_last_hospital") : null;
+  const hospitalId = (params.hospitalId as string) || savedHospitalId || "Unknown Hospital";
+  const hospitalName = (params.hospitalName as string) || (hospitalId !== "Unknown Hospital" ? `Hospital ${hospitalId}` : "");
   const role = (params.role as string) || "";
 
   const roleTitle =
@@ -56,7 +58,7 @@ export default function StaffLogin() {
       const res = await api.post("/auth/login", {
         email: email.trim().toLowerCase(),
         password,
-        hospital_id: hospitalId,
+        hospital_id: hospitalId !== "Unknown Hospital" ? hospitalId : undefined,
         role: role || undefined,
       });
 
@@ -125,19 +127,27 @@ export default function StaffLogin() {
         style={{ flex: 1 }}
       >
         <ScrollView
-          contentContainerStyle={styles.container}
+          contentContainerStyle={[
+            styles.scrollContent,
+            { paddingBottom: Math.max(insets.bottom + 24, spacing.xxl) },
+          ]}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
           <View style={styles.backWrap}>
-            <Pressable onPress={() => router.back()} style={styles.backBtn} accessibilityLabel="Back" hitSlop={10}>
+            <Pressable onPress={() => router.back()} style={styles.backBtn} accessibilityLabel="Back" hitSlop={12}>
               <Ionicons name="arrow-back" size={24} color={colors.onSurface} />
             </Pressable>
           </View>
 
           <View style={styles.headerWrap}>
             <Text style={styles.title}>{roleTitle}</Text>
-            <Text style={styles.subtitle}>{hospitalName} ({hospitalId})</Text>
+            <Text style={styles.subtitle}>{hospitalName ? `${hospitalName} (${hospitalId})` : hospitalId}</Text>
+            <Pressable onPress={() => router.push("/hospital-id")} style={{ marginTop: 6 }} hitSlop={8}>
+              <Text style={{ fontSize: 12, color: colors.brandPrimary, textDecorationLine: "underline" }}>
+                Change Hospital ID
+              </Text>
+            </Pressable>
           </View>
 
           <View style={styles.card}>
@@ -154,6 +164,8 @@ export default function StaffLogin() {
               keyboardType="email-address"
               autoCapitalize="none"
               autoCorrect={false}
+              autoComplete="email"
+              textContentType="emailAddress"
               style={styles.input}
             />
 
@@ -168,6 +180,8 @@ export default function StaffLogin() {
                 if (error) setError(null);
               }}
               secureTextEntry
+              autoComplete="current-password"
+              textContentType="password"
               returnKeyType="go"
               onSubmitEditing={onLogin}
               style={styles.input}
@@ -184,7 +198,7 @@ export default function StaffLogin() {
               testID="staff-login-btn"
               onPress={onLogin}
               disabled={loading}
-              style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }]}
+              style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }, loading && { opacity: 0.7 }]}
             >
               {loading ? (
                 <ActivityIndicator color={colors.onBrandPrimary} />
@@ -201,9 +215,12 @@ export default function StaffLogin() {
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.surfaceSecondary },
-  container: {
-    flexGrow: 1,
+  scrollContent: {
     padding: spacing.xl,
+    maxWidth: 480,
+    width: "100%",
+    alignSelf: "center",
+    flexGrow: 1,
     justifyContent: "center",
   },
   backWrap: {

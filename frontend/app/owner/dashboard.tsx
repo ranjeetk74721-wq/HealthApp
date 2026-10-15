@@ -11,6 +11,7 @@ import * as ImagePicker from "expo-image-picker";
 import { api, isConfirmedAuthError } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
+import DoctorTimingAdjustmentModal from "@/src/components/DoctorTimingAdjustmentModal";
 
 const STALE_AFTER_MS = 30_000;
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024; // 5 MB limit
@@ -276,6 +277,26 @@ export default function OwnerDashboard() {
   }, [handleAuthExpired, stats]);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
+
+  // Timing adjustment modal for admin
+  const [timingDoc, setTimingDoc] = useState<DocRow | null>(null);
+  const [timingSession, setTimingSession] = useState<any>(null);
+  const [timingModalOpen, setTimingModalOpen] = useState(false);
+  const [timingLoading, setTimingLoading] = useState(false);
+
+  const openTimingAdjustment = async (d: DocRow) => {
+    setTimingLoading(true);
+    try {
+      const sess = await api.get(`/doctor/${d.id}/session`);
+      setTimingDoc(d);
+      setTimingSession(sess);
+      setTimingModalOpen(true);
+    } catch (e: any) {
+      Alert.alert("Error", e.message || "Failed to load doctor session timing");
+    } finally {
+      setTimingLoading(false);
+    }
+  };
 
   const pickImage = async (setter: (v: string) => void) => {
     try {
@@ -795,6 +816,14 @@ export default function OwnerDashboard() {
                 </View>
               </View>
               <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+                <Pressable
+                  testID={`adjust-timing-${d.id}`}
+                  onPress={() => openTimingAdjustment(d)}
+                  style={[styles.iconActionBtn, { backgroundColor: "#FEF3C7" }]}
+                  hitSlop={8}
+                >
+                  <Ionicons name="time-outline" size={18} color="#D97706" />
+                </Pressable>
                 <Pressable testID={`edit-doc-${d.id}`} onPress={() => openEditDoctor(d)} style={[styles.iconActionBtn, { backgroundColor: colors.brandSecondary + "30" }]} hitSlop={8}>
                   <Ionicons name="create-outline" size={18} color={colors.brandPrimary} />
                 </Pressable>
@@ -854,7 +883,7 @@ export default function OwnerDashboard() {
       {/* ── Add Specialist Category Modal ── */}
       <Modal transparent visible={addSpecModalOpen} animationType="slide" onRequestClose={() => setAddSpecModalOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setAddSpecModalOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <Text style={styles.sheetTitle}>Add Specialist Category</Text>
@@ -882,7 +911,7 @@ export default function OwnerDashboard() {
       {/* ── Generate Hospital ID Modal ── */}
       <Modal transparent visible={hospModalOpen} animationType="slide" onRequestClose={() => setHospModalOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setHospModalOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
@@ -906,7 +935,7 @@ export default function OwnerDashboard() {
       {/* ── Edit Hospital Modal ── */}
       <Modal transparent visible={editHospModalOpen} animationType="slide" onRequestClose={() => setEditHospModalOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setEditHospModalOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
@@ -940,7 +969,7 @@ export default function OwnerDashboard() {
       {/* ── Add Doctor Modal ── */}
       <Modal transparent visible={addOpen} animationType="slide" onRequestClose={() => setAddOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setAddOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={[styles.sheet, { maxHeight: "92%", minHeight: "80%" }]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
@@ -1076,7 +1105,7 @@ export default function OwnerDashboard() {
       {/* ── Edit Doctor Modal ── */}
       <Modal transparent visible={editDocOpen} animationType="slide" onRequestClose={() => setEditDocOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setEditDocOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={[styles.sheet, { maxHeight: "92%", minHeight: "80%" }]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
@@ -1218,7 +1247,7 @@ export default function OwnerDashboard() {
       {/* ── Add Receptionist Modal ── */}
       <Modal transparent visible={addRecOpen} animationType="slide" onRequestClose={() => setAddRecOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setAddRecOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
@@ -1280,7 +1309,7 @@ export default function OwnerDashboard() {
       {/* ── Edit Receptionist Modal ── */}
       <Modal transparent visible={editRecOpen} animationType="slide" onRequestClose={() => setEditRecOpen(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setEditRecOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1, justifyContent: "flex-end" }}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : Platform.OS === "android" ? "height" : undefined} style={{ flex: 1, justifyContent: "flex-end" }}>
             <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <ScrollView keyboardShouldPersistTaps="handled">
@@ -1384,7 +1413,20 @@ export default function OwnerDashboard() {
                   </>
                 ) : null}
 
-                <View style={{ flexDirection: "row", gap: spacing.sm, marginTop: spacing.lg }}>
+                <Pressable
+                  testID="view-adjust-timing-btn"
+                  onPress={() => {
+                    const docToAdjust = viewDoc;
+                    setViewDoc(null);
+                    if (docToAdjust) openTimingAdjustment(docToAdjust);
+                  }}
+                  style={[styles.submitBtn, { backgroundColor: "#D97706", flexDirection: "row", justifyContent: "center", gap: 6, marginTop: spacing.md }]}
+                >
+                  <Ionicons name="time-outline" size={18} color="#fff" />
+                  <Text style={styles.submitBtnText}>Adjust Consultation Start & Delay</Text>
+                </Pressable>
+
+                <View style={{ flexDirection: "row", gap: spacing.sm, marginTop: spacing.sm }}>
                   <Pressable
                     onPress={() => {
                       const docToEdit = viewDoc;
@@ -1415,6 +1457,27 @@ export default function OwnerDashboard() {
           </Pressable>
         </Pressable>
       </Modal>
+
+      {/* ── Doctor Timing Adjustment Modal (Admin Panel) ── */}
+      {timingDoc && timingSession && (
+        <DoctorTimingAdjustmentModal
+          visible={timingModalOpen}
+          doctorId={timingDoc.id}
+          doctorName={timingDoc.full_name}
+          sessionData={timingSession}
+          affectedCount={timingDoc.todays_appts || 0}
+          onClose={() => {
+            setTimingModalOpen(false);
+            setTimingDoc(null);
+            setTimingSession(null);
+          }}
+          onSuccess={() => {
+            setToast(`Updated schedule for Dr. ${timingDoc.full_name}`);
+            load(true);
+            setTimeout(() => setToast(null), 3000);
+          }}
+        />
+      )}
     </SafeAreaView>
   );
 }
