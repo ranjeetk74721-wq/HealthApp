@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, ReactNode } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Platform } from "react-native";
-import { getBackendBase } from "@/src/api/client";
+import { getBackendBase, invalidateCache } from "@/src/api/client";
 
 export type Role = "patient" | "doctor" | "receptionist" | "owner";
 
@@ -93,6 +93,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   const signIn = useCallback(async (token: string, user: AuthUser) => {
+    // Clear API cache on login to prevent cross-account stale data
+    invalidateCache();
     // Persist token and user in parallel
     await Promise.all([
       AsyncStorage.setItem(TOKEN_KEY, token),
@@ -131,6 +133,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   const signOut = useCallback(async () => {
+    // Clear API cache immediately on logout
+    invalidateCache();
     try {
       const cachedToken = await AsyncStorage.getItem(PUSH_TOKEN_KEY);
       if (cachedToken) {
@@ -146,7 +150,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         if (Platform.OS === "web" && typeof window !== "undefined") {
           try {
             const { getFirebaseApp } = await import("@/src/firebase");
-            const app = getFirebaseApp();
+            const app = await getFirebaseApp();
             if (app) {
               const { getMessaging, deleteToken } = await import("firebase/messaging");
               const messaging = getMessaging(app);

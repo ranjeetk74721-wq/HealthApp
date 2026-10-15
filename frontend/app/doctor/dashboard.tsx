@@ -80,7 +80,7 @@ export default function DoctorDashboard() {
   const isFocused = useRef(true);
 
   const load = useCallback(async (silent = false, bypassCache = false) => {
-    const shouldBypass = silent || bypassCache;
+    const shouldBypass = bypassCache;
     try {
       const targetDate = selectedDateRef.current;
       const [d, a, sum, recs] = await Promise.all([

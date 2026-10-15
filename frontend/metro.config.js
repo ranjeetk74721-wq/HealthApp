@@ -24,6 +24,21 @@ if (process.env.NODE_ENV === 'production') {
   };
 }
 
+const iconsProxyPath = path.resolve(__dirname, 'src/components/icons-proxy.js');
+const origResolveRequest = config.resolver?.resolveRequest;
+config.resolver = {
+  ...config.resolver,
+  resolveRequest: (context, moduleName, platform) => {
+    if (moduleName === '@expo/vector-icons') {
+      return context.resolveRequest(context, iconsProxyPath, platform);
+    }
+    if (origResolveRequest) {
+      return origResolveRequest(context, moduleName, platform);
+    }
+    return context.resolveRequest(context, moduleName, platform);
+  },
+};
+
 // Use available CPU parallelism so QR reloads do not rebuild serially.
 config.maxWorkers = Math.max(2, os.cpus().length - 1);
 

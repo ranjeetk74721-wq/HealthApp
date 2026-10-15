@@ -68,6 +68,8 @@ export default function ReceptionistDashboard() {
   const [rescheduleDate, setRescheduleDate] = useState("");
   const [rescheduleSlot, setRescheduleSlot] = useState("");
   const [rescheduleLoading, setRescheduleLoading] = useState(false);
+  const [rescheduleVerifying, setRescheduleVerifying] = useState(false);
+  const [rescheduleIsTimeout, setRescheduleIsTimeout] = useState(false);
   const [rescheduleError, setRescheduleError] = useState<string | null>(null);
 
   // Add Patient sheet (preserves inputs on error)
@@ -83,6 +85,8 @@ export default function ReceptionistDashboard() {
   const [pAddress, setPAddress] = useState("");
   const [pSlot, setPSlot] = useState("");
   const [addLoading, setAddLoading] = useState(false);
+  const [addVerifying, setAddVerifying] = useState(false);
+  const [addIsTimeout, setAddIsTimeout] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
   const [addToast, setAddToast] = useState<string | null>(null);
   const [exportLoading, setExportLoading] = useState(false);
@@ -94,6 +98,12 @@ export default function ReceptionistDashboard() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isFocused = useRef(true);
   const [wsConnected, setWsConnected] = useState(false);
+
+  // In-flight synchronous guards against rapid repeated clicks
+  const addPatientSubmittingRef = useRef(false);
+  const emergencySubmittingRef = useRef(false);
+  const rescheduleSubmittingRef = useRef(false);
+  const referSubmittingRef = useRef(false);
 
   // Use a ref so load() always reads the latest selectedDoc without stale closure
   const selectedDocRef = useRef<string | null>(null);
@@ -130,7 +140,7 @@ export default function ReceptionistDashboard() {
   }, []);
 
   const load = useCallback(async (silent = false, bypassCache = false) => {
-    const shouldBypass = silent || bypassCache;
+    const shouldBypass = bypassCache;
     try {
       const docs = await api.get("/reception/doctors", { bypassCache: shouldBypass });
       setDoctors(docs);
@@ -236,7 +246,7 @@ export default function ReceptionistDashboard() {
         setAddToast(successMsg);
         setTimeout(() => setAddToast(null), 3000);
       }
-      await load(true, true);
+      await load(true);
     } catch (err: any) {
       Alert.alert("Action Failed", err?.message || "Could not complete queue action");
     } finally {
@@ -314,33 +324,78 @@ export default function ReceptionistDashboard() {
     setRescheduleDate(appt.date || selectedDate);
     setRescheduleSlot(appt.slot || "");
     setRescheduleError(null);
+    setRescheduleIsTimeout(false);
+    setRescheduleVerifying(false);
     setRescheduleModalOpen(true);
   };
 
   const handleRescheduleSubmit = async () => {
+    if (rescheduleSubmittingRef.current) return;
     if (!rescheduleAppt || !rescheduleDate) {
       setRescheduleError("Please select a valid new date");
       return;
     }
+    rescheduleSubmittingRef.current = true;
     setRescheduleLoading(true);
+    setRescheduleVerifying(false);
+    setRescheduleIsTimeout(false);
     setRescheduleError(null);
     try {
-      const res = await api.post("/reception/reschedule", {
-        appointment_id: rescheduleAppt.id,
-        new_date: rescheduleDate,
-        new_slot: rescheduleSlot.trim() || undefined,
-      });
+      const res = await api.post(
+        "/reception/reschedule",
+        {
+          appointment_id: rescheduleAppt.id,
+          new_date: rescheduleDate,
+          new_slot: rescheduleSlot.trim() || undefined,
+        },
+        { timeoutMs: 10000 }
+      );
       setAddToast(
         `Rescheduled to ${res.new_date} · New Token #${res.token_number}`
       );
       setRescheduleModalOpen(false);
       setRescheduleAppt(null);
-      await load(true, true);
+      await load(true);
       setTimeout(() => setAddToast(null), 3500);
     } catch (err: any) {
-      setRescheduleError(err?.message || "Failed to reschedule appointment");
+      if (err?.isTimeout || err?.name === "TimeoutError") {
+        // A client timeout does NOT prove the server failed to save.
+        // Before offering a repeated write after an ambiguous timeout,
+        // use existing read endpoints to check whether the change already succeeded.
+        // Do not automatically replay uncertain writes.
+        setRescheduleVerifying(true);
+        try {
+          const check = await api.get(
+            `/appointments/${rescheduleAppt.id}/patient-details`,
+            { bypassCache: true, timeoutMs: 6000 }
+          );
+          if (check && check.date === rescheduleDate) {
+            setAddToast(
+              `Rescheduled to ${check.date} · Token #${check.token_number}`
+            );
+            setRescheduleModalOpen(false);
+            setRescheduleAppt(null);
+            await load(true);
+            setTimeout(() => setAddToast(null), 3500);
+            return;
+          }
+        } catch {
+          // Verification read also failed/timed out
+        } finally {
+          setRescheduleVerifying(false);
+        }
+
+        setRescheduleIsTimeout(true);
+        setRescheduleError(
+          "Request timed out. Server verification confirmed appointment was not rescheduled. You can retry."
+        );
+      } else {
+        setRescheduleError(err?.message || "Failed to reschedule appointment");
+      }
     } finally {
+      rescheduleSubmittingRef.current = false;
       setRescheduleLoading(false);
+      setRescheduleVerifying(false);
     }
   };
 
@@ -395,7 +450,8 @@ export default function ReceptionistDashboard() {
   };
 
   const insertEmergency = async () => {
-    if (!selectedDoc) return;
+    if (!selectedDoc || emergencySubmittingRef.current) return;
+    emergencySubmittingRef.current = true;
     try {
       await api.post("/reception/emergency_insert", {
         doctor_id: selectedDoc,
@@ -403,8 +459,10 @@ export default function ReceptionistDashboard() {
       });
       setEmergencyOpen(false);
       setEmergencyName("");
-      load(true, true);
-    } catch { /* ignore */ }
+      load(true);
+    } catch { /* ignore */ } finally {
+      emergencySubmittingRef.current = false;
+    }
   };
 
   const openReferModal = (appt: any) => {
@@ -417,10 +475,12 @@ export default function ReceptionistDashboard() {
   };
 
   const handleReferSubmit = async () => {
+    if (referSubmittingRef.current) return;
     if (!referAppt || !targetDocId) {
       setReferError("Please select a target doctor");
       return;
     }
+    referSubmittingRef.current = true;
     setReferLoading(true);
     setReferError(null);
     try {
@@ -435,27 +495,35 @@ export default function ReceptionistDashboard() {
       );
       setReferModalOpen(false);
       setReferAppt(null);
-      load(true, true);
+      load(true);
       setTimeout(() => setAddToast(null), 3500);
     } catch (e: any) {
       setReferError(e.message || "Failed to refer patient");
     } finally {
+      referSubmittingRef.current = false;
       setReferLoading(false);
     }
   };
 
   const resetAddForm = () => {
+    addPatientSubmittingRef.current = false;
     setPName(""); setPMobile(""); setPAge(""); setPGender(null);
     setPSymptoms(""); setPAddress(""); setPSlot(""); setAddError(null);
     setSelectedSessionId(null); setSelectedWindowId(null);
   };
 
   const onAddPatient = async () => {
+    // Immediate synchronous in-flight guard: prevent duplicate submissions from rapid repeated clicks
+    if (addPatientSubmittingRef.current) return;
     setAddError(null);
+    setAddIsTimeout(false);
     if (!pName.trim()) return setAddError("Name is required");
     if (pMobile.replace(/[^0-9]/g, "").length < 10) return setAddError("Enter valid 10-digit mobile");
     if (!selectedDoc) return setAddError("Select a doctor first");
+
+    addPatientSubmittingRef.current = true;
     setAddLoading(true);
+    setAddVerifying(false);
     try {
       const selectedSession = configuredSessions.find((s) => s.id === selectedSessionId);
       const selectedWindow = selectedSession?.booking_windows?.find((w: any) => w.id === selectedWindowId);
@@ -463,30 +531,69 @@ export default function ReceptionistDashboard() {
         pSlot ||
         (selectedWindow ? `${selectedWindow.start_time} - ${selectedWindow.end_time}` : (selectedSession ? selectedSession.session_name : "Walk-in"));
 
-      const res = await api.post("/reception/add-patient", {
-        full_name: pName.trim(),
-        mobile: pMobile.replace(/[^0-9]/g, ""),
-        age: pAge ? parseInt(pAge, 10) : undefined,
-        gender: pGender,
-        symptoms: pSymptoms || undefined,
-        address: pAddress || undefined,
-        doctor_id: selectedDoc,
-        session_id: selectedSessionId || undefined,
-        booking_window_id: selectedWindowId || undefined,
-        slot_time: (selectedWindow ? `${selectedWindow.start_time} - ${selectedWindow.end_time}` : pSlot) || undefined,
-        slot: effectiveSlot,
-        date: selectedDate,
-      });
+      const res = await api.post(
+        "/reception/add-patient",
+        {
+          full_name: pName.trim(),
+          mobile: pMobile.replace(/[^0-9]/g, ""),
+          age: pAge ? parseInt(pAge, 10) : undefined,
+          gender: pGender,
+          symptoms: pSymptoms || undefined,
+          address: pAddress || undefined,
+          doctor_id: selectedDoc,
+          session_id: selectedSessionId || undefined,
+          booking_window_id: selectedWindowId || undefined,
+          slot_time: (selectedWindow ? `${selectedWindow.start_time} - ${selectedWindow.end_time}` : pSlot) || undefined,
+          slot: effectiveSlot,
+          date: selectedDate,
+        },
+        { timeoutMs: 12000 }
+      );
       setAddToast(`Added: ${res.patient.full_name} · Token #${res.appointment?.token_number}`);
       resetAddForm();
       setAddOpen(false);
-      load(true, true);
+      load(true);
       setTimeout(() => setAddToast(null), 3000);
     } catch (e: any) {
-      // PRESERVE FORM INPUTS on error for weak connections!
-      setAddError(e.message || "Could not add patient. Please check connection and retry.");
+      if (e?.isTimeout || e?.name === "TimeoutError") {
+        setAddVerifying(true);
+        try {
+          const qList = await api.get(
+            `/reception/queue?doctor_id=${selectedDoc}&date=${selectedDate}`,
+            { bypassCache: true, timeoutMs: 6000 }
+          );
+          const cleanMob = pMobile.replace(/[^0-9]/g, "");
+          const found = Array.isArray(qList)
+            ? qList.find(
+                (a: any) =>
+                  a.patient_mobile === cleanMob ||
+                  (a.patient_name && a.patient_name.toLowerCase() === pName.trim().toLowerCase())
+              )
+            : null;
+          if (found) {
+            setAddToast(`Added: ${found.patient_name} · Token #${found.token_number}`);
+            resetAddForm();
+            setAddOpen(false);
+            load(true);
+            setTimeout(() => setAddToast(null), 3000);
+            return;
+          }
+        } catch {
+          // Verification read failed
+        } finally {
+          setAddVerifying(false);
+        }
+
+        setAddIsTimeout(true);
+        setAddError("Request timed out. Server verification confirmed patient was not added. You can retry.");
+      } else {
+        // PRESERVE FORM INPUTS on error for weak connections!
+        setAddError(e.message || "Could not add patient. Please check connection and retry.");
+      }
     } finally {
+      addPatientSubmittingRef.current = false;
       setAddLoading(false);
+      setAddVerifying(false);
     }
   };
 
@@ -1062,11 +1169,16 @@ export default function ReceptionistDashboard() {
       <View style={styles.fabRow}>
         <Pressable
           testID="add-patient-btn"
+          disabled={addLoading}
           onPress={() => setAddOpen(true)}
-          style={[styles.fab, { backgroundColor: colors.brandPrimary }]}
+          style={[styles.fab, { backgroundColor: colors.brandPrimary }, addLoading && { opacity: 0.6 }]}
         >
-          <Ionicons name="person-add" size={20} color="#fff" />
-          <Text style={styles.fabText}>Add Patient</Text>
+          {addLoading ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Ionicons name="person-add" size={20} color="#fff" />
+          )}
+          <Text style={styles.fabText}>{addLoading ? "Saving…" : "Add Patient"}</Text>
         </Pressable>
         <Pressable
           testID="emergency-insert-btn"
@@ -1079,12 +1191,27 @@ export default function ReceptionistDashboard() {
       </View>
 
       {/* ── Add Patient Modal (Preserves inputs during connection glitches) ── */}
-      <Modal transparent visible={addOpen} animationType="slide" onRequestClose={() => setAddOpen(false)}>
-        <Pressable style={styles.modalBackdrop} onPress={() => setAddOpen(false)}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ justifyContent: "flex-end", flex: 1 }}>
-            <Pressable style={[styles.sheet, { maxHeight: "92%", minHeight: "70%" }]} onPress={(e) => e.stopPropagation()}>
+      <Modal
+        transparent
+        visible={addOpen}
+        animationType="slide"
+        onRequestClose={() => {
+          if (!addLoading && !addVerifying) setAddOpen(false);
+        }}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          style={styles.modalBackdrop}
+        >
+          <Pressable
+            style={{ flex: 1, justifyContent: "flex-end", width: "100%" }}
+            onPress={() => {
+              if (!addLoading && !addVerifying) setAddOpen(false);
+            }}
+          >
+            <Pressable style={[styles.sheet, { maxHeight: "92%" }]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
-              <ScrollView keyboardShouldPersistTaps="handled">
+              <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: spacing.xl }}>
                 <Text style={styles.sheetTitle}>Add Patient to Queue</Text>
                 <Text style={styles.sheetSub}>Select doctor session & slot (receptionist override enabled). Date: {selectedDate}</Text>
 
@@ -1171,22 +1298,22 @@ export default function ReceptionistDashboard() {
 
                 {/* 3. Patient Details */}
                 <Text style={styles.label}>3. Patient Full Name*</Text>
-                <TextInput testID="ap-name" placeholder="Patient name" placeholderTextColor={colors.muted} value={pName} onChangeText={setPName} style={styles.input} />
+                <TextInput testID="ap-name" editable={!addLoading} placeholder="Patient name" placeholderTextColor={colors.muted} value={pName} onChangeText={setPName} style={styles.input} />
                 <Text style={styles.label}>Mobile Number*</Text>
                 <View style={styles.mobileWrap}>
                   <View style={styles.ccBadge}><Text style={styles.ccText}>+91</Text></View>
-                  <TextInput testID="ap-mobile" placeholder="98765 43210" placeholderTextColor={colors.muted} value={pMobile} onChangeText={(t) => setPMobile(t.replace(/[^0-9]/g, "").slice(0, 10))} keyboardType="phone-pad" style={styles.mobileInput} />
+                  <TextInput testID="ap-mobile" editable={!addLoading} placeholder="98765 43210" placeholderTextColor={colors.muted} value={pMobile} onChangeText={(t) => setPMobile(t.replace(/[^0-9]/g, "").slice(0, 10))} keyboardType="phone-pad" style={styles.mobileInput} />
                 </View>
                 <View style={{ flexDirection: "row", gap: spacing.sm }}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.label}>Age</Text>
-                    <TextInput testID="ap-age" placeholder="32" placeholderTextColor={colors.muted} value={pAge} onChangeText={(t) => setPAge(t.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" style={styles.input} />
+                    <TextInput testID="ap-age" editable={!addLoading} placeholder="32" placeholderTextColor={colors.muted} value={pAge} onChangeText={(t) => setPAge(t.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" style={styles.input} />
                   </View>
                   <View style={{ flex: 2 }}>
                     <Text style={styles.label}>Gender</Text>
                     <View style={styles.genderRow}>
                       {GENDERS.map((g) => (
-                        <Pressable key={g} testID={`ap-gender-${g}`} onPress={() => setPGender(g)} style={[styles.genderChip, pGender === g && styles.genderChipActive]}>
+                        <Pressable key={g} testID={`ap-gender-${g}`} disabled={addLoading} onPress={() => setPGender(g)} style={[styles.genderChip, pGender === g && styles.genderChipActive, addLoading && { opacity: 0.6 }]}>
                           <Text style={[styles.genderText, pGender === g && { color: colors.onBrandPrimary }]}>{g}</Text>
                         </Pressable>
                       ))}
@@ -1194,20 +1321,39 @@ export default function ReceptionistDashboard() {
                   </View>
                 </View>
                 <Text style={styles.label}>Symptoms / Reason</Text>
-                <TextInput testID="ap-symptoms" placeholder="Fever, cough..." placeholderTextColor={colors.muted} value={pSymptoms} onChangeText={setPSymptoms} multiline style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]} />
+                <TextInput testID="ap-symptoms" editable={!addLoading} placeholder="Fever, cough..." placeholderTextColor={colors.muted} value={pSymptoms} onChangeText={setPSymptoms} multiline style={[styles.input, { minHeight: 60, textAlignVertical: "top" }]} />
                 <Text style={styles.label}>Address / Area (Optional - ऐच्छिक)</Text>
-                <TextInput testID="ap-address" placeholder="Area, city (optional for receptionist)" placeholderTextColor={colors.muted} value={pAddress} onChangeText={setPAddress} style={styles.input} />
+                <TextInput testID="ap-address" editable={!addLoading} placeholder="Area, city (optional for receptionist)" placeholderTextColor={colors.muted} value={pAddress} onChangeText={setPAddress} style={styles.input} />
                 <Text style={styles.label}>Custom Slot / Note (optional)</Text>
-                <TextInput testID="ap-slot" placeholder="e.g. 11:00 AM (or leave blank)" placeholderTextColor={colors.muted} value={pSlot} onChangeText={setPSlot} style={styles.input} />
+                <TextInput testID="ap-slot" editable={!addLoading} placeholder="e.g. 11:00 AM (or leave blank)" placeholderTextColor={colors.muted} value={pSlot} onChangeText={setPSlot} style={styles.input} />
                 {addError ? <Text style={styles.error}>{addError}</Text> : null}
-                <Pressable testID="ap-submit" onPress={onAddPatient} disabled={addLoading} style={({ pressed }) => [styles.primaryBtn, pressed && { opacity: 0.8 }]}>
-                  {addLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Confirm Booking & Add to Queue</Text>}
+                <Pressable
+                  testID="ap-submit"
+                  onPress={onAddPatient}
+                  disabled={addLoading || addVerifying}
+                  style={({ pressed }) => [
+                    styles.primaryBtn,
+                    (pressed || addLoading || addVerifying) && { opacity: 0.75 },
+                  ]}
+                >
+                  {addLoading || addVerifying ? (
+                    <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                      <ActivityIndicator size="small" color="#fff" />
+                      <Text style={styles.primaryBtnText}>
+                        {addVerifying ? "Verifying..." : "Saving…"}
+                      </Text>
+                    </View>
+                  ) : (
+                    <Text style={styles.primaryBtnText}>
+                      {addIsTimeout ? "Retry Add Patient" : "Confirm Booking & Add to Queue"}
+                    </Text>
+                  )}
                 </Pressable>
                 <View style={{ height: spacing.xl }} />
               </ScrollView>
             </Pressable>
-          </KeyboardAvoidingView>
-        </Pressable>
+          </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* ── Emergency Modal ── */}
@@ -1226,55 +1372,102 @@ export default function ReceptionistDashboard() {
       </Modal>
 
       {/* ── Reschedule Appointment Modal (Requirement 5) ── */}
-      <Modal transparent visible={rescheduleModalOpen} animationType="slide" onRequestClose={() => setRescheduleModalOpen(false)}>
-        <Pressable style={styles.modalBackdrop} onPress={() => setRescheduleModalOpen(false)}>
-          <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
-            <View style={styles.sheetHandle} />
-            <Text style={styles.sheetTitle}>Reschedule Appointment</Text>
-            <Text style={styles.sheetSub}>
-              Move Token #{rescheduleAppt?.token_number} ({rescheduleAppt?.patient_name}) to another appointment date.
-            </Text>
-
-            <Text style={styles.label}>New Appointment Date (YYYY-MM-DD)*</Text>
-            <TextInput
-              testID="reschedule-date-input"
-              value={rescheduleDate}
-              onChangeText={setRescheduleDate}
-              placeholder="e.g. 2026-10-04"
-              placeholderTextColor={colors.muted}
-              style={styles.input}
-            />
-
-            <Text style={styles.label}>Slot / Timing (Optional)</Text>
-            <TextInput
-              testID="reschedule-slot-input"
-              value={rescheduleSlot}
-              onChangeText={setRescheduleSlot}
-              placeholder="e.g. 11:30 AM or Walk-in"
-              placeholderTextColor={colors.muted}
-              style={styles.input}
-            />
-
-            {rescheduleError ? <Text style={styles.error}>{rescheduleError}</Text> : null}
-
-            <View style={{ flexDirection: "row", gap: spacing.sm, marginTop: spacing.md }}>
-              <Pressable
-                onPress={() => setRescheduleModalOpen(false)}
-                style={[styles.primaryBtn, { flex: 1, backgroundColor: colors.surfaceSecondary, borderWidth: 1, borderColor: colors.border }]}
+      <Modal
+        transparent
+        visible={rescheduleModalOpen}
+        animationType="slide"
+        onRequestClose={() => !rescheduleLoading && !rescheduleVerifying && setRescheduleModalOpen(false)}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          style={{ flex: 1 }}
+          keyboardVerticalOffset={Platform.OS === "ios" ? 40 : 0}
+        >
+          <Pressable
+            style={styles.modalBackdrop}
+            onPress={() => !rescheduleLoading && !rescheduleVerifying && setRescheduleModalOpen(false)}
+          >
+            <Pressable style={[styles.sheet, { maxHeight: "90%" }]} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <ScrollView
+                keyboardShouldPersistTaps="handled"
+                showsVerticalScrollIndicator={false}
+                contentContainerStyle={{ paddingBottom: spacing.lg }}
               >
-                <Text style={[styles.primaryBtnText, { color: colors.onSurface }]}>Cancel</Text>
-              </Pressable>
-              <Pressable
-                testID="reschedule-confirm-btn"
-                onPress={handleRescheduleSubmit}
-                disabled={rescheduleLoading}
-                style={[styles.primaryBtn, { flex: 2 }]}
-              >
-                {rescheduleLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Confirm Reschedule</Text>}
-              </Pressable>
-            </View>
+                <Text style={styles.sheetTitle}>Reschedule Appointment</Text>
+                <Text style={styles.sheetSub}>
+                  Move Token #{rescheduleAppt?.token_number} ({rescheduleAppt?.patient_name}) to another appointment date.
+                </Text>
+
+                <Text style={styles.label}>New Appointment Date (YYYY-MM-DD)*</Text>
+                <TextInput
+                  testID="reschedule-date-input"
+                  value={rescheduleDate}
+                  onChangeText={(val) => {
+                    setRescheduleDate(val);
+                    if (rescheduleIsTimeout) setRescheduleIsTimeout(false);
+                  }}
+                  editable={!rescheduleLoading && !rescheduleVerifying}
+                  placeholder="e.g. 2026-10-04"
+                  placeholderTextColor={colors.muted}
+                  style={styles.input}
+                />
+
+                <Text style={styles.label}>Slot / Timing (Optional)</Text>
+                <TextInput
+                  testID="reschedule-slot-input"
+                  value={rescheduleSlot}
+                  onChangeText={(val) => {
+                    setRescheduleSlot(val);
+                    if (rescheduleIsTimeout) setRescheduleIsTimeout(false);
+                  }}
+                  editable={!rescheduleLoading && !rescheduleVerifying}
+                  placeholder="e.g. 11:30 AM or Walk-in"
+                  placeholderTextColor={colors.muted}
+                  style={styles.input}
+                />
+
+                {rescheduleError ? <Text style={styles.error}>{rescheduleError}</Text> : null}
+
+                <View style={{ flexDirection: "row", gap: spacing.sm, marginTop: spacing.md }}>
+                  <Pressable
+                    onPress={() => setRescheduleModalOpen(false)}
+                    disabled={rescheduleLoading || rescheduleVerifying}
+                    style={[styles.primaryBtn, { flex: 1, backgroundColor: colors.surfaceSecondary, borderWidth: 1, borderColor: colors.border }]}
+                  >
+                    <Text style={[styles.primaryBtnText, { color: colors.onSurface }]}>Cancel</Text>
+                  </Pressable>
+                  <Pressable
+                    testID="reschedule-confirm-btn"
+                    onPress={handleRescheduleSubmit}
+                    disabled={rescheduleLoading || rescheduleVerifying}
+                    style={[
+                      styles.primaryBtn,
+                      { flex: 2 },
+                      rescheduleIsTimeout && { backgroundColor: colors.warning || "#d97706" },
+                    ]}
+                  >
+                    {rescheduleVerifying ? (
+                      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                        <ActivityIndicator color="#fff" size="small" />
+                        <Text style={styles.primaryBtnText}>Verifying...</Text>
+                      </View>
+                    ) : rescheduleLoading ? (
+                      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                        <ActivityIndicator color="#fff" size="small" />
+                        <Text style={styles.primaryBtnText}>Saving...</Text>
+                      </View>
+                    ) : (
+                      <Text style={styles.primaryBtnText}>
+                        {rescheduleIsTimeout ? "Retry Reschedule" : "Confirm Reschedule"}
+                      </Text>
+                    )}
+                  </Pressable>
+                </View>
+              </ScrollView>
+            </Pressable>
           </Pressable>
-        </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* ── Refer / Transfer Patient Modal ── */}
