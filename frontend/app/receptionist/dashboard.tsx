@@ -32,9 +32,32 @@ function formatTime(isoStr?: string | null): string {
 
 export default function ReceptionistDashboard() {
   const router = useRouter();
-  const { user, signOut } = useAuth();
+  const { user, loading: authLoading, signOut } = useAuth();
   const { width: windowWidth } = useWindowDimensions();
   const isSmallScreen = windowWidth < 540;
+
+  // ── Canonical Receptionist Route Guard ──
+  useEffect(() => {
+    if (!authLoading && (!user || user.role !== "receptionist")) {
+      const lastHosp = (typeof window !== "undefined" && window.localStorage?.getItem("cq_receptionist_last_hospital")) || "";
+      if (lastHosp) {
+        router.replace({ pathname: "/staff-login", params: { role: "receptionist", hospitalId: lastHosp } });
+      } else {
+        router.replace("/hospital-id");
+      }
+    }
+  }, [authLoading, user, router]);
+
+  // Safe redirect on authentication expiration
+  const handleAuthExpired = useCallback(async () => {
+    const lastHosp = user?.hospital_id || (typeof window !== "undefined" && window.localStorage?.getItem("cq_receptionist_last_hospital")) || "";
+    await signOut();
+    if (lastHosp) {
+      router.replace({ pathname: "/staff-login", params: { role: "receptionist", hospitalId: lastHosp } });
+    } else {
+      router.replace("/hospital-id");
+    }
+  }, [user, signOut, router]);
 
   // Doctor List State: explicit loading, success, empty, and error tracking
   const [doctors, setDoctors] = useState<any[]>([]);
@@ -130,7 +153,9 @@ export default function ReceptionistDashboard() {
   const wsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestIdRef = useRef(0);
   const sessionReqIdRef = useRef(0);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isFetchingRef = useRef(false);
+  const hasPendingUpdateRef = useRef(false);
   const isFocused = useRef(true);
   const [wsConnected, setWsConnected] = useState(false);
   const wsConnectedRef = useRef(false);
@@ -149,8 +174,30 @@ export default function ReceptionistDashboard() {
   const selectedDateRef = useRef(selectedDate);
   useEffect(() => { selectedDateRef.current = selectedDate; }, [selectedDate]);
 
-  // Stable ref for refreshDoctorData
+  // Stable ref for refreshDoctorData and fetchDoctors
   const refreshDoctorDataRef = useRef<(doctorId: string, targetDate: string, silent?: boolean) => Promise<void>>(undefined);
+  const fetchDoctorsRef = useRef<(silent?: boolean) => Promise<void>>(undefined);
+
+  // Single Fallback Polling Timer Controller
+  const startFallbackPolling = useCallback(() => {
+    if (pollingTimerRef.current) return;
+    pollingTimerRef.current = setInterval(() => {
+      if (Platform.OS !== "web" || document.visibilityState === "visible") {
+        const currentDoc = selectedDocRef.current;
+        const currentDate = selectedDateRef.current;
+        if (currentDoc && isFocused.current) {
+          refreshDoctorDataRef.current?.(currentDoc, currentDate, true);
+        }
+      }
+    }, POLL_INTERVAL_MS);
+  }, []);
+
+  const stopFallbackPolling = useCallback(() => {
+    if (pollingTimerRef.current) {
+      clearInterval(pollingTimerRef.current);
+      pollingTimerRef.current = null;
+    }
+  }, []);
 
   // Online / Offline listeners
   useEffect(() => {
@@ -217,41 +264,53 @@ export default function ReceptionistDashboard() {
       const nextDocId = isStillAuthorized ? prevSelected : (docs[0]?.id ?? null);
 
       if (nextDocId !== prevSelected) {
-        // Doc changed: immediately clear previous doctor's cached data
+        // Doc changed: immediately clear previous doctor's cached data and set initial loading
         setQueue([]);
         setDocSession(null);
         setSummaryData([]);
         setConfiguredSessions([]);
-        setSessionState({ status: "idle" });
+        setSessionState({ status: "loading" });
         setSelectedDoc(nextDocId);
         selectedDocRef.current = nextDocId;
       }
     } catch (err: any) {
+      const is401 = err?.status === 401 || (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired")));
+      if (is401) {
+        await handleAuthExpired();
+        return;
+      }
       setDoctorListStatus("error");
       setDoctorListError(err?.message || "Failed to load doctor list");
-      if (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired"))) {
-        await signOut();
-        router.replace("/login");
-      }
     } finally {
       if (!silent) setLoading(false);
     }
-  }, [router, signOut]);
+  }, [handleAuthExpired]);
+  useEffect(() => { fetchDoctorsRef.current = fetchDoctors; }, [fetchDoctors]);
 
   // 2. Fetch Doctor Data: queue, session, calendar summary, configured sessions
   const refreshDoctorData = useCallback(async (doctorId: string, targetDate: string, silent = false) => {
     if (!doctorId) return;
-    const curReqId = ++requestIdRef.current;
-    if (!silent) setRefreshing(true);
 
-    // Track session loading state with 5-second slow-load advisory
+    // Coalesce overlapping/burst requests
+    if (isFetchingRef.current) {
+      hasPendingUpdateRef.current = true;
+      return;
+    }
+    isFetchingRef.current = true;
+
+    const curReqId = ++requestIdRef.current;
     const curSessReqId = ++sessionReqIdRef.current;
-    setSessionState((prev) => ({
-      status: prev.status === "success" ? "loading" : "loading",
-      error: null,
-      is403: false,
-      slowLoading: false,
-    }));
+
+    // Only show full loading/session placeholder on initial load, NOT on background sync
+    if (!silent) {
+      setRefreshing(true);
+      setSessionState((prev) => ({
+        status: prev.status === "success" && docSession ? prev.status : "loading",
+        error: null,
+        is403: false,
+        slowLoading: false,
+      }));
+    }
 
     const slowTimer = setTimeout(() => {
       if (sessionReqIdRef.current === curSessReqId) {
@@ -274,6 +333,12 @@ export default function ReceptionistDashboard() {
       // 1. Queue handling
       if (qRes.status === "fulfilled") {
         setQueue(qRes.value || []);
+      } else {
+        const qErr = qRes.reason;
+        if (qErr?.status === 401 || (qErr?.message && (qErr.message.includes("401") || qErr.message.includes("expired")))) {
+          await handleAuthExpired();
+          return;
+        }
       }
 
       // 2. Session handling: isolate 403, error, empty, and success
@@ -290,16 +355,27 @@ export default function ReceptionistDashboard() {
         } else {
           const errReason = sessResult.reason;
           const errMsg = errReason?.message || "";
-          const is403 = errMsg.includes("403") || errMsg.toLowerCase().includes("forbidden") || errMsg.toLowerCase().includes("access denied");
-          setDocSession(null);
-          setSessionState({
-            status: "error",
-            error: is403
-              ? "Access Denied: You do not have permission to view or manage this doctor's consultation session."
-              : (errMsg || "Failed to load session timings"),
-            is403,
-            slowLoading: false,
-          });
+          const is401 = errReason?.status === 401 || errMsg.includes("401") || errMsg.includes("authenticated") || errMsg.includes("expired");
+          if (is401) {
+            await handleAuthExpired();
+            return;
+          }
+          const is403 = errReason?.status === 403 || errMsg.includes("403") || errMsg.toLowerCase().includes("forbidden") || errMsg.toLowerCase().includes("access denied");
+
+          if (silent && docSession) {
+            // Keep existing session UI visible during background refresh error
+            setIsStale(true);
+          } else {
+            setDocSession(null);
+            setSessionState({
+              status: "error",
+              error: is403
+                ? "Access Denied: You do not have permission to view or manage this doctor's consultation session."
+                : (errMsg || "Failed to load session timings"),
+              is403,
+              slowLoading: false,
+            });
+          }
         }
       }
 
@@ -320,17 +396,28 @@ export default function ReceptionistDashboard() {
       clearTimeout(slowTimer);
       if (curReqId !== requestIdRef.current) return;
       setIsStale(true);
-      if (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired"))) {
-        await signOut();
-        router.replace("/login");
+      const is401 = err?.status === 401 || (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired")));
+      if (is401) {
+        await handleAuthExpired();
+        return;
       }
     } finally {
+      isFetchingRef.current = false;
       if (curReqId === requestIdRef.current) {
         if (!silent) setLoading(false);
         setRefreshing(false);
       }
+      // Process pending background update if an event arrived while fetching
+      if (hasPendingUpdateRef.current) {
+        hasPendingUpdateRef.current = false;
+        const curD = selectedDocRef.current;
+        const curDt = selectedDateRef.current;
+        if (curD) {
+          refreshDoctorData(curD, curDt, true);
+        }
+      }
     }
-  }, [router, signOut]);
+  }, [docSession, handleAuthExpired]);
   useEffect(() => { refreshDoctorDataRef.current = refreshDoctorData; }, [refreshDoctorData]);
 
   // Dedicated Retry for session alone without reloading entire dashboard
@@ -362,7 +449,12 @@ export default function ReceptionistDashboard() {
       clearTimeout(slowTimer);
       if (sessionReqIdRef.current !== curSessReqId) return;
       const errMsg = err?.message || "";
-      const is403 = errMsg.includes("403") || errMsg.toLowerCase().includes("forbidden") || errMsg.toLowerCase().includes("access denied");
+      const is401 = err?.status === 401 || errMsg.includes("401") || errMsg.includes("authenticated") || errMsg.includes("expired");
+      if (is401) {
+        await handleAuthExpired();
+        return;
+      }
+      const is403 = err?.status === 403 || errMsg.includes("403") || errMsg.toLowerCase().includes("forbidden") || errMsg.toLowerCase().includes("access denied");
       setDocSession(null);
       setSessionState({
         status: "error",
@@ -383,23 +475,26 @@ export default function ReceptionistDashboard() {
         wsRef.current = null;
       }
       setWsConnected(false);
+      stopFallbackPolling();
       return;
     }
 
-    refreshDoctorData(selectedDoc, selectedDateRef.current, false);
+    // Initial load for this doctor
+    refreshDoctorDataRef.current?.(selectedDoc, selectedDateRef.current, false);
 
     if (wsRef.current) {
       try { wsRef.current.close(); } catch {}
       wsRef.current = null;
     }
 
-    const url = `${getBackendWebSocketBase()}/api/ws/queue/doctor/${selectedDoc}`;
+    const wsBase = getBackendWebSocketBase();
+    const url = `${wsBase}/api/ws/queue/doctor/${selectedDoc}`;
     try {
       const ws = new WebSocket(url);
       wsRef.current = ws;
       ws.onopen = () => {
         setWsConnected(true);
-        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+        stopFallbackPolling();
       };
       ws.onmessage = (e: any) => {
         try {
@@ -412,28 +507,22 @@ export default function ReceptionistDashboard() {
             const currentDoc = selectedDocRef.current;
             const currentDate = selectedDateRef.current;
             if (currentDoc) {
-              refreshDoctorData(currentDoc, currentDate, true);
+              refreshDoctorDataRef.current?.(currentDoc, currentDate, true);
             }
           }, 300);
         }
       };
-      ws.onerror = () => setWsConnected(false);
+      ws.onerror = () => {
+        setWsConnected(false);
+        startFallbackPolling();
+      };
       ws.onclose = () => {
         setWsConnected(false);
-        if (isFocused.current && !timerRef.current) {
-          timerRef.current = setInterval(() => {
-            if (Platform.OS !== "web" || document.visibilityState === "visible") {
-              const currentDoc = selectedDocRef.current;
-              const currentDate = selectedDateRef.current;
-              if (currentDoc) {
-                refreshDoctorData(currentDoc, currentDate, true);
-              }
-            }
-          }, POLL_INTERVAL_MS);
-        }
+        startFallbackPolling();
       };
     } catch {
       setWsConnected(false);
+      startFallbackPolling();
     }
 
     return () => {
@@ -442,34 +531,24 @@ export default function ReceptionistDashboard() {
         try { wsRef.current.close(); } catch {}
         wsRef.current = null;
       }
+      stopFallbackPolling();
     };
-  }, [selectedDoc, refreshDoctorData]);
+  }, [selectedDoc, startFallbackPolling, stopFallbackPolling]);
 
-  // Screen Focus Effect: does not trigger full reloads when wsConnected changes
+  // Screen Focus Effect: performs silent background refresh without recreating intervals or tearing down the screen
   useFocusEffect(
     useCallback(() => {
       isFocused.current = true;
-      if (doctorListStatus === "idle" || doctorListStatus === "loading") {
-        fetchDoctors(false);
-      } else if (selectedDocRef.current) {
-        refreshDoctorData(selectedDocRef.current, selectedDateRef.current, true);
+      if (selectedDocRef.current) {
+        refreshDoctorDataRef.current?.(selectedDocRef.current, selectedDateRef.current, true);
+      } else {
+        fetchDoctorsRef.current?.(false);
       }
-
-      const activeTimer = setInterval(() => {
-        if (!wsConnectedRef.current && (Platform.OS !== "web" || document.visibilityState === "visible")) {
-          const currentDoc = selectedDocRef.current;
-          const currentDate = selectedDateRef.current;
-          if (currentDoc) {
-            refreshDoctorData(currentDoc, currentDate, true);
-          }
-        }
-      }, POLL_INTERVAL_MS);
 
       return () => {
         isFocused.current = false;
-        clearInterval(activeTimer);
       };
-    }, [doctorListStatus, fetchDoctors, refreshDoctorData]),
+    }, []),
   );
 
   // Queue Action Handlers
@@ -987,7 +1066,7 @@ export default function ReceptionistDashboard() {
           </View>
         </View>
         <Pressable
-          onPress={async () => { await signOut(); router.replace("/login"); }}
+          onPress={async () => { await handleAuthExpired(); }}
           testID="reception-logout"
           style={styles.iconBtn}
         >

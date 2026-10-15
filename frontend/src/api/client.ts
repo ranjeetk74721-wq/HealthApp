@@ -32,6 +32,11 @@ export function getBackendBase() {
 
 export function getBackendWebSocketBase() {
   const base = getBackendBase();
+  if (!base) {
+    // On deployed web (e.g. Vercel) where getBackendBase() returns relative "",
+    // WebSockets require an absolute wss:// URL directed to the production backend
+    return PRODUCTION_BACKEND_URL.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://");
+  }
   return base.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://");
 }
 
@@ -39,7 +44,13 @@ export function getApiBase() {
   return getBackendBase().replace(/\/$/, "") + "/api";
 }
 
-async function getToken() {
+async function getToken(): Promise<string | null> {
+  if (Platform.OS === "web" && typeof window !== "undefined") {
+    try {
+      const sessToken = window.sessionStorage.getItem("cq_session_token");
+      if (sessToken) return sessToken;
+    } catch {}
+  }
   return await AsyncStorage.getItem("cq_token");
 }
 
@@ -344,7 +355,9 @@ async function request(path: string, opts: RequestOpts = {}) {
 
   if (!res.ok) {
     const msg = (data && data.detail) || `HTTP ${res.status}`;
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    const err: any = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    err.status = res.status;
+    throw err;
   }
 
   // Cache successful GET responses only if not stale from a concurrent invalidation

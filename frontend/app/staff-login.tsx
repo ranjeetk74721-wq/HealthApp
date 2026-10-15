@@ -12,8 +12,9 @@ export default function StaffLogin() {
   const params = useLocalSearchParams();
   const { signIn } = useAuth();
 
-  const hospitalId = (params.hospitalId as string) || "Unknown Hospital";
-  const hospitalName = (params.hospitalName as string) || "";
+  const savedHospitalId = typeof window !== "undefined" ? window.localStorage?.getItem("cq_receptionist_last_hospital") : null;
+  const hospitalId = (params.hospitalId as string) || savedHospitalId || "Unknown Hospital";
+  const hospitalName = (params.hospitalName as string) || (hospitalId !== "Unknown Hospital" ? `Hospital ${hospitalId}` : "");
   const role = (params.role as string) || "";
 
   const roleTitle = role === "doctor" ? "Doctor Login" : role === "receptionist" ? "Receptionist Login" : "Staff Login";
@@ -34,12 +35,12 @@ export default function StaffLogin() {
       const res = await api.post("/auth/login", { 
         email: email.trim().toLowerCase(), 
         password,
-        hospital_id: hospitalId,
+        hospital_id: hospitalId !== "Unknown Hospital" ? hospitalId : undefined,
         role: role || undefined,
       });
       
       // Ensure the logged in user belongs to this hospital ID
-      if (res.user.role !== "owner" && res.user.role !== "admin" && res.user.hospital_id && res.user.hospital_id.toUpperCase() !== hospitalId.toUpperCase()) {
+      if (hospitalId !== "Unknown Hospital" && res.user.role !== "owner" && res.user.role !== "admin" && res.user.hospital_id && res.user.hospital_id.toUpperCase() !== hospitalId.toUpperCase()) {
         setError(`You are not assigned to ${hospitalId}`);
         setLoading(false);
         return;
@@ -79,18 +80,25 @@ export default function StaffLogin() {
 
         <View style={styles.headerWrap}>
           <Text style={styles.title}>{roleTitle}</Text>
-          <Text style={styles.subtitle}>{hospitalName} ({hospitalId})</Text>
+          <Text style={styles.subtitle}>{hospitalName ? `${hospitalName} (${hospitalId})` : hospitalId}</Text>
+          <Pressable onPress={() => router.push("/hospital-id")} style={{ marginTop: 6 }}>
+            <Text style={{ fontSize: 12, color: colors.brandPrimary, textDecorationLine: "underline" }}>
+              Change Hospital ID
+            </Text>
+          </Pressable>
         </View>
 
         <View style={styles.card}>
           <Text style={styles.label}>Email</Text>
           <TextInput
-            placeholder="doctor@clinic.com"
+            placeholder="staff@clinic.com"
             placeholderTextColor={colors.muted}
             value={email}
             onChangeText={setEmail}
             keyboardType="email-address"
             autoCapitalize="none"
+            autoComplete="email"
+            textContentType="emailAddress"
             style={styles.input}
           />
 
@@ -101,6 +109,8 @@ export default function StaffLogin() {
             value={password}
             onChangeText={setPassword}
             secureTextEntry
+            autoComplete="current-password"
+            textContentType="password"
             style={styles.input}
           />
 
