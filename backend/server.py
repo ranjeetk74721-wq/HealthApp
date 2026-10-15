@@ -130,9 +130,22 @@ _push_client = httpx.AsyncClient(
 app = FastAPI()
 app.add_middleware(GZipMiddleware, minimum_size=500)  # Enable gzip compression for responses larger than 500 bytes
 
+# Explicit production origins and configurable origins from environment
+PROD_ORIGINS = [
+    "https://www.meribaariapp.in",
+    "https://meribaariapp.in",
+]
+_env_origins = os.environ.get("ALLOWED_ORIGINS", "").strip()
+if _env_origins:
+    PROD_ORIGINS.extend([o.strip() for o in _env_origins.split(",") if o.strip()])
+
+# Allow local development (localhost, 127.0.0.1, LAN private IPs: 10.x, 172.16-31.x, 192.168.x) and Vercel preview domains
+DEV_ORIGIN_REGEX = r"^(https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)(:\d+)?|https://.*\.vercel\.app)$"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: Restrict this to the production frontend URL before launch
+    allow_origins=PROD_ORIGINS,
+    allow_origin_regex=DEV_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -2504,10 +2517,10 @@ async def validate_hospital_id(body: ValidateHospitalIdBody):
     if not hid:
         raise HTTPException(status_code=400, detail="Hospital ID is required")
 
-    if hid.upper() in ["ADMIN-000", "H00001"]:
+    if hid.upper() == "ADMIN-000":
         return {
             "valid": True,
-            "hospital_id": hid.upper(),
+            "hospital_id": "ADMIN-000",
             "name": "System Admin",
             "isAdmin": True
         }
@@ -2516,10 +2529,19 @@ async def validate_hospital_id(body: ValidateHospitalIdBody):
         "$or": [
             {"hospital_id": hid},
             {"hospital_id": hid.upper()},
-            {"hospital_id": {"$regex": f"^{hid}$", "$options": "i"}}
+            {"hospital_id": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}}
         ],
         "status": {"$ne": "inactive"}
     })
+    if not hosp and hid.upper() == "H00001":
+        # Default hospital fallback when H00001 has not been explicitly inserted in db.hospitals
+        return {
+            "valid": True,
+            "hospital_id": "H00001",
+            "name": "Meribaari General Hospital (H00001)",
+            "city": "Main City",
+            "isAdmin": False
+        }
     if not hosp:
         raise HTTPException(status_code=404, detail="Invalid or inactive Hospital ID")
 
@@ -5337,8 +5359,14 @@ async def reception_queue(
 @api_router.get("/reception/doctors")
 async def reception_doctors(user: dict = Depends(require_role("receptionist", "doctor"))):
     q = {}
-    if user.get("hospital_id"):
-        q["hospital_id"] = user["hospital_id"]
+    hid = (user.get("hospital_id") or "").strip()
+    if hid:
+        q["$or"] = [
+            {"hospital_id": hid},
+            {"hospital_id": hid.upper()},
+            {"hospital_id": hid.lower()},
+            {"hospital_id": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}}
+        ]
     docs = await db.doctors.find(q, {"_id": 0}).to_list(200)
     return docs
 

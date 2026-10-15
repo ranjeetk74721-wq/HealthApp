@@ -91,20 +91,21 @@ export default function DynamicAppointmentScreen() {
       } catch (err: any) {
         if (!isMounted.current) return;
         setIsStale(true);
-        const msg = err.message || "";
-        if (msg.includes("410")) {
+        const status = err?.status;
+        const msg = err?.message || "";
+        if (status === 410 || msg.includes("410")) {
           setErrorStatus(410);
           setErrorMessage("This appointment link has expired or was cancelled.");
-        } else if (msg.includes("403")) {
+        } else if (status === 403 || msg.includes("403")) {
           setErrorStatus(403);
           setErrorMessage(
             "Access Denied: This appointment link is not authorized."
           );
-        } else if (msg.includes("404")) {
+        } else if (status === 404 || msg.includes("404")) {
           setErrorStatus(404);
           setErrorMessage("Appointment not found or link has expired.");
         } else {
-          setErrorMessage(err.message || "Unable to load appointment details.");
+          setErrorMessage(err?.message || "Unable to load appointment details.");
         }
       } finally {
         if (isMounted.current) {

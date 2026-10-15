@@ -6,37 +6,115 @@ export const PRODUCTION_BACKEND_URL = "https://healthapp-b4mo.onrender.com";
 const configuredBase = process.env.EXPO_PUBLIC_BACKEND_URL;
 const expoHost = Constants.expoConfig?.hostUri?.split(":")[0];
 
-export function getBackendBase() {
+/**
+ * Checks whether a hostname belongs to a private local development network.
+ * Restricts local development fallback strictly to valid private IPv4 blocks,
+ * localhost, and .local mDNS names.
+ */
+export function isPrivateDevHost(hostname: string): boolean {
+  if (!hostname) return false;
+  if (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "0.0.0.0" ||
+    hostname.endsWith(".local")
+  ) {
+    return true;
+  }
+  const parts = hostname.split(".").map(Number);
+  if (parts.length === 4 && parts.every((p) => !isNaN(p) && p >= 0 && p <= 255)) {
+    // 10.0.0.0 - 10.255.255.255
+    if (parts[0] === 10) return true;
+    // 172.16.0.0 - 172.31.255.255
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    // 192.168.0.0 - 192.168.255.255
+    if (parts[0] === 192 && parts[1] === 168) return true;
+  }
+  return false;
+}
+
+export function getBackendBase(): string {
+  // 1. Explicitly configured backend URL
   if (process.env.EXPO_PUBLIC_BACKEND_URL) {
-    const envUrl = process.env.EXPO_PUBLIC_BACKEND_URL.trim();
-    if (envUrl && !envUrl.includes("localhost") && !envUrl.includes("127.0.0.1")) {
-      return envUrl;
+    const raw = process.env.EXPO_PUBLIC_BACKEND_URL.trim();
+    if (raw) {
+      const cleaned = raw.replace(/\/+$/, "").replace(/\/api$/, "");
+      // Never send HTTPS production web users to an HTTP backend (mixed content failure)
+      if (
+        Platform.OS === "web" &&
+        typeof window !== "undefined" &&
+        window.location.protocol === "https:" &&
+        cleaned.startsWith("http://")
+      ) {
+        return "";
+      }
+      if (!cleaned.includes("localhost") && !cleaned.includes("127.0.0.1")) {
+        return cleaned;
+      }
     }
   }
 
+  // 2. Web browser resolution
   if (Platform.OS === "web" && typeof window !== "undefined") {
-    const hostname = window.location.hostname;
-    // Local development web
-    if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0") {
-      return "http://localhost:8000";
+    const { hostname, protocol } = window.location;
+    // Local / LAN development web: resolve backend to laptop host on port 8000
+    if (protocol === "http:" && isPrivateDevHost(hostname)) {
+      return `http://${hostname}:8000`;
     }
-    // Deployed web (e.g. Vercel) -> use relative path because vercel.json proxies /api to Render
+    // Deployed web (e.g. Vercel at https://www.meribaariapp.in) -> use relative path
+    // because vercel.json proxies /api to Render backend
     return "";
   }
 
+  // 3. Native Expo resolution
   const isLocalhost = !configuredBase || /localhost|127\.0\.0\.1/.test(configuredBase);
-  return Platform.OS !== "web" && isLocalhost && expoHost
-    ? `http://${expoHost}:8000`
-    : (configuredBase || PRODUCTION_BACKEND_URL);
+  if (Platform.OS !== "web" && isLocalhost && expoHost) {
+    return `http://${expoHost}:8000`;
+  }
+
+  return configuredBase
+    ? configuredBase.replace(/\/+$/, "").replace(/\/api$/, "")
+    : PRODUCTION_BACKEND_URL;
 }
 
-export function getBackendWebSocketBase() {
-  const base = getBackendBase();
+export function getBackendWebSocketBase(): string {
+  // 1. If explicit EXPO_PUBLIC_BACKEND_URL is given
+  if (process.env.EXPO_PUBLIC_BACKEND_URL) {
+    const raw = process.env.EXPO_PUBLIC_BACKEND_URL.trim();
+    if (raw && !raw.includes("localhost") && !raw.includes("127.0.0.1")) {
+      const cleaned = raw.replace(/\/+$/, "").replace(/\/api$/, "");
+      return cleaned.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://");
+    }
+  }
+
+  // 2. Web browser resolution
+  if (Platform.OS === "web" && typeof window !== "undefined") {
+    const { hostname, protocol } = window.location;
+    // Local development web (localhost or LAN IP over HTTP)
+    if (protocol === "http:" && isPrivateDevHost(hostname)) {
+      return `ws://${hostname}:8000`;
+    }
+    // Production web (e.g. Vercel):
+    // Vercel serverless HTTP rewrites DO NOT support persistent WebSockets.
+    // Therefore, web clients in production MUST connect directly to Render's WSS endpoint.
+    return PRODUCTION_BACKEND_URL.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://");
+  }
+
+  // 3. Native Expo resolution
+  const isLocalhost = !configuredBase || /localhost|127\.0\.0\.1/.test(configuredBase);
+  if (Platform.OS !== "web" && isLocalhost && expoHost) {
+    return `ws://${expoHost}:8000`;
+  }
+
+  const base = configuredBase
+    ? configuredBase.replace(/\/+$/, "").replace(/\/api$/, "")
+    : PRODUCTION_BACKEND_URL;
   return base.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://");
 }
 
-export function getApiBase() {
-  return getBackendBase().replace(/\/$/, "") + "/api";
+export function getApiBase(): string {
+  const base = getBackendBase();
+  return base ? `${base}/api` : "/api";
 }
 
 async function getToken() {
@@ -272,12 +350,41 @@ export function getTargetedInvalidationPrefixes(path: string, _method: string): 
   return null;
 }
 
-export class TimeoutError extends Error {
+export class ApiError extends Error {
+  status: number;
+  data: any;
+  isHtmlResponse: boolean;
+  isServerWarming: boolean;
+  isAuthError: boolean;
+  isForbidden: boolean;
+  isNetworkError: boolean;
+
+  constructor(message: string, status: number = 0, data: any = null, isHtml: boolean = false) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.data = data;
+    this.isHtmlResponse = isHtml;
+    this.isNetworkError = status === 0;
+    this.isAuthError = status === 401;
+    this.isForbidden = status === 403;
+    this.isServerWarming = status === 502 || status === 503 || status === 504;
+  }
+}
+
+export class TimeoutError extends ApiError {
   isTimeout = true;
   constructor(message?: string) {
-    super(message || "Request timed out");
+    super(message || "Request timed out", 0, null, false);
     this.name = "TimeoutError";
   }
+}
+
+export function isConfirmedAuthError(err: any): boolean {
+  if (!err) return false;
+  if (err instanceof ApiError) return err.isAuthError;
+  if (err?.status === 401) return true;
+  return false;
 }
 
 export interface RequestOpts extends RequestInit {
@@ -287,7 +394,7 @@ export interface RequestOpts extends RequestInit {
 }
 
 // ─── Core request ───────────────────────────────────────────────────────────
-async function request(path: string, opts: RequestOpts = {}) {
+async function request(path: string, opts: RequestOpts = {}, retryCount = 0): Promise<any> {
   const reqSeq = ++_requestSeq;
   const token = await getToken();
   const headers: any = { ...(opts.headers || {}) };
@@ -296,8 +403,20 @@ async function request(path: string, opts: RequestOpts = {}) {
   }
   if (token) headers.Authorization = `Bearer ${token}`;
   const method = (opts.method || "GET").toUpperCase();
+
+  // Normalize path to prevent duplicate or missing /api
+  let cleanPath = path.trim();
+  if (cleanPath.startsWith("/api/")) {
+    cleanPath = cleanPath.slice(4);
+  } else if (cleanPath === "/api") {
+    cleanPath = "";
+  }
+  if (!cleanPath.startsWith("/")) {
+    cleanPath = `/${cleanPath}`;
+  }
+
   const apiBase = getApiBase();
-  const url = `${apiBase}${path}`;
+  const url = `${apiBase}${cleanPath}`;
 
   // Return cached result for GET requests unless bypassCache is true
   if (method === "GET" && !opts.bypassCache) {
@@ -324,17 +443,44 @@ async function request(path: string, opts: RequestOpts = {}) {
   } catch (err: any) {
     if (didTimeout || err?.name === "AbortError") {
       throw new TimeoutError(
-        `Request to ${path} timed out after ${opts.timeoutMs}ms. Please check your connection.`,
+        `Request to ${cleanPath} timed out after ${opts.timeoutMs}ms. Please check your connection.`,
       );
     }
-    throw new Error(
-      `Unable to reach the Meribaari API at ${getBackendBase()}. Check your internet connection and try again.`,
+
+    // Safe transient retry for idempotent GET requests (handles mobile network switch or Render cold-start)
+    if (method === "GET" && retryCount < 1) {
+      await new Promise((r) => setTimeout(r, 1500));
+      return request(path, opts, retryCount + 1);
+    }
+
+    const hostDisplay = typeof window !== "undefined" ? (getBackendBase() || window.location.origin) : getBackendBase();
+    throw new ApiError(
+      `Unable to reach the Meribaari API at ${hostDisplay}. Check your internet connection and try again.`,
+      0,
+      null,
+      false,
     );
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
   }
 
+  const contentType = res.headers.get("content-type") || "";
   const text = await res.text();
+  const isHtml =
+    contentType.includes("text/html") ||
+    text.trim().startsWith("<!DOCTYPE") ||
+    text.trim().startsWith("<html");
+
+  if (isHtml) {
+    // API route returned HTML: indicates a routing failure, missing backend proxy, or SPA fallback
+    throw new ApiError(
+      `API route returned HTML instead of JSON (HTTP ${res.status}). The requested endpoint '${cleanPath}' may be misrouted or server is warming up.`,
+      res.status,
+      text,
+      true,
+    );
+  }
+
   let data: any = null;
   try {
     data = text ? JSON.parse(text) : null;
@@ -343,8 +489,19 @@ async function request(path: string, opts: RequestOpts = {}) {
   }
 
   if (!res.ok) {
-    const msg = (data && data.detail) || `HTTP ${res.status}`;
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    // Retry once for GET on 502/503 during Render cold start
+    if (method === "GET" && (res.status === 502 || res.status === 503) && retryCount < 1) {
+      await new Promise((r) => setTimeout(r, 2000));
+      return request(path, opts, retryCount + 1);
+    }
+
+    let msg = `HTTP ${res.status}`;
+    if (data && typeof data === "object" && data.detail) {
+      msg = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+    } else if (typeof data === "string" && data.length < 200) {
+      msg = data;
+    }
+    throw new ApiError(msg, res.status, data, false);
   }
 
   // Cache successful GET responses only if not stale from a concurrent invalidation
@@ -359,7 +516,7 @@ async function request(path: string, opts: RequestOpts = {}) {
     if (explicitPrefixes !== undefined) {
       invalidateCache(explicitPrefixes);
     } else {
-      const targeted = getTargetedInvalidationPrefixes(path, method);
+      const targeted = getTargetedInvalidationPrefixes(cleanPath, method);
       if (targeted !== null) {
         invalidateCache(targeted);
       } else {

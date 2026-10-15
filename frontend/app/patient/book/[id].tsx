@@ -13,7 +13,7 @@ import {
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { api } from "@/src/api/client";
+import { api, isConfirmedAuthError } from "@/src/api/client";
 import { colors, spacing, radius, font } from "@/src/theme";
 import { formatExpectedTimeRange } from "@/src/utils/timeFormat";
 import NotificationPermissionBanner from "@/src/components/NotificationPermissionBanner";
@@ -204,6 +204,9 @@ export default function BookAppointment() {
         }
         setShowPay(false);
         setError("Booking request timed out. Server verification confirmed no appointment was created. You can retry.");
+      } else if (isConfirmedAuthError(e) || e?.status === 401) {
+        setShowPay(false);
+        router.push(`/login?redirect=${encodeURIComponent(`/patient/book/${id}`)}`);
       } else {
         setShowPay(false);
         setError(e.message || "Booking failed. Please review session eligibility.");

@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   View, Text, StyleSheet, ScrollView, ActivityIndicator, Pressable,
-  RefreshControl, Modal, TextInput, Alert, Image,
+  RefreshControl, Modal, TextInput, Alert, Image, KeyboardAvoidingView, Platform,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
 import * as ImagePicker from "expo-image-picker";
-import { api, getBackendWebSocketBase } from "@/src/api/client";
+import { api, getBackendWebSocketBase, isConfirmedAuthError } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import CalendarSummary from "@/src/components/CalendarSummary";
@@ -38,10 +38,12 @@ const STATUS_COLORS: Record<string, string> = {
 
 export default function DoctorDashboard() {
   const router = useRouter();
-  const { user, signOut } = useAuth();
+  const { user, loading: authLoading, signOut } = useAuth();
   const [docSession, setDocSession]   = useState<any | null>(null);
   const [data, setData]       = useState<any | null>(null);
   const [appts, setAppts]     = useState<any[]>([]);
+  const [apptsError, setApptsError] = useState<string | null>(null);
+  const [profileError, setProfileError] = useState<string | null>(null);
   const [summaryData, setSummaryData] = useState<any[]>([]);
   const [receptionists, setReceptionists] = useState<any[]>([]);
   const [selectedPatientAppt, setSelectedPatientAppt] = useState<any | null>(null);
@@ -76,90 +78,182 @@ export default function DoctorDashboard() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
-  const timerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isFocused = useRef(true);
+  const isLoggingOutRef = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimerRef = useRef<any>(null);
 
-  const load = useCallback(async (silent = false, bypassCache = false) => {
-    const shouldBypass = bypassCache;
+  const handleAuthExpired = useCallback(async () => {
+    if (isLoggingOutRef.current) return;
+    isLoggingOutRef.current = true;
     try {
-      const targetDate = selectedDateRef.current;
-      const [d, a, sum, recs] = await Promise.all([
-        api.get("/doctor/dashboard", { bypassCache: shouldBypass }),
-        api.get(`/doctor/appointments?date=${targetDate}`, { bypassCache: shouldBypass }),
-        api.get("/appointments/calendar-summary", { bypassCache: shouldBypass }).catch(() => []),
-        api.get("/doctor/receptionists", { bypassCache: shouldBypass }).catch(() => []),
-      ]);
-      setData(d);
-      setAppts(a || []);
-      setSummaryData(sum || []);
-      setReceptionists(recs || []);
-
-      const docId = d?.doctor?.id;
-      if (docId) {
-        api.get(`/doctor/${docId}/session?date=${targetDate}`, { bypassCache: shouldBypass })
-          .then((res) => { if (res?.session) setDocSession(res.session); })
-          .catch(() => {});
-      }
-    } catch (err: any) {
-      if (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired"))) {
-        await signOut();
-        router.replace("/login");
-      }
+      await signOut();
+      router.replace("/hospital-id?redirect=/doctor/dashboard");
     } finally {
-      if (!silent) setLoading(false);
-      setRefreshing(false);
+      isLoggingOutRef.current = false;
     }
   }, [router, signOut]);
 
-  // WebSocket — subscribe to doctor's queue channel
+  const load = useCallback(async (silent = false, bypassCache = false) => {
+    const shouldBypass = bypassCache;
+    const targetDate = selectedDateRef.current;
+
+    // 1. Independent Doctor Profile & Status load
+    try {
+      const d = await api.get("/doctor/dashboard", { bypassCache: shouldBypass });
+      if (d && typeof d === "object") {
+        setData(d);
+        setProfileError(null);
+        const docId = d?.doctor?.id;
+        if (docId) {
+          api.get(`/doctor/${docId}/session?date=${targetDate}`, { bypassCache: shouldBypass })
+            .then((res) => { if (res?.session) setDocSession(res.session); })
+            .catch(() => {});
+        }
+      }
+    } catch (err: any) {
+      if (isConfirmedAuthError(err)) {
+        await handleAuthExpired();
+        return;
+      }
+      setProfileError(err?.message || "Failed to load doctor profile");
+    }
+
+    // 2. Independent Appointments load
+    try {
+      const a = await api.get(`/doctor/appointments?date=${targetDate}`, { bypassCache: shouldBypass });
+      if (Array.isArray(a)) {
+        setAppts(a);
+        setApptsError(null);
+      }
+    } catch (err: any) {
+      if (isConfirmedAuthError(err)) {
+        await handleAuthExpired();
+        return;
+      }
+      setApptsError(err?.message || "Failed to load appointments");
+    }
+
+    // 3. Non-essential sections (Calendar Summary & Receptionists)
+    api.get("/appointments/calendar-summary", { bypassCache: shouldBypass })
+      .then((sum) => { if (Array.isArray(sum)) setSummaryData(sum); })
+      .catch(() => {});
+
+    api.get("/doctor/receptionists", { bypassCache: shouldBypass })
+      .then((recs) => { if (Array.isArray(recs)) setReceptionists(recs); })
+      .catch(() => {});
+
+    if (!silent) setLoading(false);
+    setRefreshing(false);
+  }, [handleAuthExpired]);
+
+  // Online & Visibility Listener for Mobile Backgrounding
+  useEffect(() => {
+    if (Platform.OS === "web" && typeof window !== "undefined") {
+      const handleVisibilityChange = () => {
+        if (document.visibilityState === "visible") {
+          load(true, true);
+        }
+      };
+      const handleOnline = () => {
+        load(true, true);
+      };
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+      window.addEventListener("online", handleOnline);
+      return () => {
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+        window.removeEventListener("online", handleOnline);
+      };
+    }
+  }, [load]);
+
+  // WebSocket with bounded exponential backoff
   useEffect(() => {
     const doctorId = data?.doctor?.id;
     if (!doctorId) return;
 
-    if (wsRef.current) { try { wsRef.current.close(); } catch { /* ignore */ } wsRef.current = null; }
+    let isDisposed = false;
 
-    try {
-      const ws = new WebSocket(`${getBackendWebSocketBase()}/api/ws/queue/doctor/${doctorId}`);
-      wsRef.current = ws;
-      ws.onopen = () => {
-        setWsConnected(true);
-        // WS is live — stop fallback polling
-        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-      };
-      ws.onmessage = (e: any) => {
-        try {
-          const msg = typeof e?.data === "string" ? JSON.parse(e.data) : e?.data;
-          if (msg?.type === "ping" || msg?.type === "pong" || msg?.type === "connected") return;
-        } catch {}
-        if (isFocused.current) load(true);
-      };
-      ws.onerror   = () => setWsConnected(false);
-      ws.onclose   = () => {
+    const connectWs = () => {
+      if (isDisposed) return;
+      if (wsRef.current) {
+        try { wsRef.current.close(); } catch {}
+        wsRef.current = null;
+      }
+
+      try {
+        const ws = new WebSocket(`${getBackendWebSocketBase()}/api/ws/queue/doctor/${doctorId}`);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          if (isDisposed) { ws.close(); return; }
+          setWsConnected(true);
+          reconnectAttemptsRef.current = 0;
+          if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+        };
+
+        ws.onmessage = (e: any) => {
+          try {
+            const msg = typeof e?.data === "string" ? JSON.parse(e.data) : e?.data;
+            if (msg?.type === "ping" || msg?.type === "pong" || msg?.type === "connected") return;
+          } catch {}
+          if (isFocused.current) load(true);
+        };
+
+        ws.onerror = () => setWsConnected(false);
+
+        ws.onclose = () => {
+          setWsConnected(false);
+          wsRef.current = null;
+          if (!isDisposed) {
+            const attempts = reconnectAttemptsRef.current;
+            reconnectAttemptsRef.current = attempts + 1;
+            const delay = Math.min(30000, Math.max(2000, Math.pow(1.5, attempts) * 1000 + Math.random() * 1000));
+            reconnectTimerRef.current = setTimeout(() => {
+              if (isFocused.current) connectWs();
+            }, delay);
+
+            if (isFocused.current && !timerRef.current) {
+              timerRef.current = setInterval(() => load(true), POLL_INTERVAL_MS);
+            }
+          }
+        };
+      } catch {
         setWsConnected(false);
-        // Restart fallback polling if still on screen
-        if (isFocused.current && !timerRef.current) {
-          timerRef.current = setInterval(() => load(true), POLL_INTERVAL_MS);
-        }
-      };
-    } catch { setWsConnected(false); }
+      }
+    };
+
+    connectWs();
 
     return () => {
-      if (wsRef.current) { try { wsRef.current.close(); } catch { /* ignore */ } wsRef.current = null; }
+      isDisposed = true;
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      if (wsRef.current) {
+        try { wsRef.current.close(); } catch {}
+        wsRef.current = null;
+      }
     };
   }, [data?.doctor?.id, load]);
+
+  useEffect(() => {
+    if (!authLoading && !user) {
+      router.replace("/hospital-id?redirect=/doctor/dashboard");
+    }
+  }, [authLoading, user, router]);
 
   useFocusEffect(
     useCallback(() => {
       isFocused.current = true;
       load();
-      if (!wsConnected) {
+      if (!wsConnected && !timerRef.current) {
         timerRef.current = setInterval(() => load(true), POLL_INTERVAL_MS);
       }
       return () => {
         isFocused.current = false;
         if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
       };
-    }, [load, wsConnected]),
+    }, [load, wsConnected])
   );
 
   const changeStatus = async (status: string) => {
@@ -310,10 +404,32 @@ export default function DoctorDashboard() {
     );
   };
 
-  if (loading || !data) {
+  if (authLoading || (loading && !data)) {
     return (
       <SafeAreaView style={styles.safe}>
-        <ActivityIndicator style={{ marginTop: 60 }} color={colors.brand} />
+        <ActivityIndicator style={{ marginTop: 60 }} color={colors.brandPrimary} />
+      </SafeAreaView>
+    );
+  }
+
+  if (!data && profileError) {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <View style={{ flex: 1, justifyContent: "center", alignItems: "center", padding: spacing.xl }}>
+          <Ionicons name="alert-circle-outline" size={48} color={colors.error} />
+          <Text style={{ fontSize: font.lg, fontWeight: "700", color: colors.onSurface, marginTop: 12 }}>
+            Unable to Load Dashboard
+          </Text>
+          <Text style={{ fontSize: font.sm, color: colors.muted, textAlign: "center", marginTop: 8, marginBottom: 20 }}>
+            {profileError}
+          </Text>
+          <Pressable
+            onPress={() => { setLoading(true); load(false, true); }}
+            style={{ backgroundColor: colors.brandPrimary, paddingHorizontal: 24, paddingVertical: 12, borderRadius: radius.md }}
+          >
+            <Text style={{ color: colors.onBrandPrimary, fontWeight: "700" }}>Retry</Text>
+          </Pressable>
+        </View>
       </SafeAreaView>
     );
   }
@@ -606,120 +722,128 @@ export default function DoctorDashboard() {
 
       {/* ── Prescription Modal ── */}
       <Modal transparent visible={!!prescOpen} animationType="slide" onRequestClose={() => setPrescOpen(null)}>
-        <Pressable style={styles.modalBackdrop} onPress={() => setPrescOpen(null)}>
-          <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
-            <View style={styles.sheetHandle} />
-            <Text style={styles.sheetTitle}>Prescription</Text>
-            <Text style={styles.sheetSub}>{prescOpen?.patient_name}</Text>
-            <TextInput
-              testID="presc-input"
-              value={prescText}
-              onChangeText={setPrescText}
-              multiline
-              placeholder="Rx: medication, dosage, notes..."
-              placeholderTextColor={colors.muted}
-              style={styles.prescInput}
-            />
-            <Pressable testID="presc-save" onPress={savePresc} style={styles.saveBtn}>
-              <Text style={styles.saveBtnText}>Save Prescription</Text>
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setPrescOpen(null)}>
+            <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <Text style={styles.sheetTitle}>Prescription</Text>
+              <Text style={styles.sheetSub}>{prescOpen?.patient_name}</Text>
+              <TextInput
+                testID="presc-input"
+                value={prescText}
+                onChangeText={setPrescText}
+                multiline
+                placeholder="Rx: medication, dosage, notes..."
+                placeholderTextColor={colors.muted}
+                style={styles.prescInput}
+              />
+              <Pressable testID="presc-save" onPress={savePresc} style={styles.saveBtn}>
+                <Text style={styles.saveBtnText}>Save Prescription</Text>
+              </Pressable>
             </Pressable>
           </Pressable>
-        </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* ── Add Receptionist Modal ── */}
       <Modal transparent visible={recModalOpen} animationType="slide" onRequestClose={() => setRecModalOpen(false)}>
-        <Pressable style={styles.modalBackdrop} onPress={() => setRecModalOpen(false)}>
-          <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
-            <View style={styles.sheetHandle} />
-            <Text style={styles.sheetTitle}>Add Receptionist</Text>
-            <Text style={styles.sheetSub}>Create a receptionist for your hospital (Hospital ID is locked to your hospital)</Text>
-            
-            <Text style={styles.editLabel}>Full Name*</Text>
-            <TextInput value={recName} onChangeText={setRecName} placeholder="e.g. Rahul Sharma" placeholderTextColor={colors.muted} style={styles.editInput} />
-            
-            <Text style={styles.editLabel}>Login Email*</Text>
-            <TextInput value={recEmail} onChangeText={setRecEmail} keyboardType="email-address" autoCapitalize="none" placeholder="receptionist@hospital.com" placeholderTextColor={colors.muted} style={styles.editInput} />
-            
-            <Text style={styles.editLabel}>Login Password*</Text>
-            <TextInput value={recPassword} onChangeText={setRecPassword} secureTextEntry placeholder="Temporary password" placeholderTextColor={colors.muted} style={styles.editInput} />
-            
-            <Text style={styles.editLabel}>Mobile Number (Optional)</Text>
-            <TextInput value={recMobile} onChangeText={setRecMobile} keyboardType="phone-pad" placeholder="9876543210" placeholderTextColor={colors.muted} style={styles.editInput} />
-            
-            {recError ? <Text style={{ color: colors.error, fontSize: font.sm, marginTop: 6, textAlign: "center" }}>{recError}</Text> : null}
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setRecModalOpen(false)}>
+            <Pressable style={[styles.sheet, { maxHeight: "90%" }]} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <Text style={styles.sheetTitle}>Add Receptionist</Text>
+              <Text style={styles.sheetSub}>Create a receptionist for your hospital (Hospital ID is locked to your hospital)</Text>
+              
+              <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 20 }}>
+                <Text style={styles.editLabel}>Full Name*</Text>
+                <TextInput value={recName} onChangeText={setRecName} placeholder="e.g. Rahul Sharma" placeholderTextColor={colors.muted} style={styles.editInput} />
+                
+                <Text style={styles.editLabel}>Login Email*</Text>
+                <TextInput value={recEmail} onChangeText={setRecEmail} keyboardType="email-address" autoCapitalize="none" placeholder="receptionist@hospital.com" placeholderTextColor={colors.muted} style={styles.editInput} />
+                
+                <Text style={styles.editLabel}>Login Password*</Text>
+                <TextInput value={recPassword} onChangeText={setRecPassword} secureTextEntry placeholder="Temporary password" placeholderTextColor={colors.muted} style={styles.editInput} />
+                
+                <Text style={styles.editLabel}>Mobile Number (Optional)</Text>
+                <TextInput value={recMobile} onChangeText={setRecMobile} keyboardType="phone-pad" placeholder="9876543210" placeholderTextColor={colors.muted} style={styles.editInput} />
+                
+                {recError ? <Text style={{ color: colors.error, fontSize: font.sm, marginTop: 6, textAlign: "center" }}>{recError}</Text> : null}
 
-            <Pressable onPress={handleAddReceptionist} disabled={recSaving} style={styles.saveBtn}>
-              {recSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveBtnText}>Save Receptionist</Text>}
+                <Pressable onPress={handleAddReceptionist} disabled={recSaving} style={styles.saveBtn}>
+                  {recSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveBtnText}>Save Receptionist</Text>}
+                </Pressable>
+              </ScrollView>
             </Pressable>
           </Pressable>
-        </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* ── Edit Profile Modal ── */}
       <Modal transparent visible={editOpen} animationType="slide" onRequestClose={() => setEditOpen(false)}>
-        <Pressable style={styles.modalBackdrop} onPress={() => setEditOpen(false)}>
-          <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
-            <View style={styles.sheetHandle} />
-            <Text style={styles.sheetTitle}>Update My Profile</Text>
-            <Text style={styles.sheetSub}>Update your consultation fees, timings, photo &amp; password</Text>
-            
-            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ gap: spacing.xs, paddingBottom: 20 }}>
-              {/* Photo section */}
-              <Text style={styles.editLabel}>Profile Photo (Max 5 MB)</Text>
-              <View style={{ flexDirection: "row", alignItems: "center", gap: 14, marginVertical: 6 }}>
-                {editPhoto ? (
-                  <Image source={{ uri: editPhoto }} style={{ width: 64, height: 64, borderRadius: 32, backgroundColor: colors.border }} />
-                ) : (
-                  <View style={{ width: 64, height: 64, borderRadius: 32, backgroundColor: colors.surfaceSecondary, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.border }}>
-                    <Ionicons name="person-circle-outline" size={44} color={colors.muted} />
-                  </View>
-                )}
-                <View style={{ gap: 6, flex: 1 }}>
-                  <Pressable onPress={pickPhoto} style={{ flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: colors.brandSecondary, paddingVertical: 8, paddingHorizontal: 12, borderRadius: radius.md, alignSelf: "flex-start" }}>
-                    <Ionicons name="camera-outline" size={16} color={colors.brandPrimary} />
-                    <Text style={{ color: colors.brandPrimary, fontWeight: "600", fontSize: font.sm }}>Change Photo</Text>
-                  </Pressable>
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setEditOpen(false)}>
+            <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <Text style={styles.sheetTitle}>Update My Profile</Text>
+              <Text style={styles.sheetSub}>Update your consultation fees, timings, photo &amp; password</Text>
+              
+              <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ gap: spacing.xs, paddingBottom: 20 }}>
+                {/* Photo section */}
+                <Text style={styles.editLabel}>Profile Photo (Max 5 MB)</Text>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 14, marginVertical: 6 }}>
                   {editPhoto ? (
-                    <Pressable onPress={() => setEditPhoto(null)} style={{ alignSelf: "flex-start" }}>
-                      <Text style={{ color: colors.error, fontSize: font.xs, fontWeight: "600" }}>Remove Photo</Text>
+                    <Image source={{ uri: editPhoto }} style={{ width: 64, height: 64, borderRadius: 32, backgroundColor: colors.border }} />
+                  ) : (
+                    <View style={{ width: 64, height: 64, borderRadius: 32, backgroundColor: colors.surfaceSecondary, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.border }}>
+                      <Ionicons name="person-circle-outline" size={44} color={colors.muted} />
+                    </View>
+                  )}
+                  <View style={{ gap: 6, flex: 1 }}>
+                    <Pressable onPress={pickPhoto} style={{ flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: colors.brandSecondary, paddingVertical: 8, paddingHorizontal: 12, borderRadius: radius.md, alignSelf: "flex-start" }}>
+                      <Ionicons name="camera-outline" size={16} color={colors.brandPrimary} />
+                      <Text style={{ color: colors.brandPrimary, fontWeight: "600", fontSize: font.sm }}>Change Photo</Text>
                     </Pressable>
-                  ) : null}
+                    {editPhoto ? (
+                      <Pressable onPress={() => setEditPhoto(null)} style={{ alignSelf: "flex-start" }}>
+                        <Text style={{ color: colors.error, fontSize: font.xs, fontWeight: "600" }}>Remove Photo</Text>
+                      </Pressable>
+                    ) : null}
+                  </View>
                 </View>
-              </View>
 
-              {/* Password section */}
-              <Text style={styles.editLabel}>Change Password (leave empty to keep current)</Text>
-              <TextInput
-                value={editPassword}
-                onChangeText={setEditPassword}
-                secureTextEntry
-                placeholder="New Password (min 6 chars)"
-                placeholderTextColor={colors.muted}
-                style={styles.editInput}
-              />
+                {/* Password section */}
+                <Text style={styles.editLabel}>Change Password (leave empty to keep current)</Text>
+                <TextInput
+                  value={editPassword}
+                  onChangeText={setEditPassword}
+                  secureTextEntry
+                  placeholder="New Password (min 6 chars)"
+                  placeholderTextColor={colors.muted}
+                  style={styles.editInput}
+                />
 
-              <Text style={styles.editLabel}>Consultation Fees (₹)</Text>
-              <TextInput testID="edit-fees" value={editFees} onChangeText={(v) => setEditFees(v.replace(/[^0-9]/g, ""))} keyboardType="number-pad" placeholder="500" placeholderTextColor={colors.muted} style={styles.editInput} />
-              
-              <Text style={styles.editLabel}>⏱ Avg. Time per Patient (minutes)</Text>
-              <TextInput testID="edit-avgmin" value={editAvgMin} onChangeText={(v) => setEditAvgMin(v.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" placeholder="15" placeholderTextColor={colors.muted} style={styles.editInput} />
-              <Text style={styles.hintTxt}>Patients ki live wait time is number × queue position se calculate hoti hai</Text>
-              
-              <Text style={styles.editLabel}>Timings</Text>
-              <TextInput testID="edit-timings" value={editTimings} onChangeText={setEditTimings} placeholder="10:00 AM - 4:00 PM" placeholderTextColor={colors.muted} style={styles.editInput} />
-              
-              <Text style={styles.editLabel}>Bio (optional)</Text>
-              <TextInput testID="edit-bio" value={editBio} onChangeText={setEditBio} multiline placeholder="Short bio" placeholderTextColor={colors.muted} style={[styles.editInput, { minHeight: 70, textAlignVertical: "top" }]} />
-              
-              {editError ? <Text style={{ color: colors.error, fontSize: font.sm, marginTop: 6, textAlign: "center" }}>{editError}</Text> : null}
+                <Text style={styles.editLabel}>Consultation Fees (₹)</Text>
+                <TextInput testID="edit-fees" value={editFees} onChangeText={(v) => setEditFees(v.replace(/[^0-9]/g, ""))} keyboardType="number-pad" placeholder="500" placeholderTextColor={colors.muted} style={styles.editInput} />
+                
+                <Text style={styles.editLabel}>⏱ Avg. Time per Patient (minutes)</Text>
+                <TextInput testID="edit-avgmin" value={editAvgMin} onChangeText={(v) => setEditAvgMin(v.replace(/[^0-9]/g, "").slice(0, 3))} keyboardType="number-pad" placeholder="15" placeholderTextColor={colors.muted} style={styles.editInput} />
+                <Text style={styles.hintTxt}>Patients ki live wait time is number × queue position se calculate hoti hai</Text>
+                
+                <Text style={styles.editLabel}>Timings</Text>
+                <TextInput testID="edit-timings" value={editTimings} onChangeText={setEditTimings} placeholder="10:00 AM - 4:00 PM" placeholderTextColor={colors.muted} style={styles.editInput} />
+                
+                <Text style={styles.editLabel}>Bio (optional)</Text>
+                <TextInput testID="edit-bio" value={editBio} onChangeText={setEditBio} multiline placeholder="Short bio" placeholderTextColor={colors.muted} style={[styles.editInput, { minHeight: 70, textAlignVertical: "top" }]} />
+                
+                {editError ? <Text style={{ color: colors.error, fontSize: font.sm, marginTop: 6, textAlign: "center" }}>{editError}</Text> : null}
 
-              <Pressable testID="edit-save" onPress={saveProfile} disabled={editSaving} style={styles.saveBtn}>
-                {editSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveBtnText}>Save Changes</Text>}
-              </Pressable>
-            </ScrollView>
+                <Pressable testID="edit-save" onPress={saveProfile} disabled={editSaving} style={styles.saveBtn}>
+                  {editSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveBtnText}>Save Changes</Text>}
+                </Pressable>
+              </ScrollView>
+            </Pressable>
           </Pressable>
-        </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* ── Patient Details View / Edit Modal ── */}

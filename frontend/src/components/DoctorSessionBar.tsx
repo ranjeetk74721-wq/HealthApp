@@ -482,8 +482,10 @@ const styles = StyleSheet.create({
     padding: spacing.sm,
     gap: spacing.sm,
     marginBottom: spacing.xs,
+    flexWrap: "wrap",
   },
   infoBlock: {
+    minWidth: 100,
     flex: 1,
   },
   infoLabel: {

@@ -3,11 +3,11 @@ import {
   View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator,
   RefreshControl, Modal, TextInput, KeyboardAvoidingView, Platform, Alert,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { api, getApiBase, getBackendWebSocketBase } from "@/src/api/client";
+import { api, getApiBase, getBackendWebSocketBase, isConfirmedAuthError } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 import CalendarSummary from "@/src/components/CalendarSummary";
@@ -30,11 +30,14 @@ function formatTime(isoStr?: string | null): string {
 
 export default function ReceptionistDashboard() {
   const router = useRouter();
-  const { user, signOut } = useAuth();
+  const insets = useSafeAreaInsets();
+  const { user, loading: authLoading, signOut } = useAuth();
   const [doctors, setDoctors] = useState<any[]>([]);
+  const [doctorsError, setDoctorsError] = useState<string | null>(null);
   const [selectedDoc, setSelectedDoc] = useState<string | null>(null);
   const [docSession, setDocSession] = useState<any | null>(null);
   const [queue, setQueue] = useState<any[]>([]);
+  const [queueError, setQueueError] = useState<string | null>(null);
   const [summaryData, setSummaryData] = useState<any[]>([]);
   const [selectedDate, setSelectedDate] = useState<string>(
     new Date().toLocaleDateString("en-CA")
@@ -98,6 +101,9 @@ export default function ReceptionistDashboard() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isFocused = useRef(true);
   const [wsConnected, setWsConnected] = useState(false);
+  const isLoggingOutRef = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimerRef = useRef<any>(null);
 
   // In-flight synchronous guards against rapid repeated clicks
   const addPatientSubmittingRef = useRef(false);
@@ -108,6 +114,82 @@ export default function ReceptionistDashboard() {
   // Use a ref so load() always reads the latest selectedDoc without stale closure
   const selectedDocRef = useRef<string | null>(null);
   useEffect(() => { selectedDocRef.current = selectedDoc; }, [selectedDoc]);
+
+  const handleAuthExpired = useCallback(async () => {
+    if (isLoggingOutRef.current) return;
+    isLoggingOutRef.current = true;
+    try {
+      await signOut();
+      router.replace("/hospital-id?redirect=/receptionist/dashboard");
+    } finally {
+      isLoggingOutRef.current = false;
+    }
+  }, [router, signOut]);
+
+  useEffect(() => {
+    if (!authLoading && !user) {
+      router.replace("/hospital-id?redirect=/receptionist/dashboard");
+    }
+  }, [authLoading, user, router]);
+
+  const loadDoctorQueue = useCallback(async (doctorId: string, shouldBypass = false) => {
+    try {
+      const q = await api.get(`/reception/queue?doctor_id=${doctorId}&date=${selectedDate}`, { bypassCache: shouldBypass });
+      setQueue(q || []);
+      setQueueError(null);
+      const nowStr = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true });
+      setLastUpdated(nowStr);
+      setIsStale(false);
+    } catch (err: any) {
+      if (isConfirmedAuthError(err)) {
+        await handleAuthExpired();
+        return;
+      }
+      setQueueError(err?.message || "Failed to load queue");
+      setIsStale(true);
+    }
+
+    // Auxiliary non-essential queries (do not block or crash queue)
+    api.get(`/doctor/${doctorId}/session?date=${selectedDate}`, { bypassCache: shouldBypass })
+      .then((sessRes) => { if (sessRes?.session) setDocSession(sessRes.session); })
+      .catch(() => {});
+    api.get(`/appointments/calendar-summary?doctor_id=${doctorId}`, { bypassCache: shouldBypass })
+      .then((sum) => { if (Array.isArray(sum)) setSummaryData(sum); })
+      .catch(() => {});
+    api.get(`/doctor/${doctorId}/sessions?target_date=${selectedDate}`, { bypassCache: shouldBypass })
+      .then((confSessRes) => { if (Array.isArray(confSessRes?.sessions)) setConfiguredSessions(confSessRes.sessions); })
+      .catch(() => {});
+  }, [handleAuthExpired, selectedDate]);
+
+  const load = useCallback(async (silent = false, bypassCache = false) => {
+    const shouldBypass = bypassCache;
+    try {
+      const docs = await api.get("/reception/doctors", { bypassCache: shouldBypass });
+      if (Array.isArray(docs)) {
+        setDoctors(docs);
+        setDoctorsError(null);
+        let doctorId = selectedDocRef.current;
+        if (!doctorId || !docs.some((d: any) => d.id === doctorId)) {
+          doctorId = docs[0]?.id ?? null;
+          setSelectedDoc(doctorId);
+          selectedDocRef.current = doctorId;
+        }
+        if (doctorId) {
+          await loadDoctorQueue(doctorId, shouldBypass);
+        }
+      }
+    } catch (err: any) {
+      if (isConfirmedAuthError(err)) {
+        await handleAuthExpired();
+        return;
+      }
+      setDoctorsError(err?.message || "Failed to load doctor list");
+      setIsStale(true);
+    } finally {
+      if (!silent) setLoading(false);
+      setRefreshing(false);
+    }
+  }, [handleAuthExpired, loadDoctorQueue]);
 
   // Online / Offline listeners
   useEffect(() => {
@@ -123,7 +205,6 @@ export default function ReceptionistDashboard() {
       };
       const handleVisibilityChange = () => {
         if (document.visibilityState === "visible") {
-          // Tab became active: immediately refresh authoritative state
           load(true, true);
         }
       };
@@ -137,86 +218,78 @@ export default function ReceptionistDashboard() {
         document.removeEventListener("visibilitychange", handleVisibilityChange);
       };
     }
-  }, []);
+  }, [load]);
 
-  const load = useCallback(async (silent = false, bypassCache = false) => {
-    const shouldBypass = bypassCache;
-    try {
-      const docs = await api.get("/reception/doctors", { bypassCache: shouldBypass });
-      setDoctors(docs);
-      const doctorId = selectedDocRef.current || (docs[0]?.id ?? null);
-      if (doctorId && !selectedDocRef.current) {
-        setSelectedDoc(doctorId);
-        selectedDocRef.current = doctorId;
-      }
-      if (doctorId) {
-        const [q, sessRes, sum, confSessRes] = await Promise.all([
-          api.get(`/reception/queue?doctor_id=${doctorId}&date=${selectedDate}`, { bypassCache: shouldBypass }),
-          api.get(`/doctor/${doctorId}/session?date=${selectedDate}`, { bypassCache: shouldBypass }).catch(() => null),
-          api.get(`/appointments/calendar-summary?doctor_id=${doctorId}`, { bypassCache: shouldBypass }).catch(() => []),
-          api.get(`/doctor/${doctorId}/sessions?target_date=${selectedDate}`, { bypassCache: shouldBypass }).catch(() => ({ sessions: [] })),
-        ]);
-        setQueue(q || []);
-        if (sessRes?.session) setDocSession(sessRes.session);
-        setSummaryData(sum || []);
-        setConfiguredSessions(confSessRes?.sessions || []);
-      }
-      const nowStr = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true });
-      setLastUpdated(nowStr);
-      setIsStale(false);
-    } catch (err: any) {
-      setIsStale(true);
-      if (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired"))) {
-        await signOut();
-        router.replace("/login");
-      }
-    } finally {
-      if (!silent) setLoading(false);
-      setRefreshing(false);
-    }
-  }, [router, signOut, selectedDate]);
-
-  // WebSocket — re-subscribe when selected doctor changes
+  // WebSocket with bounded exponential backoff
   useEffect(() => {
     if (!selectedDoc) return;
-    load(true, true);
+    loadDoctorQueue(selectedDoc, true);
 
-    if (wsRef.current) { try { wsRef.current.close(); } catch { /* ignore */ } wsRef.current = null; }
+    let isDisposed = false;
 
-    const url = `${getBackendWebSocketBase()}/api/ws/queue/doctor/${selectedDoc}`;
-    try {
-      const ws = new WebSocket(url);
-      wsRef.current = ws;
-      ws.onopen = () => {
-        setWsConnected(true);
-        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-      };
-      ws.onmessage = (e: any) => {
-        try {
-          const msg = typeof e?.data === "string" ? JSON.parse(e.data) : e?.data;
-          if (msg?.type === "ping" || msg?.type === "pong" || msg?.type === "connected") return;
-        } catch {}
-        if (isFocused.current && (Platform.OS !== "web" || document.visibilityState === "visible")) {
-          load(true, true);
-        }
-      };
-      ws.onerror = () => setWsConnected(false);
-      ws.onclose = () => {
-        setWsConnected(false);
-        if (isFocused.current && !timerRef.current) {
-          timerRef.current = setInterval(() => {
-            if (Platform.OS !== "web" || document.visibilityState === "visible") {
-              load(true);
+    const connectWs = () => {
+      if (isDisposed) return;
+      if (wsRef.current) {
+        try { wsRef.current.close(); } catch {}
+        wsRef.current = null;
+      }
+
+      const url = `${getBackendWebSocketBase()}/api/ws/queue/doctor/${selectedDoc}`;
+      try {
+        const ws = new WebSocket(url);
+        wsRef.current = ws;
+        ws.onopen = () => {
+          if (isDisposed) { ws.close(); return; }
+          setWsConnected(true);
+          reconnectAttemptsRef.current = 0;
+          if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+        };
+        ws.onmessage = (e: any) => {
+          try {
+            const msg = typeof e?.data === "string" ? JSON.parse(e.data) : e?.data;
+            if (msg?.type === "ping" || msg?.type === "pong" || msg?.type === "connected") return;
+          } catch {}
+          if (isFocused.current && (Platform.OS !== "web" || document.visibilityState === "visible")) {
+            loadDoctorQueue(selectedDoc, true);
+          }
+        };
+        ws.onerror = () => setWsConnected(false);
+        ws.onclose = () => {
+          setWsConnected(false);
+          wsRef.current = null;
+          if (!isDisposed) {
+            const attempts = reconnectAttemptsRef.current;
+            reconnectAttemptsRef.current = attempts + 1;
+            const delay = Math.min(30000, Math.max(2000, Math.pow(1.5, attempts) * 1000 + Math.random() * 1000));
+            reconnectTimerRef.current = setTimeout(() => {
+              if (isFocused.current) connectWs();
+            }, delay);
+
+            if (isFocused.current && !timerRef.current) {
+              timerRef.current = setInterval(() => {
+                if (Platform.OS !== "web" || document.visibilityState === "visible") {
+                  loadDoctorQueue(selectedDoc, true);
+                }
+              }, POLL_INTERVAL_MS);
             }
-          }, POLL_INTERVAL_MS);
-        }
-      };
-    } catch { setWsConnected(false); }
+          }
+        };
+      } catch {
+        setWsConnected(false);
+      }
+    };
+
+    connectWs();
 
     return () => {
-      if (wsRef.current) { try { wsRef.current.close(); } catch { /* ignore */ } wsRef.current = null; }
+      isDisposed = true;
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      if (wsRef.current) {
+        try { wsRef.current.close(); } catch {}
+        wsRef.current = null;
+      }
     };
-  }, [selectedDoc, load]);
+  }, [selectedDoc, loadDoctorQueue]);
 
   useFocusEffect(
     useCallback(() => {
@@ -597,10 +670,10 @@ export default function ReceptionistDashboard() {
     }
   };
 
-  if (loading) {
+  if (authLoading || (loading && doctors.length === 0 && !doctorsError)) {
     return (
       <SafeAreaView style={styles.safe}>
-        <ActivityIndicator style={{ marginTop: 60 }} color={colors.brand} />
+        <ActivityIndicator style={{ marginTop: 60 }} color={colors.brandPrimary} />
       </SafeAreaView>
     );
   }
@@ -698,25 +771,50 @@ export default function ReceptionistDashboard() {
       </View>
 
       {/* ── Doctor selection (Requirement 5) ── */}
-      <View style={styles.docPickerWrap}>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.docPickerRow}>
-          {doctors.map((d) => {
-            const active = selectedDoc === d.id;
-            return (
+      {doctors.length > 0 ? (
+        <View style={styles.docPickerWrap}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.docPickerRow}>
+            {doctors.map((d) => {
+              const active = selectedDoc === d.id;
+              return (
+                <Pressable
+                  key={d.id}
+                  testID={`select-doc-${d.id}`}
+                  onPress={() => setSelectedDoc(d.id)}
+                  style={[styles.docChip, active && styles.docChipActive]}
+                >
+                  <Text style={[styles.docChipText, active && { color: colors.onBrandPrimary }]} numberOfLines={1}>
+                    {d.full_name}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+        </View>
+      ) : (
+        <View style={{ backgroundColor: colors.surface, padding: spacing.md, marginHorizontal: spacing.lg, marginVertical: spacing.sm, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border }}>
+          {doctorsError ? (
+            <View style={{ alignItems: "center", gap: 8, paddingVertical: 10 }}>
+              <Ionicons name="alert-circle-outline" size={32} color={colors.error} />
+              <Text style={{ fontSize: font.sm, color: colors.error, fontWeight: "600", textAlign: "center" }}>{doctorsError}</Text>
               <Pressable
-                key={d.id}
-                testID={`select-doc-${d.id}`}
-                onPress={() => setSelectedDoc(d.id)}
-                style={[styles.docChip, active && styles.docChipActive]}
+                onPress={() => load(false, true)}
+                style={{ backgroundColor: colors.brandPrimary, paddingHorizontal: 16, paddingVertical: 8, borderRadius: radius.md }}
               >
-                <Text style={[styles.docChipText, active && { color: colors.onBrandPrimary }]} numberOfLines={1}>
-                  {d.full_name}
-                </Text>
+                <Text style={{ color: "#fff", fontWeight: "600", fontSize: font.sm }}>Retry Loading Doctors</Text>
               </Pressable>
-            );
-          })}
-        </ScrollView>
-      </View>
+            </View>
+          ) : (
+            <View style={{ alignItems: "center", gap: 6, paddingVertical: 12 }}>
+              <Ionicons name="people-outline" size={36} color={colors.muted} />
+              <Text style={{ fontSize: font.base, fontWeight: "700", color: colors.onSurface }}>No Doctors Assigned</Text>
+              <Text style={{ fontSize: font.xs, color: colors.muted, textAlign: "center", maxWidth: 320 }}>
+                No active doctors are currently assigned to this hospital (ID: {(user as any)?.hospital_id || "your hospital"}). Contact your hospital administrator or doctor to ensure their account is registered under this hospital ID.
+              </Text>
+            </View>
+          )}
+        </View>
+      )}
 
       {/* ── KPIs ── */}
       <View style={styles.kpiRow}>
@@ -1166,7 +1264,7 @@ export default function ReceptionistDashboard() {
       ) : null}
 
       {/* ── FABs ── */}
-      <View style={styles.fabRow}>
+      <View style={[styles.fabRow, { bottom: Math.max(20, insets.bottom + 8) }]}>
         <Pressable
           testID="add-patient-btn"
           disabled={addLoading}
@@ -1358,17 +1456,19 @@ export default function ReceptionistDashboard() {
 
       {/* ── Emergency Modal ── */}
       <Modal transparent visible={emergencyOpen} animationType="slide" onRequestClose={() => setEmergencyOpen(false)}>
-        <Pressable style={styles.modalBackdrop} onPress={() => setEmergencyOpen(false)}>
-          <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
-            <View style={styles.sheetHandle} />
-            <Text style={styles.sheetTitle}>Emergency Priority Insert</Text>
-            <Text style={styles.sheetSub}>Patient will be inserted with highest priority without disturbing existing token numbers.</Text>
-            <TextInput testID="emergency-name-input" placeholder="Patient name" placeholderTextColor={colors.muted} value={emergencyName} onChangeText={setEmergencyName} style={styles.emergencyInput} />
-            <Pressable testID="emergency-confirm" onPress={insertEmergency} style={styles.emergencyBtn}>
-              <Text style={styles.emergencyBtnText}>Insert as Priority</Text>
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setEmergencyOpen(false)}>
+            <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <Text style={styles.sheetTitle}>Emergency Priority Insert</Text>
+              <Text style={styles.sheetSub}>Patient will be inserted with highest priority without disturbing existing token numbers.</Text>
+              <TextInput testID="emergency-name-input" placeholder="Patient name" placeholderTextColor={colors.muted} value={emergencyName} onChangeText={setEmergencyName} style={styles.emergencyInput} />
+              <Pressable testID="emergency-confirm" onPress={insertEmergency} style={styles.emergencyBtn}>
+                <Text style={styles.emergencyBtnText}>Insert as Priority</Text>
+              </Pressable>
             </Pressable>
           </Pressable>
-        </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* ── Reschedule Appointment Modal (Requirement 5) ── */}
@@ -1472,52 +1572,56 @@ export default function ReceptionistDashboard() {
 
       {/* ── Refer / Transfer Patient Modal ── */}
       <Modal transparent visible={referModalOpen} animationType="slide" onRequestClose={() => setReferModalOpen(false)}>
-        <Pressable style={styles.modalBackdrop} onPress={() => setReferModalOpen(false)}>
-          <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
-            <View style={styles.sheetHandle} />
-            <Text style={styles.sheetTitle}>Refer / Transfer Patient</Text>
-            <Text style={styles.sheetSub}>
-              Transfer {referAppt?.patient_name} (Token #{referAppt?.token_number}) to another doctor in the hospital.
-            </Text>
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setReferModalOpen(false)}>
+            <Pressable style={[styles.sheet, { maxHeight: "90%" }]} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: spacing.lg }}>
+                <Text style={styles.sheetTitle}>Refer / Transfer Patient</Text>
+                <Text style={styles.sheetSub}>
+                  Transfer {referAppt?.patient_name} (Token #{referAppt?.token_number}) to another doctor in the hospital.
+                </Text>
 
-            <Text style={styles.label}>Select Target Doctor*</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 8 }}>
-              {doctors
-                .filter((d) => d.id !== selectedDoc)
-                .map((d) => {
-                  const isTarget = targetDocId === d.id;
-                  return (
-                    <Pressable
-                      key={d.id}
-                      testID={`refer-target-${d.id}`}
-                      onPress={() => setTargetDocId(d.id)}
-                      style={[styles.docChip, isTarget && styles.docChipActive]}
-                    >
-                      <Text style={[styles.docChipText, isTarget && { color: colors.onBrandPrimary }]}>
-                        {d.full_name} ({d.specialty || "General"})
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-            </ScrollView>
+                <Text style={styles.label}>Select Target Doctor*</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 8 }}>
+                  {doctors
+                    .filter((d) => d.id !== selectedDoc)
+                    .map((d) => {
+                      const isTarget = targetDocId === d.id;
+                      return (
+                        <Pressable
+                          key={d.id}
+                          testID={`refer-target-${d.id}`}
+                          onPress={() => setTargetDocId(d.id)}
+                          style={[styles.docChip, isTarget && styles.docChipActive]}
+                        >
+                          <Text style={[styles.docChipText, isTarget && { color: colors.onBrandPrimary }]}>
+                            {d.full_name} ({d.specialty || "General"})
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                </ScrollView>
 
-            <Text style={styles.label}>Reason for Transfer (Optional)</Text>
-            <TextInput
-              testID="refer-reason-input"
-              placeholder="e.g. Doctor on emergency / specialist consultation"
-              placeholderTextColor={colors.muted}
-              value={referReason}
-              onChangeText={setReferReason}
-              style={styles.input}
-            />
+                <Text style={styles.label}>Reason for Transfer (Optional)</Text>
+                <TextInput
+                  testID="refer-reason-input"
+                  placeholder="e.g. Doctor on emergency / specialist consultation"
+                  placeholderTextColor={colors.muted}
+                  value={referReason}
+                  onChangeText={setReferReason}
+                  style={styles.input}
+                />
 
-            {referError ? <Text style={styles.error}>{referError}</Text> : null}
+                {referError ? <Text style={styles.error}>{referError}</Text> : null}
 
-            <Pressable testID="refer-confirm-btn" onPress={handleReferSubmit} disabled={referLoading} style={styles.primaryBtn}>
-              {referLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Confirm Transfer</Text>}
+                <Pressable testID="refer-confirm-btn" onPress={handleReferSubmit} disabled={referLoading} style={styles.primaryBtn}>
+                  {referLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryBtnText}>Confirm Transfer</Text>}
+                </Pressable>
+              </ScrollView>
             </Pressable>
           </Pressable>
-        </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* ── Patient Details View / Edit Modal ── */}

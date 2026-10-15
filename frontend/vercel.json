@@ -9,6 +9,10 @@
       "destination": "https://healthapp-b4mo.onrender.com/api/:path*"
     },
     {
+      "source": "/health",
+      "destination": "https://healthapp-b4mo.onrender.com/health"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }

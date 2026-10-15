@@ -8,7 +8,7 @@ export default function Root({ children }: PropsWithChildren) {
       <head>
         <meta charSet="utf-8" />
         <meta httpEquiv="X-UA-Compatible" content="IE=edge" />
-        <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, viewport-fit=cover" />
         <meta name="google-site-verification" content="odBixVw-npeF1pKbiKtQ8c85qhvGX0UPzNCRC_oY82M" />
         <meta name="theme-color" content="#0369A1" />
         <meta name="description" content="MeriBaari — Book doctor appointments, view live token numbers, and track rolling estimated waiting times in real-time." />
@@ -82,9 +82,25 @@ export default function Root({ children }: PropsWithChildren) {
         <style
           dangerouslySetInnerHTML={{
             __html: `
-              body > div:first-child { position: fixed !important; top: 0; left: 0; right: 0; bottom: 0; }
+              html, body {
+                width: 100%;
+                height: 100%;
+                margin: 0;
+                padding: 0;
+                -webkit-text-size-adjust: 100%;
+                background-color: #f8fafc;
+              }
+              body > div:first-child {
+                width: 100%;
+                height: 100%;
+                display: flex;
+                flex-direction: column;
+              }
               [role="tablist"] [role="tab"] * { overflow: visible !important; }
               [role="heading"], [role="heading"] * { overflow: visible !important; }
+              input, textarea, select {
+                font-size: 16px !important;
+              }
             `,
           }}
         />

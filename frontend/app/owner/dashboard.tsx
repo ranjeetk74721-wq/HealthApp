@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator,
   RefreshControl, Modal, TextInput, KeyboardAvoidingView, Platform,
@@ -8,7 +8,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
 import * as ImagePicker from "expo-image-picker";
-import { api } from "@/src/api/client";
+import { api, isConfirmedAuthError } from "@/src/api/client";
 import { useAuth } from "@/src/context/AuthContext";
 import { colors, spacing, radius, font } from "@/src/theme";
 
@@ -114,7 +114,7 @@ interface RecRow {
 
 export default function OwnerDashboard() {
   const router = useRouter();
-  const { user, signOut } = useAuth();
+  const { user, loading: authLoading, signOut } = useAuth();
   const [stats, setStats] = useState<any | null>(null);
   const [doctors, setDoctors] = useState<DocRow[]>([]);
   const [hospitals, setHospitals] = useState<HospRow[]>([]);
@@ -225,6 +225,24 @@ export default function OwnerDashboard() {
     }
   };
 
+  const isLoggingOutRef = useRef(false);
+  const handleAuthExpired = useCallback(async () => {
+    if (isLoggingOutRef.current) return;
+    isLoggingOutRef.current = true;
+    try {
+      await signOut();
+      router.replace("/admin/login?redirect=/owner/dashboard");
+    } finally {
+      isLoggingOutRef.current = false;
+    }
+  }, [router, signOut]);
+
+  useEffect(() => {
+    if (!authLoading && !user) {
+      router.replace("/admin/login?redirect=/owner/dashboard");
+    }
+  }, [authLoading, user, router]);
+
   const load = useCallback(async (force = false) => {
     if (!force && Date.now() - lastFetchedAt.current < STALE_AFTER_MS && stats !== null) {
       return;
@@ -246,15 +264,16 @@ export default function OwnerDashboard() {
       }
       lastFetchedAt.current = Date.now();
     } catch (e: any) {
-      if (e?.message && (e.message.includes("401") || e.message.includes("authenticated") || e.message.includes("expired"))) {
-        await signOut();
-        router.replace("/login");
+      if (isConfirmedAuthError(e)) {
+        await handleAuthExpired();
+        return;
       }
+      setError(e?.message || "Failed to load admin stats");
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [router, signOut, stats]);
+  }, [handleAuthExpired, stats]);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
@@ -650,7 +669,7 @@ export default function OwnerDashboard() {
     s.toLowerCase().includes(editDocSpecSearch.toLowerCase().trim())
   );
 
-  if (loading) return <SafeAreaView style={styles.safe}><ActivityIndicator style={{ marginTop: 60 }} color={colors.brand} /></SafeAreaView>;
+  if (authLoading || (loading && !stats)) return <SafeAreaView style={styles.safe}><ActivityIndicator style={{ marginTop: 60 }} color={colors.brandPrimary} /></SafeAreaView>;
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
@@ -659,7 +678,7 @@ export default function OwnerDashboard() {
           <Text style={styles.hello}>Admin Panel</Text>
           <Text style={styles.name}>{user?.full_name}</Text>
         </View>
-        <Pressable onPress={async () => { await signOut(); router.replace("/login"); }} testID="owner-logout" style={styles.iconBtn}>
+        <Pressable onPress={async () => { await signOut(); router.replace("/admin/login"); }} testID="owner-logout" style={styles.iconBtn}>
           <Ionicons name="log-out-outline" size={22} color={colors.onSurfaceSecondary} />
         </Pressable>
       </View>
