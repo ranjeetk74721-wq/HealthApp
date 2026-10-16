@@ -13,8 +13,9 @@ from sms_service import format_appointment_sms_text, send_appointment_sms, HINDI
 
 
 @pytest.fixture(autouse=True)
-def force_renflair_provider(monkeypatch):
-    monkeypatch.setenv("SMS_PROVIDER", "renflair")
+def force_aisensy_provider(monkeypatch):
+    monkeypatch.setenv("SMS_PROVIDER", "aisensy")
+    monkeypatch.setenv("AISENSY_API_KEY", "test_mock_api_key_123")
 
 
 class Test12HourTimeFormat:
@@ -121,13 +122,10 @@ class TestAppointmentSmsTemplate:
 
     @pytest.mark.asyncio
     async def test_send_appointment_sms_returns_formatted_text(self, monkeypatch):
-        monkeypatch.setenv("RENFLAIR_API_KEY", "mock_key")
-        monkeypatch.setenv("RENFLAIR_BASE_URL", "https://sms.renflair.in")
+        async def mock_post(self, url, json=None, headers=None, timeout=None, **kwargs):
+            return httpx.Response(200, json={"success": "true", "messageId": "msg_mock_123"})
 
-        async def mock_get(self, url, params=None, timeout=None, **kwargs):
-            return httpx.Response(200, json={"status": "success", "message": "SMS sent successfully"})
-
-        monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+        monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
 
         res = await send_appointment_sms(
             phone="9876543210",

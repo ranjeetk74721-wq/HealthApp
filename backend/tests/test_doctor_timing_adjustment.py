@@ -629,6 +629,7 @@ class TestCompleteScheduleAndDelayFlow:
         tz_ist = timezone(timedelta(hours=5, minutes=30))
         monkeypatch.setattr(server, "get_ist_now", lambda: datetime(2026, 10, 2, 9, 0, 0, tzinfo=tz_ist))
         monkeypatch.setattr(server, "broadcast_doctor_update", AsyncMock())
+        monkeypatch.setattr(server, "notify_timing_adjusted", AsyncMock())
 
         mock_db.doctors.find_one = AsyncMock(return_value={"id": "doc-bench", "user_id": "u-doc", "avg_consult_minutes": 5})
         mock_db.doctor_sessions.find_one = AsyncMock(return_value={

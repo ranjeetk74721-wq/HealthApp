@@ -37,7 +37,7 @@ if (Platform.OS === "android") {
 
 import { safeSessionStorageGet, safeSessionStorageSet } from "@/src/utils/safeStorage";
 import React, { Component, ReactNode, ErrorInfo, useState } from "react";
-import { View, Text, Pressable, StyleSheet } from "react-native";
+import { View, Text, Pressable, StyleSheet, ActivityIndicator } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 
 interface ErrorBoundaryProps {
@@ -312,8 +312,14 @@ export default function RootLayout() {
     };
   }, [router]);
 
-  // Never return null indefinitely if font loading is delayed
-  if (!loaded && !error && !fontTimeout) return null;
+  // Render minimal system-font fallback while fonts load (avoids blank screen on web/mobile)
+  if (!loaded && !error && !fontTimeout) {
+    return (
+      <View style={{ flex: 1, backgroundColor: "#FFFFFF", alignItems: "center", justifyContent: "center" }}>
+        <ActivityIndicator size="large" color="#0369A1" />
+      </View>
+    );
+  }
 
   return (
     <SafeAreaProvider>

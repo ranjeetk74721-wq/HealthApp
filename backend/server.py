@@ -119,7 +119,7 @@ OTP_RATE_MAX_REQUESTS = 5
 PRIVACY_NOTICE_VERSION = "2026-02-1"
 
 # ============ EMERGENT PUSH SETUP ============
-PUSH_BASE_URL = "https://integrations.emergentagent.com"
+PUSH_BASE_URL = os.environ.get("EMERGENT_PUSH_BASE_URL", "https://integrations.emergentagent.com")
 PUSH_KEY = os.environ.get("EMERGENT_PUSH_KEY", "placeholder")
 _push_client = httpx.AsyncClient(
     base_url=PUSH_BASE_URL,
@@ -208,14 +208,6 @@ async def ensure_db_indexes():
     """Create indexes for all frequently-queried fields.
     create_index is idempotent — safe to run on every startup.
     """
-    # LiveAir configuration validation at backend startup (Requirement 3)
-    if os.environ.get("SMS_PROVIDER", "").strip().lower() == "liveair":
-        try:
-            from liveair_sms_service import validate_liveair_startup_config
-            validate_liveair_startup_config()
-        except Exception as e:
-            logger.warning(f"LiveAir startup validation warning: {e}")
-
     try:
         await asyncio.gather(
             # users
@@ -2706,13 +2698,14 @@ async def hospital_login(body: HospitalLoginBody):
     hosp_email = (hosp.get("email") or "").strip().lower()
     pwd_hash = hosp.get("password_hash")
     
+    default_hosp_pwd = os.environ.get("DEFAULT_HOSPITAL_PASSWORD", "Hospital@123")
     valid_creds = False
     if hosp_email and pwd_hash:
         if hosp_email == email and verify_password(body.password, pwd_hash):
             valid_creds = True
-    elif (not hosp_email or hosp_email == email) and verify_password(body.password, hash_password("Hospital@123")):
+    elif (not hosp_email or hosp_email == email) and verify_password(body.password, hash_password(default_hosp_pwd)):
         valid_creds = True
-    elif email.endswith(f"@{hid.lower()}.com") and body.password == "Hospital@123":
+    elif email.endswith(f"@{hid.lower()}.com") and body.password == default_hosp_pwd:
         valid_creds = True
 
     if not valid_creds:
@@ -2920,7 +2913,7 @@ async def send_otp(request: Request, body: SendOTPBody):
         sms_res = await send_otp_sms(mobile, otp)
         if not sms_res.get("ok"):
             logger.warning(f"OTP delivery failed: {sms_res.get('error')}")
-            if get_sms_provider() in ("liveair", "aisensy") and os.environ.get("ALLOW_DEV_OTP") != "1":
+            if get_sms_provider() == "aisensy" and os.environ.get("ALLOW_DEV_OTP") != "1":
                 err_msg = sms_res.get("error") or "Failed to deliver OTP via gateway."
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
@@ -2930,7 +2923,7 @@ async def send_otp(request: Request, body: SendOTPBody):
         raise
     except Exception as e:
         logger.error(f"OTP delivery error: {e}")
-        if get_sms_provider() in ("liveair", "aisensy") and os.environ.get("ALLOW_DEV_OTP") != "1":
+        if get_sms_provider() == "aisensy" and os.environ.get("ALLOW_DEV_OTP") != "1":
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Gateway connection error. Please try again later."
@@ -3415,7 +3408,7 @@ async def create_appointment(
             detail="You already have an active appointment for this doctor/session."
         )
 
-    # Calculate latest ETA and trigger Renflair V7 transactional SMS
+    # Calculate latest ETA and trigger AiSensy WhatsApp appointment utility message
     target_sched = target_session if (body.session_id and not body.session_id.endswith("_default")) else None
     eta_data = await calculate_appointment_eta(
         doc,
@@ -3469,13 +3462,10 @@ async def create_appointment(
 
             masked_num = f"******{patient_mobile[-4:]}" if len(patient_mobile) >= 6 else "*****"
             logger.info(
-                f"[BOOKING_SMS]\n"
+                f"[BOOKING_NOTIFICATION]\n"
                 f"Booking created: YES\n"
-                f"SMS function called: YES\n"
-                f"Provider: {sms_provider_name.title()}\n"
+                f"Messaging provider: {sms_provider_name.title()}\n"
                 f"Recipient: {masked_num}\n"
-                f"Route: {os.environ.get('LIVEAIR_ROUTE', '3')}\n"
-                f"Template configured: {'YES' if os.environ.get('LIVEAIR_TEMPLATE_ID') else 'NO'}\n"
                 f"Provider response: {sms_res.get('message_id') or sms_res.get('error') or 'NONE'}\n"
                 f"Delivery status: {'PENDING' if sms_ok else 'FAILED'}"
             )
@@ -6498,7 +6488,7 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
                 detail="This patient already has an active appointment for today."
             )
 
-        # Trigger Renflair Transactional SMS V7
+        # Trigger AiSensy WhatsApp appointment utility message
         eta_data = await calculate_appointment_eta(appt, doctor=doctor)
         dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
         expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
@@ -6545,13 +6535,10 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
 
             masked_num = f"******{mobile[-4:]}" if len(mobile) >= 6 else "*****"
             logger.info(
-                f"[BOOKING_SMS]\n"
+                f"[BOOKING_NOTIFICATION]\n"
                 f"Booking created: YES\n"
-                f"SMS function called: YES\n"
-                f"Provider: {sms_provider_name.title()}\n"
+                f"Messaging provider: {sms_provider_name.title()}\n"
                 f"Recipient: {masked_num}\n"
-                f"Route: {os.environ.get('LIVEAIR_ROUTE', '3')}\n"
-                f"Template configured: {'YES' if os.environ.get('LIVEAIR_TEMPLATE_ID') else 'NO'}\n"
                 f"Provider response: {sms_res.get('message_id') or sms_res.get('error') or 'NONE'}\n"
                 f"Delivery status: {'PENDING' if sms_ok else 'FAILED'}"
             )
@@ -6644,13 +6631,10 @@ async def reception_send_appointment_link(
 
     masked_num = f"******{mobile[-4:]}" if len(mobile) >= 6 else "*****"
     logger.info(
-        f"[BOOKING_SMS]\n"
+        f"[BOOKING_NOTIFICATION]\n"
         f"Booking created: YES\n"
-        f"SMS function called: YES\n"
-        f"Provider: {sms_provider_name.title()}\n"
+        f"Messaging provider: {sms_provider_name.title()}\n"
         f"Recipient: {masked_num}\n"
-        f"Route: {os.environ.get('LIVEAIR_ROUTE', '3')}\n"
-        f"Template configured: {'YES' if os.environ.get('LIVEAIR_TEMPLATE_ID') else 'NO'}\n"
         f"Provider response: {sms_res.get('message_id') or sms_res.get('error') or 'NONE'}\n"
         f"Delivery status: {'PENDING' if sms_ok else 'FAILED'}"
     )
@@ -6889,145 +6873,28 @@ async def dev_test_sms(
 
     enforce_dev_test_sms_rate_limit(request, user.get("id", ""))
 
-    provider = get_sms_provider()
-    test_message = "Meribaari SMS integration test successful."
-
-    if provider == "aisensy":
-        sample_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        res = await send_appointment_sms(
-            phone=body.phone,
-            oid=999,
-            hour="12:00 PM",
-            hospital_name="MeriBaari Clinic",
-            doctor_name="Doctor Test",
-            token_number=999,
-            expected_time="12:00 PM",
-            live_queue_link=f"{get_app_public_url()}/appointment/test-link",
-            patient_name="Test Patient",
-            appointment_date=sample_date,
-        )
-        return {
-            "ok": res.get("ok", False),
-            "provider": "aisensy",
-            "message_id": res.get("message_id"),
-            "status": "sent" if res.get("ok") else "failed",
-            "error": res.get("error"),
-            "error_code": res.get("error_code"),
-            "response": res.get("response"),
-        }
-    elif provider == "liveair":
-        try:
-            from liveair_sms_service import execute_liveair_test_sms
-        except ImportError:
-            from backend.liveair_sms_service import execute_liveair_test_sms
-            
-        test_report = await execute_liveair_test_sms(body.phone)
-        send_res = test_report.get("send_response") or {}
-        return {
-            "ok": test_report.get("success", False),
-            "provider": "liveair",
-            "message_id": send_res.get("message_id"),
-            "status": "sent" if test_report.get("success") else "failed",
-            "error": test_report.get("error") or send_res.get("error"),
-            "code": send_res.get("code"),
-            "credits": test_report.get("credits"),
-            "delivery_report": test_report.get("delivery_report"),
-        }
-    elif provider == "brevo":
-        try:
-            from sms_service import send_sms_via_brevo
-        except ImportError:
-            from backend.sms_service import send_sms_via_brevo
-            
-        res = await send_sms_via_brevo(body.phone, test_message)
-        return {
-            "ok": res.get("ok", False),
-            "provider": "brevo",
-            "message_id": res.get("message_id"),
-            "status": "sent" if res.get("ok") else "failed",
-            "error": res.get("error"),
-        }
-    else:
-        # Default Renflair
-        sample_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        res = await send_appointment_sms(
-            phone=body.phone,
-            oid=999,
-            hour="12:00 PM",
-            hospital_name="MeriBaari Test",
-            doctor_name="Doctor Test",
-            token_number=999,
-            expected_time="12:00 PM",
-            live_queue_link=f"{get_app_public_url()}/appointment/test-link",
-            appointment_date=sample_date,
-        )
-        return {
-            "ok": res.get("ok", False),
-            "provider": res.get("provider", "renflair"),
-            "message_id": res.get("message_id"),
-            "status": "sent" if res.get("ok") else "failed",
-            "error": res.get("error"),
-        }
-
-
-@api_router.get("/dev/sms-delivery/{message_id}")
-async def dev_sms_delivery_status(
-    message_id: str,
-    user: dict = Depends(get_current_user),
-):
-    """Check SMS delivery status report via LiveAir Delivery Report API (Requirement 11)."""
-    dev_enabled = (
-        os.environ.get("DEV_TEST_SMS_ENABLED", "0").strip() in ("1", "true", "True")
-        or os.environ.get("ENVIRONMENT", "").lower() in ("development", "test", "dev")
+    sample_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    res = await send_appointment_sms(
+        phone=body.phone,
+        oid=999,
+        hour="12:00 PM",
+        hospital_name="MeriBaari Clinic",
+        doctor_name="Doctor Test",
+        token_number=999,
+        expected_time="12:00 PM",
+        live_queue_link=f"{get_app_public_url()}/appointment/test-link",
+        patient_name="Test Patient",
+        appointment_date=sample_date,
     )
-    if not dev_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Development test SMS endpoint is disabled."
-        )
-
-    if user.get("role") not in ("owner", "admin", "developer", "doctor", "receptionist"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin or developer privileges required to check delivery status."
-        )
-
-    try:
-        from liveair_sms_service import get_liveair_delivery_status
-    except ImportError:
-        from backend.liveair_sms_service import get_liveair_delivery_status
-        
-    return await get_liveair_delivery_status(message_id)
-
-
-@api_router.get("/dev/liveair-credits")
-async def dev_liveair_credits(
-    route: Optional[str] = None,
-    user: dict = Depends(get_current_user),
-):
-    """Check LiveAir available credits for configured route (Requirement 10)."""
-    dev_enabled = (
-        os.environ.get("DEV_TEST_SMS_ENABLED", "0").strip() in ("1", "true", "True")
-        or os.environ.get("ENVIRONMENT", "").lower() in ("development", "test", "dev")
-    )
-    if not dev_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Development test SMS endpoint is disabled."
-        )
-
-    if user.get("role") not in ("owner", "admin", "developer", "doctor", "receptionist"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin or developer privileges required."
-        )
-
-    try:
-        from liveair_sms_service import get_liveair_credits
-    except ImportError:
-        from backend.liveair_sms_service import get_liveair_credits
-        
-    return await get_liveair_credits(route)
+    return {
+        "ok": res.get("ok", False),
+        "provider": "aisensy",
+        "message_id": res.get("message_id"),
+        "status": "sent" if res.get("ok") else "failed",
+        "error": res.get("error"),
+        "error_code": res.get("error_code"),
+        "response": res.get("response"),
+    }
 
 
 
@@ -7332,7 +7199,7 @@ async def create_hospital(body: dict, user: dict = Depends(require_role("owner",
         raise HTTPException(status_code=400, detail="Hospital ID already exists")
 
     email = (body.get("email") or f"admin@{hid.lower()}.com").strip().lower()
-    pwd = body.get("password") or "Hospital@123"
+    pwd = body.get("password") or os.environ.get("DEFAULT_HOSPITAL_PASSWORD", "Hospital@123")
 
     doc = {
         "id": str(uuid.uuid4()),
@@ -7595,18 +7462,20 @@ async def seed_data():
     # Run doctor specialist terminology normalization
     await migrate_doctor_specialty_terminology()
 
-    # Seed Admin User (ranjeet7421@gmail.com, H00001)
-    admin_email = "ranjeet7421@gmail.com"
+    # Seed Admin User (configurable via environment variables)
+    admin_email = os.environ.get("ADMIN_INITIAL_EMAIL", "ranjeet7421@gmail.com").strip().lower()
+    admin_pwd = os.environ.get("ADMIN_INITIAL_PASSWORD", "Ranjeet@74")
+    admin_hosp = os.environ.get("ADMIN_INITIAL_HOSPITAL_ID", "H00001").strip().upper()
     admin_user = await db.users.find_one({"email": admin_email})
     if not admin_user:
         await db.users.insert_one({
             "id": str(uuid.uuid4()),
             "email": admin_email,
-            "password_hash": hash_password("Ranjeet@74"),
+            "password_hash": hash_password(admin_pwd),
             "full_name": "Admin",
             "role": "admin",
-            "hospital_id": "H00001",
-            "hospital_code": "H00001",
+            "hospital_id": admin_hosp,
+            "hospital_code": admin_hosp,
             "status": "active",
             "login_disabled": False,
             "created_at": now_iso(),
@@ -7614,13 +7483,13 @@ async def seed_data():
     else:
         admin_update = {
             "role": "admin",
-            "hospital_id": "H00001",
-            "hospital_code": "H00001",
+            "hospital_id": admin_hosp,
+            "hospital_code": admin_hosp,
             "status": "active",
             "login_disabled": False,
         }
         if not admin_user.get("password_hash"):
-            admin_update["password_hash"] = hash_password(os.environ.get("ADMIN_INITIAL_PASSWORD", "Ranjeet@74"))
+            admin_update["password_hash"] = hash_password(admin_pwd)
         await db.users.update_one(
             {"email": admin_email},
             {"$set": admin_update}

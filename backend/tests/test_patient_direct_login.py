@@ -14,8 +14,13 @@ import pytest
 from starlette.testclient import TestClient
 from server import app, save_memory_otp, _otp_store, create_token
 
-sync_client = pymongo.MongoClient(os.environ.get("MONGO_URL", "mongodb://localhost:27017"))
+sync_client = pymongo.MongoClient(os.environ.get("MONGO_URL", "mongodb://localhost:27017"), serverSelectionTimeoutMS=1000)
 sync_db = sync_client[os.environ.get("DB_NAME", "clinicqueue")]
+
+try:
+    sync_client.admin.command("ping")
+except Exception:
+    pytest.skip("Local MongoDB server is not reachable. Skipping live database tests.", allow_module_level=True)
 
 
 from rate_limiter import rate_limiter
@@ -38,7 +43,7 @@ def test_first_time_user_requires_otp_and_verification(client):
     mobile = f"98111{secrets.randbelow(90000) + 10000}"
     
     with patch("server.send_otp_sms", new_callable=AsyncMock) as mock_send:
-        mock_send.return_value = {"ok": True, "provider": "renflair"}
+        mock_send.return_value = {"ok": True, "provider": "aisensy"}
         
         res = client.post("/api/auth/send-otp", json={"mobile": mobile})
         assert res.status_code == 200, res.text
@@ -168,7 +173,7 @@ def test_force_otp_resends_otp_even_for_registered_user(client):
     })
     
     with patch("server.send_otp_sms", new_callable=AsyncMock) as mock_send:
-        mock_send.return_value = {"ok": True, "provider": "renflair"}
+        mock_send.return_value = {"ok": True, "provider": "aisensy"}
         
         res = client.post("/api/auth/send-otp", json={"mobile": mobile, "force_otp": True})
         assert res.status_code == 200
@@ -197,7 +202,7 @@ def test_unverified_receptionist_patient_requires_otp_first_time(client):
     
     # 1. First visit by this patient requires OTP
     with patch("server.send_otp_sms", new_callable=AsyncMock) as mock_send:
-        mock_send.return_value = {"ok": True, "provider": "renflair"}
+        mock_send.return_value = {"ok": True, "provider": "aisensy"}
         res1 = client.post("/api/auth/send-otp", json={"mobile": mobile})
         assert res1.status_code == 200
         assert res1.json()["direct_login"] is False

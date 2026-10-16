@@ -13,7 +13,7 @@ backend_root = str(Path(__file__).resolve().parent.parent)
 if backend_root not in sys.path:
     sys.path.insert(0, backend_root)
 
-import mongomock_motor
+mongomock_motor = pytest.importorskip("mongomock_motor")
 import server
 from server import app, create_token, get_ist_now, now_iso
 

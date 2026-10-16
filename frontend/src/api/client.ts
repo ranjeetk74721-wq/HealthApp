@@ -1,8 +1,10 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants from "expo-constants";
 import { Platform } from "react-native";
+import { safeSessionStorageGet } from "@/src/utils/safeStorage";
 
-export const PRODUCTION_BACKEND_URL = "https://healthapp-b4mo.onrender.com";
+export const PRODUCTION_BACKEND_URL =
+  process.env.EXPO_PUBLIC_PRODUCTION_BACKEND_URL || "https://healthapp-b4mo.onrender.com";
 const configuredBase = process.env.EXPO_PUBLIC_BACKEND_URL;
 const expoHost = Constants.expoConfig?.hostUri?.split(":")[0];
 
@@ -116,8 +118,6 @@ export function getApiBase(): string {
   const base = getBackendBase();
   return base ? `${base}/api` : "/api";
 }
-
-import { safeSessionStorageGet } from "@/src/utils/safeStorage";
 
 async function getToken(): Promise<string | null> {
   if (Platform.OS === "web") {
@@ -478,11 +478,11 @@ async function request(path: string, opts: RequestOpts = {}, retryCount = 0): Pr
     text.trim().startsWith("<html");
 
   if (isHtml) {
-    // API route returned HTML: indicates a routing failure, missing backend proxy, or SPA fallback
+    // API route returned HTML (e.g. gateway timeout, proxy error, or unexpected HTML page)
     throw new ApiError(
-      `API route returned HTML instead of JSON (HTTP ${res.status}). The requested endpoint '${cleanPath}' may be misrouted or server is warming up.`,
+      `The server returned an unexpected response (HTTP ${res.status}). Please try again later.`,
       res.status,
-      text,
+      null,
       true,
     );
   }

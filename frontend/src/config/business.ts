@@ -9,15 +9,15 @@
  */
 
 export const BUSINESS_CONFIG = {
-  brandName: "Meribaari",
-  tagline: "Meri baari — skip the wait.",
-  websiteUrl: "https://www.meribaariapp.in",
+  brandName: process.env.EXPO_PUBLIC_BRAND_NAME || "Meribaari",
+  tagline: process.env.EXPO_PUBLIC_TAGLINE || "Meri baari — skip the wait.",
+  websiteUrl: process.env.EXPO_PUBLIC_WEBSITE_URL || "https://www.meribaariapp.in",
 
   // Confirmed legal operator details
-  legalBusinessName: "RRTECH.PVT.LTD",
-  address: "DUMKA, JHARKHAND, 814151",
-  supportEmail: "easehealthcareapp@gmail.com",
-  businessPhone: "+91 9153719933",
+  legalBusinessName: process.env.EXPO_PUBLIC_LEGAL_BUSINESS_NAME || "RRTECH.PVT.LTD",
+  address: process.env.EXPO_PUBLIC_LEGAL_ADDRESS || "DUMKA, JHARKHAND, 814151",
+  supportEmail: process.env.EXPO_PUBLIC_SUPPORT_EMAIL || "easehealthcareapp@gmail.com",
+  businessPhone: process.env.EXPO_PUBLIC_SUPPORT_PHONE || "+91 9153719933",
 
   // Formatted telephone and mailto links
   get mailtoLink(): string {

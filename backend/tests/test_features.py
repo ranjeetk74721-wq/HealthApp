@@ -16,10 +16,15 @@ if _backend_dir not in sys.path:
 
 from server import app, hash_otp, normalize_mobile, create_token, save_memory_otp
 from rate_limiter import rate_limiter
-from sms_service import send_appointment_sms, format_brevo_recipient
+from sms_service import send_appointment_sms, format_renflair_phone
 
-sync_client = pymongo.MongoClient(os.environ.get("MONGO_URL", "mongodb://localhost:27017"))
+sync_client = pymongo.MongoClient(os.environ.get("MONGO_URL", "mongodb://localhost:27017"), serverSelectionTimeoutMS=1000)
 sync_db = sync_client[os.environ.get("DB_NAME", "clinicqueue")]
+
+try:
+    sync_client.admin.command("ping")
+except Exception:
+    pytest.skip("Local MongoDB server is not reachable. Skipping live database tests.", allow_module_level=True)
 
 
 @pytest.fixture(scope="module")
@@ -357,11 +362,11 @@ def test_8_rate_limit_rapid_otp_sends(client):
 
 
 # ==============================================================================
-# TEST CASE 9: Brevo Resilience & Secret Privacy
+# TEST CASE 9: Messaging Resilience & Secret Privacy
 # ==============================================================================
 @pytest.mark.asyncio
-async def test_9_brevo_failure_resilience_and_secret_privacy():
-    """Case 9: Brevo SMS failure does not crash or expose API keys."""
+async def test_9_messaging_failure_resilience_and_secret_privacy():
+    """Case 9: Messaging failure does not crash or expose API keys."""
     res = await send_appointment_sms(
         phone="invalid-number",
         patient_name="Test Patient",

@@ -106,6 +106,7 @@ export default function Root({ children }: PropsWithChildren) {
                 bottom: 0;
                 min-height: 100%;
                 height: 100%;
+                height: 100dvh;
                 width: 100%;
                 display: flex;
                 flex-direction: column;

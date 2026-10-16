@@ -143,7 +143,7 @@ export default function PrivacyPolicyPage() {
             <Text style={styles.bulletPoint}>•</Text>
             <Text style={styles.bulletText}>
               <Text style={styles.boldText}>SMS & WhatsApp Communications: </Text>
-              Transactional OTPs and appointment updates are delivered via telecommunication partners (such as AiSensy for WhatsApp, LiveAir, Renflair, or Brevo).
+              Transactional OTPs and appointment updates are delivered via our messaging partner (AiSensy for WhatsApp communications).
             </Text>
           </View>
           <View style={styles.bulletItem}>
