@@ -79,7 +79,7 @@ export default function HospitalAuth() {
         <View style={styles.card}>
           <Text style={styles.label}>Hospital Email</Text>
           <TextInput
-            placeholder="e.g. admin@mh001.com"
+            placeholder="Enter hospital email"
             placeholderTextColor={colors.muted}
             value={email}
             onChangeText={setEmail}
@@ -90,7 +90,7 @@ export default function HospitalAuth() {
 
           <Text style={styles.label}>Hospital Password</Text>
           <TextInput
-            placeholder="••••••••"
+            placeholder="Enter password"
             placeholderTextColor={colors.muted}
             value={password}
             onChangeText={setPassword}

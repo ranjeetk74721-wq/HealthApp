@@ -36,12 +36,20 @@ export default function HospitalId() {
     try {
       const res = await api.post("/hospital/validate-id", { hospital_id: cleanId });
 
+      const releaseFocus = () => {
+        if (Platform.OS === "web" && typeof document !== "undefined") {
+          (document.activeElement as HTMLElement)?.blur();
+        }
+      };
+
       if (res.isAdmin) {
+        releaseFocus();
         router.push({
           pathname: "/admin/login",
           params: params.redirect ? { redirect: params.redirect } : undefined,
         });
       } else {
+        releaseFocus();
         router.push({
           pathname: "/select-role",
           params: {
@@ -108,7 +116,7 @@ export default function HospitalId() {
           <View style={styles.card}>
             <Text style={styles.label}>Hospital ID</Text>
             <TextInput
-              placeholder="e.g. MH001 or H00001"
+              placeholder="Enter Hospital ID"
               placeholderTextColor={colors.muted}
               value={hospitalId}
               onChangeText={(t) => {

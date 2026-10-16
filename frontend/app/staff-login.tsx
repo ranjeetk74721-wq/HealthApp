@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   View,
   Text,
@@ -29,6 +29,23 @@ export default function StaffLogin() {
   }>();
   const { signIn } = useAuth();
   const insets = useSafeAreaInsets();
+  const headerRef = useRef<View>(null);
+
+  // Focus handoff on web: move focus to title container (non-input) so focus does not stay on hidden prior screen
+  useEffect(() => {
+    if (Platform.OS === "web") {
+      const el = headerRef.current as any;
+      if (el && typeof el.focus === "function") {
+        el.focus();
+      }
+    }
+  }, []);
+
+  const releaseFocus = () => {
+    if (Platform.OS === "web" && typeof document !== "undefined") {
+      (document.activeElement as HTMLElement)?.blur();
+    }
+  };
 
   const savedHospitalId = safeLocalStorageGet("cq_receptionist_last_hospital");
   const hospitalId = (params.hospitalId as string) || savedHospitalId || "Unknown Hospital";
@@ -137,15 +154,34 @@ export default function StaffLogin() {
           showsVerticalScrollIndicator={false}
         >
           <View style={styles.backWrap}>
-            <Pressable onPress={() => router.back()} style={styles.backBtn} accessibilityLabel="Back" hitSlop={12}>
+            <Pressable
+              onPress={() => {
+                releaseFocus();
+                router.back();
+              }}
+              style={styles.backBtn}
+              accessibilityLabel="Back"
+              hitSlop={12}
+            >
               <Ionicons name="arrow-back" size={24} color={colors.onSurface} />
             </Pressable>
           </View>
 
-          <View style={styles.headerWrap}>
+          <View
+            ref={headerRef}
+            style={[styles.headerWrap, Platform.OS === "web" ? ({ outline: "none" } as any) : undefined]}
+            {...(Platform.OS === "web" ? { tabIndex: -1 } : {})}
+          >
             <Text style={styles.title}>{roleTitle}</Text>
             <Text style={styles.subtitle}>{hospitalName ? `${hospitalName} (${hospitalId})` : hospitalId}</Text>
-            <Pressable onPress={() => router.push("/hospital-id")} style={{ marginTop: 6 }} hitSlop={8}>
+            <Pressable
+              onPress={() => {
+                releaseFocus();
+                router.push("/hospital-id");
+              }}
+              style={{ marginTop: 6 }}
+              hitSlop={8}
+            >
               <Text style={{ fontSize: 12, color: colors.brandPrimary, textDecorationLine: "underline" }}>
                 Change Hospital ID
               </Text>
@@ -156,7 +192,7 @@ export default function StaffLogin() {
             <Text style={styles.label}>Email Address</Text>
             <TextInput
               testID="staff-email-input"
-              placeholder="name@hospital.com"
+              placeholder="Enter email"
               placeholderTextColor={colors.muted}
               value={email}
               onChangeText={(t) => {
@@ -174,7 +210,7 @@ export default function StaffLogin() {
             <Text style={styles.label}>Password</Text>
             <TextInput
               testID="staff-password-input"
-              placeholder="••••••••"
+              placeholder="Enter password"
               placeholderTextColor={colors.muted}
               value={password}
               onChangeText={(t) => {

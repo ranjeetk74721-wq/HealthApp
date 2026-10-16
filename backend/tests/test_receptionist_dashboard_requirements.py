@@ -12,6 +12,8 @@ from server import (
     calendar_summary,
     reception_cancel_appointment,
     reception_export_excel,
+    reception_add_patient,
+    AddPatientBody,
     QueueActionBody,
 )
 from fastapi import HTTPException
@@ -39,6 +41,8 @@ class MockDB:
         self.doctors = MagicMock()
         self.doctors.find = MagicMock(return_value=MockCursor([{"id": "doc-1"}]))
         self.doctor_sessions = MagicMock()
+        self.clinic_sessions = MagicMock()
+        self.doctor_schedule_configs = MagicMock()
         self.push_subscriptions = MagicMock()
         self.push_subscriptions.update_many = AsyncMock()
         self.push_logs = MagicMock()
@@ -457,3 +461,63 @@ async def test_excel_export_generation_and_columns(mock_db):
     charlie_row = next(r for r in rows[1:] if r[3] == "Charlie Brown")
     assert charlie_row[10] == "Cancelled"
     assert "Patient requested cancellation" in charlie_row[16]
+
+
+@pytest.mark.asyncio
+async def test_reception_add_patient_success_and_duplicate(mock_db, monkeypatch):
+    """Verifies reception_add_patient resolves hosp_id correctly, allocates next token,
+    and blocks duplicate appointments with HTTP 409.
+    """
+    mock_db.users.find_one = AsyncMock(return_value=None)
+    mock_db.users.insert_one = AsyncMock()
+    mock_db.doctors.find_one = AsyncMock(return_value={
+        "id": "doc-1",
+        "full_name": "Dr. Sarah Jenkins",
+        "hospital_id": "HOSP_TEST_99",
+        "fees": 600,
+    })
+    mock_db.clinic_sessions.find_one = AsyncMock(return_value={
+        "id": "sess-morning",
+        "session_name": "Morning OPD",
+        "start_time": "10:00 AM",
+        "end_time": "01:00 PM",
+    })
+    mock_db.appointments.find_one = AsyncMock(return_value=None)
+    mock_db.appointments.insert_one = AsyncMock()
+    mock_db.appointments.update_one = AsyncMock()
+    mock_db.doctor_sessions.find_one = AsyncMock(return_value=None)
+
+    monkeypatch.setattr(server, "broadcast_doctor_update", AsyncMock())
+    monkeypatch.setattr(server, "send_appointment_sms", AsyncMock(return_value={"ok": True, "message_id": "mid-123"}))
+    monkeypatch.setattr(server, "allocate_next_token_for_session", AsyncMock(return_value=1))
+    monkeypatch.setattr(server, "resolve_clinic_session_id", AsyncMock(return_value="sess-morning"))
+    monkeypatch.setattr(server, "calculate_appointment_eta", AsyncMock(return_value={"expected_turn_time": "10:00 AM", "eta_minutes": 0}))
+
+    user = {"id": "rec-1", "role": "receptionist", "hospital_id": "HOSP_TEST_99"}
+    body = AddPatientBody(
+        full_name="Rajesh Sharma",
+        mobile="9876543210",
+        doctor_id="doc-1",
+        age=35,
+        gender="Male",
+        address="Sector 14, Gurgaon",
+        date="2026-10-16",
+    )
+
+    # 1. Successful addition & token allocation
+    res = await reception_add_patient(body, user)
+    assert res["ok"] is True
+    assert res["patient"]["full_name"] == "Rajesh Sharma"
+    assert res["patient"]["mobile"] == "+919876543210"
+    assert res["appointment"]["token_number"] == 1
+    assert res["appointment"]["hospital_id"] == "HOSP_TEST_99"
+    assert res["appointment"]["status"] == "arrived"
+    assert mock_db.appointments.insert_one.called
+
+    # 2. Duplicate appointment returns HTTP 409
+    mock_db.appointments.find_one = AsyncMock(return_value={"id": "existing-appt-id", "session_id": "sess-morning"})
+    with pytest.raises(HTTPException) as exc:
+        await reception_add_patient(body, user)
+    assert exc.value.status_code == 409
+    assert "already has an active appointment" in exc.value.detail
+

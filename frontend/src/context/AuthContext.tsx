@@ -3,7 +3,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Platform } from "react-native";
 import { getBackendBase, invalidateCache } from "@/src/api/client";
 
-export type Role = "patient" | "doctor" | "receptionist" | "owner";
+export type Role = "patient" | "doctor" | "receptionist" | "owner" | "admin";
 
 export interface AuthUser {
   id: string;

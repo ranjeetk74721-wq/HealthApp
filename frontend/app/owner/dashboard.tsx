@@ -239,7 +239,7 @@ export default function OwnerDashboard() {
   }, [router, signOut]);
 
   useEffect(() => {
-    if (!authLoading && !user) {
+    if (!authLoading && (!user || (user.role !== "owner" && user.role !== "admin"))) {
       router.replace("/admin/login?redirect=/owner/dashboard");
     }
   }, [authLoading, user, router]);

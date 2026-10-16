@@ -6403,6 +6403,7 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
         if not doctor:
             raise HTTPException(status_code=404, detail="Doctor not found")
 
+        hosp_id = user.get("hospital_id") or doctor.get("hospital_id")
         appt_date = getattr(body, "date", None) or get_ist_now().strftime("%Y-%m-%d")
 
         # Atomic duplicate check — scoped to session when session_id is provided
@@ -6431,7 +6432,6 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
                 detail=f"This patient already has an active appointment{existing_sess_name} for today."
             )
 
-        hosp_id = user.get("hospital_id") or doctor.get("hospital_id")
         token_number = await allocate_next_token_for_session(hosp_id, body.doctor_id, appt_date, resolved_session_id)
 
         # Fetch session name for display
@@ -6901,6 +6901,7 @@ async def dev_test_sms(
 
 # ============ WEBSOCKET ENDPOINTS ============
 @app.websocket("/api/ws/queue/doctor/{doctor_id}")
+@api_router.websocket("/ws/queue/doctor/{doctor_id}")
 async def ws_doctor_queue(ws: WebSocket, doctor_id: str):
     channel = f"doctor:{doctor_id}"
     await manager.connect(channel, ws)
@@ -6928,6 +6929,7 @@ async def ws_doctor_queue(ws: WebSocket, doctor_id: str):
 
 
 @app.websocket("/api/ws/queue/appt/{appointment_id}")
+@api_router.websocket("/ws/queue/appt/{appointment_id}")
 async def ws_appt_queue(ws: WebSocket, appointment_id: str):
     channel = f"appt:{appointment_id}"
     await manager.connect(channel, ws)

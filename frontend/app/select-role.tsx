@@ -1,4 +1,5 @@
-import { View, Text, Pressable, StyleSheet, ScrollView } from "react-native";
+import { View, Text, Pressable, StyleSheet, ScrollView, Platform } from "react-native";
+import { useEffect, useRef } from "react";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { colors, spacing, radius, font } from "@/src/theme";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -9,8 +10,26 @@ export default function SelectRole() {
   const params = useLocalSearchParams<{ hospitalId?: string; hospitalName?: string; redirect?: string }>();
   const hospitalId = (params.hospitalId || "").trim().toUpperCase();
   const hospitalName = params.hospitalName || "Hospital Portal";
+  const headerRef = useRef<View>(null);
+
+  // Focus handoff on web: move focus to title container (non-input) so focus does not stay on hidden prior screen
+  useEffect(() => {
+    if (Platform.OS === "web") {
+      const el = headerRef.current as any;
+      if (el && typeof el.focus === "function") {
+        el.focus();
+      }
+    }
+  }, []);
+
+  const releaseFocus = () => {
+    if (Platform.OS === "web" && typeof document !== "undefined") {
+      (document.activeElement as HTMLElement)?.blur();
+    }
+  };
 
   const onSelect = (role: "doctor" | "receptionist" | "admin") => {
+    releaseFocus();
     router.push({
       pathname: "/staff-login",
       params: {
@@ -26,12 +45,24 @@ export default function SelectRole() {
     <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
       <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
         <View style={styles.backWrap}>
-          <Pressable onPress={() => router.back()} style={styles.backBtn} accessibilityLabel="Back" hitSlop={10}>
+          <Pressable
+            onPress={() => {
+              releaseFocus();
+              router.back();
+            }}
+            style={styles.backBtn}
+            accessibilityLabel="Back"
+            hitSlop={10}
+          >
             <Ionicons name="arrow-back" size={24} color={colors.onSurface} />
           </Pressable>
         </View>
 
-        <View style={styles.headerWrap}>
+        <View
+          ref={headerRef}
+          style={[styles.headerWrap, Platform.OS === "web" ? ({ outline: "none" } as any) : undefined]}
+          {...(Platform.OS === "web" ? { tabIndex: -1 } : {})}
+        >
           <View style={styles.badge}>
             <Ionicons name="checkmark-circle" size={16} color={colors.success} style={{ marginRight: 6 }} />
             <Text style={styles.badgeText}>Verified: {hospitalId}</Text>
