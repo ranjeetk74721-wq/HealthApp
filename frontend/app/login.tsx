@@ -31,8 +31,19 @@ export default function Login() {
     return digits.slice(0, 10);
   };
 
+  const releaseFocus = () => {
+    if (Platform.OS === "web" && typeof document !== "undefined") {
+      try {
+        (document.activeElement as HTMLElement)?.blur();
+      } catch {
+        // safe no-op
+      }
+    }
+  };
+
   const onSendOtp = async () => {
     setError(null);
+    releaseFocus();
     const clean = normalizePatientMobileInput(mobile);
     if (clean.length < 10) {
       setError("Please enter a valid 10-digit mobile number");
@@ -52,12 +63,6 @@ export default function Login() {
 
       // Check with backend for direct login or OTP dispatch
       const res = await api.post("/auth/send-otp", { mobile: clean });
-
-      const releaseFocus = () => {
-        if (Platform.OS === "web" && typeof document !== "undefined") {
-          (document.activeElement as HTMLElement)?.blur();
-        }
-      };
 
       // Returning User Direct Login:
       // If the number was previously verified with OTP and the account exists,
@@ -88,6 +93,7 @@ export default function Login() {
     } catch (e: any) {
       setError(e.message || "Failed to log in");
     } finally {
+      releaseFocus();
       setSendingOtp(false);
     }
   };

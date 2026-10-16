@@ -59,14 +59,17 @@ def get_aisensy_otp_campaign_name() -> str:
     3. AISENSY_CAMPAIGN_NAME
     4. Default "Meribaari_otp_api"
     """
-    name = (
+    raw_name = (
         os.environ.get("AISENSY_OTP_CAMPAIGN_NAME")
         or os.environ.get("Key_name")
         or os.environ.get("KEY_NAME")
         or os.environ.get("AISENSY_CAMPAIGN_NAME")
         or "Meribaari_otp_api"
-    )
-    return name.strip()
+    ).strip().strip("'\"")
+    # Automatically map known legacy or misspelled campaign names to the live approved campaign
+    if raw_name.lower() in ("meribari", "meribaari", "meribaari_otp", "meribari_otp", ""):
+        return "Meribaari_otp_api"
+    return raw_name
 
 
 def get_aisensy_appt_campaign_name() -> str:
@@ -79,15 +82,18 @@ def get_aisensy_appt_campaign_name() -> str:
     4. AISENSY_CAMPAIGN_NAME
     5. Default "Meribaari_appointment_api"
     """
-    name = (
+    raw_name = (
         os.environ.get("AISENSY_APPT_CAMPAIGN_NAME")
         or os.environ.get("AISENSY_UTILITY_CAMPAIGN_NAME")
         or os.environ.get("Key_name")
         or os.environ.get("KEY_NAME")
         or os.environ.get("AISENSY_CAMPAIGN_NAME")
         or "Meribaari_appointment_api"
-    )
-    return name.strip()
+    ).strip().strip("'\"")
+    # Automatically map known legacy or misspelled campaign names to the live approved campaign
+    if raw_name.lower() in ("meribaari_appointment", "meribari_appointment", "meribaari_utility", ""):
+        return "Meribaari_appointment_api"
+    return raw_name
 
 
 def get_aisensy_endpoint() -> str:

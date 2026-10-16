@@ -6918,6 +6918,7 @@ async def dev_test_sms(
 
 # ============ WEBSOCKET ENDPOINTS ============
 @app.websocket("/api/ws/queue/doctor/{doctor_id}")
+@app.websocket("/ws/queue/doctor/{doctor_id}")
 @api_router.websocket("/ws/queue/doctor/{doctor_id}")
 async def ws_doctor_queue(ws: WebSocket, doctor_id: str):
     channel = f"doctor:{doctor_id}"
@@ -6946,6 +6947,7 @@ async def ws_doctor_queue(ws: WebSocket, doctor_id: str):
 
 
 @app.websocket("/api/ws/queue/appt/{appointment_id}")
+@app.websocket("/ws/queue/appt/{appointment_id}")
 @api_router.websocket("/ws/queue/appt/{appointment_id}")
 async def ws_appt_queue(ws: WebSocket, appointment_id: str):
     channel = f"appt:{appointment_id}"
