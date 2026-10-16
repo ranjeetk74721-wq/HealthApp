@@ -18,6 +18,12 @@ import logging
 import httpx
 from typing import Optional, Dict, Any, List
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 logger = logging.getLogger("aisensy_service")
 
 # Default AiSensy endpoint
@@ -37,8 +43,10 @@ def get_aisensy_api_key() -> str:
         or os.environ.get("AISENSY_PROJECT_API_KEY")
         or os.environ.get("AISENSY_KEY")
     )
-    if key and key.strip() not in ("placeholder", "your_aisensy_api_key", "your_aisensy_project_api_key"):
-        return key.strip()
+    if key:
+        clean = key.strip().strip("'\"")
+        if clean not in ("placeholder", "your_aisensy_api_key", "your_aisensy_project_api_key"):
+            return clean
     return ""
 
 
@@ -49,14 +57,14 @@ def get_aisensy_otp_campaign_name() -> str:
     1. AISENSY_OTP_CAMPAIGN_NAME
     2. Key_name / KEY_NAME
     3. AISENSY_CAMPAIGN_NAME
-    4. Default "meribaari"
+    4. Default "Meribaari_otp_api"
     """
     name = (
         os.environ.get("AISENSY_OTP_CAMPAIGN_NAME")
         or os.environ.get("Key_name")
         or os.environ.get("KEY_NAME")
         or os.environ.get("AISENSY_CAMPAIGN_NAME")
-        or "meribaari"
+        or "Meribaari_otp_api"
     )
     return name.strip()
 
@@ -245,8 +253,16 @@ async def send_aisensy_project_message(
         if resp.status_code in (200, 201, 202):
             is_success = True
             if isinstance(data, dict):
-                if data.get("success") is False or data.get("status") in ("failed", "error"):
+                raw_success = data.get("success")
+                if raw_success is False or str(raw_success).lower() == "false" or data.get("status") in ("failed", "error"):
                     is_success = False
+
+            msg_id = (
+                data.get("submitted_message_id")
+                or data.get("messageId")
+                or data.get("message_id")
+                or data.get("id")
+            )
 
             return {
                 "ok": is_success,
@@ -254,7 +270,7 @@ async def send_aisensy_project_message(
                 "phone": norm_destination,
                 "campaign_name": clean_campaign,
                 "status_code": resp.status_code,
-                "message_id": data.get("messageId") or data.get("message_id") or data.get("id"),
+                "message_id": msg_id,
                 "response": data,
                 "error": None if is_success else (data.get("message") or data.get("error") or "Provider returned error"),
                 "error_code": None if is_success else (data.get("code") or data.get("errorCode") or "API_ERROR"),

@@ -2057,6 +2057,79 @@ async def notify_appointment_booked(appt: dict, doctor: dict, eta_data: dict) ->
         logger.warning(f"notify_appointment_booked error: {e}")
 
 
+async def dispatch_appointment_sms_background(
+    appt_id: str,
+    patient_mobile: str,
+    token_number: Any,
+    hour_val: str,
+    hospital_name: str,
+    patient_name: str,
+    doctor_name: str,
+    expected_time_val: str,
+    dynamic_link: str,
+    appt_date: Any,
+) -> None:
+    """Non-blocking background worker to deliver appointment utility WhatsApp message via AiSensy.
+    
+    Guarantees:
+    - Never blocks the client HTTP response or booking creation.
+    - Prevents duplicate dispatches if already sent to provider.
+    - Persists provider message ID, error codes, and audit records in MongoDB.
+    - Rejection or network timeout will not affect already-saved appointments.
+    """
+    try:
+        if not patient_mobile:
+            return
+
+        # Deduplication guard: check if already sent to provider
+        existing = await db.appointments.find_one({"id": appt_id}, {"sms_status": 1})
+        if existing and existing.get("sms_status") == "SENT_TO_PROVIDER":
+            logger.info(f"[AiSensy] Notification for appointment {appt_id} already dispatched. Skipping duplicate.")
+            return
+
+        sms_res = await send_appointment_sms(
+            phone=patient_mobile,
+            oid=token_number,
+            hour=hour_val,
+            hospital_name=hospital_name,
+            patient_name=patient_name,
+            doctor_name=doctor_name,
+            token_number=token_number,
+            expected_time=expected_time_val,
+            estimated_time=expected_time_val,
+            live_queue_link=dynamic_link,
+            appointment_link=dynamic_link,
+            appointment_date=appt_date,
+        )
+        sms_ok = sms_res.get("ok", False)
+        sms_provider_name = sms_res.get("provider") or get_sms_provider()
+        sms_status = "SENT_TO_PROVIDER" if sms_ok else "FAILED"
+        sms_updates = {
+            "sms_provider": sms_provider_name,
+            "sms_status": sms_status,
+            "sms_last_attempt_at": now_iso(),
+        }
+        if sms_res.get("message_id"):
+            sms_updates["sms_provider_message_id"] = sms_res["message_id"]
+        if sms_res.get("error_code") or sms_res.get("code"):
+            sms_updates["sms_error_code"] = sms_res.get("error_code") or sms_res.get("code")
+        if sms_res.get("sms_text"):
+            sms_updates["sms_text"] = sms_res["sms_text"]
+        await db.appointments.update_one({"id": appt_id}, {"$set": sms_updates})
+
+        masked_num = f"******{patient_mobile[-4:]}" if len(patient_mobile) >= 6 else "*****"
+        logger.info(
+            f"[BOOKING_NOTIFICATION]\n"
+            f"Booking created: YES\n"
+            f"Messaging provider: {sms_provider_name.title()}\n"
+            f"Recipient: {masked_num}\n"
+            f"Provider response: {sms_res.get('message_id') or sms_res.get('error') or 'NONE'}\n"
+            f"Delivery status: {'PENDING' if sms_ok else 'FAILED'}"
+        )
+    except Exception as e:
+        logger.warning(f"[AiSensy Background] Notification dispatch failed for appointment {appt_id}: {e}")
+
+
 async def send_welcome_status_if_needed(
     user_id: str,
     device_token: str,
@@ -3425,52 +3498,25 @@ async def create_appointment(
         hour_val = expected_time_val if (" – " in expected_time_val or " - " in expected_time_val) else format_renflair_hour(expected_time_val, default="2")
         hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
         appt_date = doc.get("date") or getattr(body, "date", None)
-        try:
-            sms_res = await send_appointment_sms(
-                phone=patient_mobile,
-                oid=token_number,
-                hour=hour_val,
-                hospital_name=hospital_name,
-                patient_name=user["full_name"],
-                doctor_name=doctor["full_name"],
-                token_number=token_number,
-                expected_time=expected_time_val,
-                estimated_time=expected_time_val,
-                live_queue_link=dynamic_link,
-                appointment_link=dynamic_link,
-                appointment_date=appt_date,
-            )
-            sms_ok = sms_res.get("ok", False)
-            sms_provider_name = sms_res.get("provider") or get_sms_provider()
-            sms_status = "SENT_TO_PROVIDER" if sms_ok else "FAILED"
-            sms_updates = {
-                "sms_provider": sms_provider_name,
-                "sms_status": sms_status,
-                "sms_last_attempt_at": now_iso(),
-            }
-            if sms_res.get("message_id"):
-                sms_updates["sms_provider_message_id"] = sms_res["message_id"]
-                doc["sms_provider_message_id"] = sms_res["message_id"]
-            if sms_res.get("error_code") or sms_res.get("code"):
-                sms_updates["sms_error_code"] = sms_res.get("error_code") or sms_res.get("code")
-            if sms_res.get("sms_text"):
-                sms_updates["sms_text"] = sms_res["sms_text"]
-                doc["sms_text"] = sms_res["sms_text"]
-            await db.appointments.update_one({"id": appt_id}, {"$set": sms_updates})
-            doc["sms_status"] = sms_status
-            doc["sms_provider"] = sms_provider_name
+        
+        # Immediate non-blocking response state
+        doc["sms_status"] = "PENDING"
+        doc["sms_provider"] = get_sms_provider()
 
-            masked_num = f"******{patient_mobile[-4:]}" if len(patient_mobile) >= 6 else "*****"
-            logger.info(
-                f"[BOOKING_NOTIFICATION]\n"
-                f"Booking created: YES\n"
-                f"Messaging provider: {sms_provider_name.title()}\n"
-                f"Recipient: {masked_num}\n"
-                f"Provider response: {sms_res.get('message_id') or sms_res.get('error') or 'NONE'}\n"
-                f"Delivery status: {'PENDING' if sms_ok else 'FAILED'}"
+        asyncio.create_task(
+            dispatch_appointment_sms_background(
+                appt_id=appt_id,
+                patient_mobile=patient_mobile,
+                token_number=token_number,
+                hour_val=hour_val,
+                hospital_name=hospital_name,
+                patient_name=user.get("full_name", "Patient"),
+                doctor_name=doctor.get("full_name", "Doctor"),
+                expected_time_val=expected_time_val,
+                dynamic_link=dynamic_link,
+                appt_date=appt_date,
             )
-        except Exception as e:
-            logger.warning(f"SMS sending failed (non-blocking): {e}")
+        )
 
     doc.pop("_id", None)
     await broadcast_doctor_update(body.doctor_id, "booked")
@@ -6497,53 +6543,24 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
         appt["expected_time"] = expected_time_val
         appt["eta_minutes"] = eta_data.get("eta_minutes", 0)
         hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
-        appt_date = appt.get("date")
-        try:
-            sms_res = await send_appointment_sms(
-                phone=mobile,
-                oid=appt["token_number"],
-                hour=hour_val,
+        # Immediate non-blocking response state
+        appt["sms_status"] = "PENDING"
+        appt["sms_provider"] = get_sms_provider()
+
+        asyncio.create_task(
+            dispatch_appointment_sms_background(
+                appt_id=appt_id,
+                patient_mobile=mobile,
+                token_number=appt["token_number"],
+                hour_val=hour_val,
                 hospital_name=hospital_name,
                 patient_name=patient_name,
-                doctor_name=doctor["full_name"],
-                token_number=appt["token_number"],
-                expected_time=expected_time_val,
-                estimated_time=expected_time_val,
-                live_queue_link=dynamic_link,
-                appointment_link=dynamic_link,
-                appointment_date=appt_date,
+                doctor_name=doctor.get("full_name", "Doctor"),
+                expected_time_val=expected_time_val,
+                dynamic_link=dynamic_link,
+                appt_date=appt_date,
             )
-            sms_ok = sms_res.get("ok", False)
-            sms_provider_name = sms_res.get("provider") or get_sms_provider()
-            sms_status = "SENT_TO_PROVIDER" if sms_ok else "FAILED"
-            sms_updates = {
-                "sms_provider": sms_provider_name,
-                "sms_status": sms_status,
-                "sms_last_attempt_at": now_iso(),
-            }
-            if sms_res.get("message_id"):
-                sms_updates["sms_provider_message_id"] = sms_res["message_id"]
-                appt["sms_provider_message_id"] = sms_res["message_id"]
-            if sms_res.get("error_code") or sms_res.get("code"):
-                sms_updates["sms_error_code"] = sms_res.get("error_code") or sms_res.get("code")
-            if sms_res.get("sms_text"):
-                sms_updates["sms_text"] = sms_res["sms_text"]
-                appt["sms_text"] = sms_res["sms_text"]
-            await db.appointments.update_one({"id": appt_id}, {"$set": sms_updates})
-            appt["sms_status"] = sms_status
-            appt["sms_provider"] = sms_provider_name
-
-            masked_num = f"******{mobile[-4:]}" if len(mobile) >= 6 else "*****"
-            logger.info(
-                f"[BOOKING_NOTIFICATION]\n"
-                f"Booking created: YES\n"
-                f"Messaging provider: {sms_provider_name.title()}\n"
-                f"Recipient: {masked_num}\n"
-                f"Provider response: {sms_res.get('message_id') or sms_res.get('error') or 'NONE'}\n"
-                f"Delivery status: {'PENDING' if sms_ok else 'FAILED'}"
-            )
-        except Exception as e:
-            logger.warning(f"SMS sending failed (non-blocking): {e}")
+        )
 
         appt.pop("_id", None)
         await broadcast_doctor_update(body.doctor_id, "patient_added")

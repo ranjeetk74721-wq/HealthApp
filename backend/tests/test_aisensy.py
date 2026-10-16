@@ -519,3 +519,69 @@ def test_fastapi_json_validation_error_handling():
     assert response.status_code == 400
     assert response.json()["ok"] is False
     assert "Invalid or empty JSON body" in response.json()["detail"]
+
+
+# ============ 7. NEW VERIFICATION & AUDIT TESTS ============
+
+@pytest.mark.asyncio
+async def test_aisensy_extracts_submitted_message_id(monkeypatch):
+    """Verify that AiSensy's submitted_message_id is correctly mapped to message_id."""
+    monkeypatch.setenv("AISENSY_API_KEY", "test_key")
+    mock_resp = MagicMock(spec=httpx.Response)
+    mock_resp.status_code = 200
+    mock_resp.text = json.dumps({
+        "success": "true",
+        "submitted_message_id": "74c7d686-0c03-4bdb-8fd3-481e5981e71f"
+    })
+    mock_resp.json.return_value = {
+        "success": "true",
+        "submitted_message_id": "74c7d686-0c03-4bdb-8fd3-481e5981e71f"
+    }
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        res = await send_aisensy_project_message(
+            destination="9876543210",
+            campaign_name="Meribaari_otp_api",
+            user_name="Test User",
+            template_params=["654321"],
+        )
+        assert res["ok"] is True
+        assert res["message_id"] == "74c7d686-0c03-4bdb-8fd3-481e5981e71f"
+
+
+def test_aisensy_otp_default_campaign_name_meribaari_otp_api(monkeypatch):
+    """Verify default OTP campaign name falls back to Meribaari_otp_api."""
+    monkeypatch.delenv("AISENSY_OTP_CAMPAIGN_NAME", raising=False)
+    monkeypatch.delenv("Key_name", raising=False)
+    monkeypatch.delenv("KEY_NAME", raising=False)
+    monkeypatch.delenv("AISENSY_CAMPAIGN_NAME", raising=False)
+    assert get_aisensy_otp_campaign_name() == "Meribaari_otp_api"
+
+
+
+@pytest.mark.asyncio
+async def test_dispatch_appointment_sms_background_dedup(monkeypatch):
+    """Verify background dispatch skips duplicate if already marked SENT_TO_PROVIDER."""
+    from server import dispatch_appointment_sms_background, db
+
+    mock_db_appt = {"id": "appt-dedup-1", "sms_status": "SENT_TO_PROVIDER"}
+    with patch.object(db.appointments, "find_one", new_callable=AsyncMock) as mock_find, \
+         patch("server.send_appointment_sms", new_callable=AsyncMock) as mock_send:
+        mock_find.return_value = mock_db_appt
+
+        await dispatch_appointment_sms_background(
+            appt_id="appt-dedup-1",
+            patient_mobile="9876543210",
+            token_number=1,
+            hour_val="10:00 AM",
+            hospital_name="Clinic",
+            patient_name="Patient",
+            doctor_name="Doctor",
+            expected_time_val="10:00 AM",
+            dynamic_link="https://link.com",
+            appt_date="2026-10-20",
+        )
+
+        mock_send.assert_not_called()
+
