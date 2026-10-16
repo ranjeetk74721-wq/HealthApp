@@ -19,9 +19,21 @@ export default function Login() {
   const [sendingOtp, setSendingOtp] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const normalizePatientMobileInput = (raw: string): string => {
+    let digits = raw.replace(/\D/g, "");
+    if (digits.startsWith("91") && digits.length === 12) {
+      digits = digits.slice(2);
+    } else if (digits.startsWith("0") && digits.length === 11) {
+      digits = digits.slice(1);
+    } else if (digits.length > 10 && digits.startsWith("91")) {
+      digits = digits.slice(2, 12);
+    }
+    return digits.slice(0, 10);
+  };
+
   const onSendOtp = async () => {
     setError(null);
-    const clean = mobile.replace(/[^0-9]/g, "");
+    const clean = normalizePatientMobileInput(mobile);
     if (clean.length < 10) {
       setError("Please enter a valid 10-digit mobile number");
       return;
@@ -41,11 +53,18 @@ export default function Login() {
       // Check with backend for direct login or OTP dispatch
       const res = await api.post("/auth/send-otp", { mobile: clean });
 
+      const releaseFocus = () => {
+        if (Platform.OS === "web" && typeof document !== "undefined") {
+          (document.activeElement as HTMLElement)?.blur();
+        }
+      };
+
       // Returning User Direct Login:
       // If the number was previously verified with OTP and the account exists,
       // log in directly and navigate straight to the dashboard.
       if (res.direct_login && res.access_token && res.user) {
         await signIn(res.access_token, res.user);
+        releaseFocus();
         if (params.redirect) {
           router.replace(params.redirect as any);
         } else {
@@ -55,6 +74,7 @@ export default function Login() {
       }
 
       // First-time user / unverified: route to OTP screen
+      releaseFocus();
       if (isFirebaseConfigured()) {
         await sendFirebasePhoneOtp(fullNumber);
         otpParams.use_firebase = "1";
@@ -95,10 +115,13 @@ export default function Login() {
                 placeholder="98765 43210"
                 placeholderTextColor={colors.muted}
                 value={mobile}
-                onChangeText={(t) => setMobile(t.replace(/[^0-9]/g, "").slice(0, 10))}
+                onChangeText={(t) => {
+                  setMobile(normalizePatientMobileInput(t));
+                  if (error) setError(null);
+                }}
                 keyboardType="phone-pad"
                 style={styles.mobileInput}
-                maxLength={10}
+                maxLength={16}
               />
             </View>
 

@@ -923,16 +923,16 @@ def normalize_mobile(mobile: str) -> str:
     """Normalize Indian mobile numbers to +91XXXXXXXXXX format."""
     if not mobile:
         return ""
-    m = "".join(ch for ch in mobile if ch.isdigit() or ch == "+")
-    # Strip leading +91 or 91 or 0
-    if m.startswith("+91"):
-        m = m[3:]
-    elif m.startswith("91") and len(m) == 12:
-        m = m[2:]
-    elif m.startswith("0"):
-        m = m[1:]
-    m = "".join(ch for ch in m if ch.isdigit())
-    return f"+91{m}" if m else ""
+    digits = "".join(ch for ch in str(mobile) if ch.isdigit())
+    if digits.startswith("91") and len(digits) == 12:
+        digits = digits[2:]
+    elif digits.startswith("0") and len(digits) == 11:
+        digits = digits[1:]
+    elif len(digits) > 10 and digits.startswith("091"):
+        digits = digits[3:]
+    elif len(digits) > 10 and digits[-10] in "56789":
+        digits = digits[-10:]
+    return f"+91{digits}" if digits else ""
 
 
 async def get_current_user(

@@ -943,8 +943,8 @@ export default function OwnerDashboard() {
                 <TextInput placeholder="Hospital ID (e.g. H00002, auto-generated if blank)" placeholderTextColor={colors.muted} value={hospIdInput} onChangeText={setHospIdInput} autoCapitalize="characters" style={styles.input} />
                 <TextInput placeholder="Hospital Name*" placeholderTextColor={colors.muted} value={hospName} onChangeText={setHospName} style={styles.input} />
                 <TextInput placeholder="City (optional)" placeholderTextColor={colors.muted} value={hospCity} onChangeText={setHospCity} style={styles.input} />
-                <TextInput placeholder="Hospital Verification Email (optional, defaults to admin@ID.com)" placeholderTextColor={colors.muted} value={hospEmail} onChangeText={setHospEmail} keyboardType="email-address" autoCapitalize="none" style={styles.input} />
-                <TextInput placeholder="Hospital Verification Password (optional, defaults to Hospital@123)" placeholderTextColor={colors.muted} value={hospPassword} onChangeText={setHospPassword} secureTextEntry style={styles.input} />
+                <TextInput placeholder="Hospital verification email (optional)" placeholderTextColor={colors.muted} value={hospEmail} onChangeText={setHospEmail} keyboardType="email-address" autoCapitalize="none" style={styles.input} />
+                <TextInput placeholder="Hospital verification password (optional)" placeholderTextColor={colors.muted} value={hospPassword} onChangeText={setHospPassword} secureTextEntry style={styles.input} />
                 <Pressable onPress={handleCreateHospital} disabled={hospSaving} style={styles.submitBtn}>
                   {hospSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitBtnText}>Create Hospital ID</Text>}
                 </Pressable>

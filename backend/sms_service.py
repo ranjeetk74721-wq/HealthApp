@@ -74,8 +74,8 @@ def format_renflair_phone(phone: str) -> Optional[str]:
     elif digits.startswith("0") and len(digits) == 11:
         digits = digits[1:]
     
-    # Valid Indian mobile number: exactly 10 digits starting with 6, 7, 8, or 9
-    if len(digits) == 10 and digits[0] in "6789":
+    # Valid Indian mobile number: exactly 10 digits starting with 5, 6, 7, 8, or 9
+    if len(digits) == 10 and digits[0] in "56789":
         return digits
     return None
 
