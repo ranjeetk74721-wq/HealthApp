@@ -101,3 +101,11 @@ credentials.json
 # Never commit EAS/Google Play credentials
 google-services-key.json
 GoogleService-Info.plist
+
+# Architecture, audits, reports, and private documentation (saved locally, excluded from GitHub)
+local_architecture_docs/
+memory/
+*.md
+!README.md
+!frontend/README.md
+

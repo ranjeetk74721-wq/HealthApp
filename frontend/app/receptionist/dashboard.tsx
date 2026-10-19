@@ -905,7 +905,8 @@ export default function ReceptionistDashboard() {
     setAddError(null);
     setAddIsTimeout(false);
     if (!pName.trim()) return setAddError("Name is required");
-    if (pMobile.replace(/[^0-9]/g, "").length < 10) return setAddError("Enter valid 10-digit mobile");
+    const cleanMobile = pMobile.replace(/[^0-9]/g, "");
+    if (pMobile.trim() && cleanMobile.length < 10) return setAddError("Enter valid 10-digit mobile");
     const effectiveDocId = selectedDocRef.current || selectedDoc;
     if (!effectiveDocId) return setAddError("Select a doctor first");
 
@@ -923,7 +924,7 @@ export default function ReceptionistDashboard() {
         "/reception/add-patient",
         {
           full_name: pName.trim(),
-          mobile: pMobile.replace(/[^0-9]/g, ""),
+          mobile: cleanMobile || undefined,
           age: pAge ? parseInt(pAge, 10) : undefined,
           gender: pGender,
           symptoms: pSymptoms || undefined,
@@ -952,11 +953,11 @@ export default function ReceptionistDashboard() {
             `/reception/queue?doctor_id=${effectiveDocId}&date=${selectedDate}`,
             { bypassCache: true, timeoutMs: 6000 }
           );
-          const cleanMob = pMobile.replace(/[^0-9]/g, "");
+          const cleanMob = cleanMobile || null;
           const found = Array.isArray(qList)
             ? qList.find(
                 (a: any) =>
-                  a.patient_mobile === cleanMob ||
+                  (cleanMob && a.patient_mobile === cleanMob) ||
                   (a.patient_name && a.patient_name.toLowerCase() === pName.trim().toLowerCase())
               )
             : null;
@@ -1422,6 +1423,16 @@ export default function ReceptionistDashboard() {
                         <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
                           <Text style={styles.apptName}>{a.patient_name}</Text>
                           <Ionicons name="information-circle-outline" size={14} color={colors.brandPrimary} />
+                          {isBooked && (
+                            <View style={[styles.consultingBadge, { backgroundColor: "#E0E7FF" }]}>
+                              <Text style={[styles.consultingBadgeText, { color: "#3730A3" }]}>REGISTERED</Text>
+                            </View>
+                          )}
+                          {isArrived && (
+                            <View style={[styles.consultingBadge, { backgroundColor: "#FEF3C7" }]}>
+                              <Text style={[styles.consultingBadgeText, { color: "#92400E" }]}>WAITING</Text>
+                            </View>
+                          )}
                           {isConsulting && (
                             <View style={styles.consultingBadge}>
                               <Text style={styles.consultingBadgeText}>CONSULTING</Text>
@@ -1942,10 +1953,10 @@ export default function ReceptionistDashboard() {
               {/* 3. Patient Details */}
               <Text style={styles.label}>3. Patient Full Name*</Text>
               <TextInput testID="ap-name" editable={!addLoading} placeholder="Patient name" placeholderTextColor={colors.muted} value={pName} onChangeText={setPName} style={styles.input} />
-              <Text style={styles.label}>Mobile Number*</Text>
+              <Text style={styles.label}>Mobile Number (Optional - ऐच्छिक)</Text>
               <View style={styles.mobileWrap}>
                 <View style={styles.ccBadge}><Text style={styles.ccText}>+91</Text></View>
-                <TextInput testID="ap-mobile" editable={!addLoading} placeholder="98765 43210" placeholderTextColor={colors.muted} value={pMobile} onChangeText={(t) => setPMobile(t.replace(/[^0-9]/g, "").slice(0, 10))} keyboardType="phone-pad" style={styles.mobileInput} />
+                <TextInput testID="ap-mobile" editable={!addLoading} placeholder="98765 43210 (or leave blank)" placeholderTextColor={colors.muted} value={pMobile} onChangeText={(t) => setPMobile(t.replace(/[^0-9]/g, "").slice(0, 10))} keyboardType="phone-pad" style={styles.mobileInput} />
               </View>
               <View style={{ flexDirection: "row", gap: spacing.sm }}>
                 <View style={{ flex: 1 }}>

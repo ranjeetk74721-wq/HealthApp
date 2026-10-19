@@ -127,15 +127,31 @@ async function getToken(): Promise<string | null> {
   return await AsyncStorage.getItem("cq_token");
 }
 
-// ─── Simple in-memory GET cache (30 second TTL) ───────────────────────────
+// ─── Simple in-memory GET cache with role/token isolation and in-flight deduplication ───
 // Prevents duplicate API calls when screens re-focus rapidly.
-// Only caches GET requests; mutations always bypass.
+// Only caches GET requests; mutations always bypass and invalidate.
 interface CacheEntry {
   data: any;
   expiresAt: number;
 }
 const _cache: Map<string, CacheEntry> = new Map();
-const CACHE_TTL_MS = 30_000; // 30 seconds
+const _inFlight: Map<string, Promise<any>> = new Map();
+
+// 30 seconds for static metadata (specialties, clinic profiles)
+const STATIC_CACHE_TTL_MS = 30_000;
+// 2 seconds for real-time operational queues & appointments to eliminate duplicate parallel fetches while guaranteeing fresh data
+const OPERATIONAL_CACHE_TTL_MS = 2_000;
+
+export function isOperationalEndpoint(cleanPath: string): boolean {
+  return (
+    cleanPath.startsWith("/reception/queue") ||
+    cleanPath.startsWith("/doctor/appointments") ||
+    cleanPath.startsWith("/doctor/dashboard") ||
+    cleanPath.includes("/session") ||
+    cleanPath.startsWith("/appointments") ||
+    cleanPath.startsWith("/patient/queue")
+  );
+}
 
 // Monotonic sequence clock for tracking request start and invalidation times
 let _requestSeq = 0;
@@ -152,8 +168,9 @@ function getCached(key: string): any | null {
   return entry.data;
 }
 
-function setCached(key: string, data: any) {
-  _cache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS });
+function setCached(key: string, data: any, cleanPath: string) {
+  const ttl = isOperationalEndpoint(cleanPath) ? OPERATIONAL_CACHE_TTL_MS : STATIC_CACHE_TTL_MS;
+  _cache.set(key, { data, expiresAt: Date.now() + ttl });
 }
 
 function escapeRegex(str: string): string {
@@ -161,8 +178,10 @@ function escapeRegex(str: string): string {
 }
 
 function normalizeKeyPath(key: string): string {
+  // Strip token prefix if present: "tokenHash:path"
+  const colonIdx = key.indexOf(":");
+  let keyPath = colonIdx !== -1 && !key.startsWith("http") ? key.slice(colonIdx + 1) : key;
   const apiBase = getApiBase();
-  let keyPath = key;
   if (apiBase && keyPath.startsWith(apiBase)) {
     keyPath = keyPath.slice(apiBase.length);
   }
@@ -214,6 +233,7 @@ export function invalidateCache(pathPrefix?: string | string[]) {
     _lastGlobalInvalidationSeq = invalSeq;
     _prefixInvalidations.clear();
     _cache.clear();
+    _inFlight.clear();
     return;
   }
 
@@ -423,116 +443,135 @@ async function request(path: string, opts: RequestOpts = {}, retryCount = 0): Pr
 
   const apiBase = getApiBase();
   const url = `${apiBase}${cleanPath}`;
+  const tokenHash = token ? token.slice(-16) : "anon";
+  const cacheKey = `${tokenHash}:${url}`;
 
   // Return cached result for GET requests unless bypassCache is true
   if (method === "GET" && !opts.bypassCache) {
-    const cached = getCached(url);
+    const cached = getCached(cacheKey);
     if (cached !== null) return cached;
+
+    const inFlight = _inFlight.get(cacheKey);
+    if (inFlight) return inFlight;
   }
 
-  let res: Response;
-  let timeoutId: any = null;
-  let didTimeout = false;
-  let signal = opts.signal;
+  const exec = async (): Promise<any> => {
+    let res: Response;
+    let timeoutId: any = null;
+    let didTimeout = false;
+    let signal = opts.signal;
 
-  if (opts.timeoutMs && opts.timeoutMs > 0) {
-    const controller = new AbortController();
-    signal = controller.signal;
-    timeoutId = setTimeout(() => {
-      didTimeout = true;
-      controller.abort();
-    }, opts.timeoutMs);
-  }
+    if (opts.timeoutMs && opts.timeoutMs > 0) {
+      const controller = new AbortController();
+      signal = controller.signal;
+      timeoutId = setTimeout(() => {
+        didTimeout = true;
+        controller.abort();
+      }, opts.timeoutMs);
+    }
 
-  try {
-    res = await fetch(url, { ...opts, headers, signal });
-  } catch (err: any) {
-    if (didTimeout || err?.name === "AbortError") {
-      throw new TimeoutError(
-        `Request to ${cleanPath} timed out after ${opts.timeoutMs}ms. Please check your connection.`,
+    try {
+      res = await fetch(url, { ...opts, headers, signal });
+    } catch (err: any) {
+      if (didTimeout || err?.name === "AbortError") {
+        throw new TimeoutError(
+          `Request to ${cleanPath} timed out after ${opts.timeoutMs}ms. Please check your connection.`,
+        );
+      }
+
+      // Safe transient retry for idempotent GET requests (handles mobile network switch or Render cold-start)
+      if (method === "GET" && retryCount < 1) {
+        await new Promise((r) => setTimeout(r, 1500));
+        return request(path, opts, retryCount + 1);
+      }
+
+      const hostDisplay = typeof window !== "undefined" ? (getBackendBase() || window.location.origin) : getBackendBase();
+      throw new ApiError(
+        `Unable to reach the Meribaari API at ${hostDisplay}. Check your internet connection and try again.`,
+        0,
+        null,
+        false,
+      );
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+
+    const contentType = res.headers.get("content-type") || "";
+    const text = await res.text();
+    const isHtml =
+      contentType.includes("text/html") ||
+      text.trim().startsWith("<!DOCTYPE") ||
+      text.trim().startsWith("<html");
+
+    if (isHtml) {
+      // API route returned HTML (e.g. gateway timeout, proxy error, or unexpected HTML page)
+      throw new ApiError(
+        `The server returned an unexpected response (HTTP ${res.status}). Please try again later.`,
+        res.status,
+        null,
+        true,
       );
     }
 
-    // Safe transient retry for idempotent GET requests (handles mobile network switch or Render cold-start)
-    if (method === "GET" && retryCount < 1) {
-      await new Promise((r) => setTimeout(r, 1500));
-      return request(path, opts, retryCount + 1);
+    let data: any = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text;
     }
 
-    const hostDisplay = typeof window !== "undefined" ? (getBackendBase() || window.location.origin) : getBackendBase();
-    throw new ApiError(
-      `Unable to reach the Meribaari API at ${hostDisplay}. Check your internet connection and try again.`,
-      0,
-      null,
-      false,
-    );
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
-  }
+    if (!res.ok) {
+      // Retry once for GET on 502/503 during Render cold start
+      if (method === "GET" && (res.status === 502 || res.status === 503) && retryCount < 1) {
+        await new Promise((r) => setTimeout(r, 2000));
+        return request(path, opts, retryCount + 1);
+      }
 
-  const contentType = res.headers.get("content-type") || "";
-  const text = await res.text();
-  const isHtml =
-    contentType.includes("text/html") ||
-    text.trim().startsWith("<!DOCTYPE") ||
-    text.trim().startsWith("<html");
-
-  if (isHtml) {
-    // API route returned HTML (e.g. gateway timeout, proxy error, or unexpected HTML page)
-    throw new ApiError(
-      `The server returned an unexpected response (HTTP ${res.status}). Please try again later.`,
-      res.status,
-      null,
-      true,
-    );
-  }
-
-  let data: any = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = text;
-  }
-
-  if (!res.ok) {
-    // Retry once for GET on 502/503 during Render cold start
-    if (method === "GET" && (res.status === 502 || res.status === 503) && retryCount < 1) {
-      await new Promise((r) => setTimeout(r, 2000));
-      return request(path, opts, retryCount + 1);
+      let msg = `HTTP ${res.status}`;
+      if (data && typeof data === "object" && data.detail) {
+        msg = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+      } else if (typeof data === "string" && data.length < 200) {
+        msg = data;
+      }
+      throw new ApiError(msg, res.status, data, false);
     }
 
-    let msg = `HTTP ${res.status}`;
-    if (data && typeof data === "object" && data.detail) {
-      msg = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
-    } else if (typeof data === "string" && data.length < 200) {
-      msg = data;
-    }
-    throw new ApiError(msg, res.status, data, false);
-  }
-
-  // Cache successful GET responses only if not stale from a concurrent invalidation
-  if (method === "GET") {
-    const isStale = isResponseStale(url, reqSeq);
-    if (!isStale && !opts.bypassCache) {
-      setCached(url, data);
-    }
-  } else {
-    // Mutation — invalidate targeted caches so affected resources fetch fresh data
-    const explicitPrefixes = opts.invalidatePrefixes;
-    if (explicitPrefixes !== undefined) {
-      invalidateCache(explicitPrefixes);
+    // Cache successful GET responses only if not stale from a concurrent invalidation
+    if (method === "GET") {
+      const isStale = isResponseStale(url, reqSeq);
+      if (!isStale && !opts.bypassCache) {
+        setCached(cacheKey, data, cleanPath);
+      }
     } else {
-      const targeted = getTargetedInvalidationPrefixes(cleanPath, method);
-      if (targeted !== null) {
-        invalidateCache(targeted);
+      // Mutation — invalidate targeted caches so affected resources fetch fresh data
+      const explicitPrefixes = opts.invalidatePrefixes;
+      if (explicitPrefixes !== undefined) {
+        invalidateCache(explicitPrefixes);
       } else {
-        // Fallback for unestablished mutations / auth boundaries: full cache clear
-        invalidateCache();
+        const targeted = getTargetedInvalidationPrefixes(cleanPath, method);
+        if (targeted !== null) {
+          invalidateCache(targeted);
+        } else {
+          // Fallback for unestablished mutations / auth boundaries: full cache clear
+          invalidateCache();
+        }
       }
     }
+
+    return data;
+  };
+
+  if (method === "GET") {
+    const fetchPromise = exec();
+    _inFlight.set(cacheKey, fetchPromise);
+    try {
+      return await fetchPromise;
+    } finally {
+      _inFlight.delete(cacheKey);
+    }
   }
 
-  return data;
+  return await exec();
 }
 
 export const api = {

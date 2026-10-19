@@ -1,22 +1,39 @@
 const fs = require('fs');
 const path = require('path');
 
-const DIST_HTML_PATH = path.join(__dirname, '..', 'dist', 'index.html');
+const DIST_DIR = path.join(__dirname, '..', 'dist');
+const DIST_HTML_PATH = path.join(DIST_DIR, 'index.html');
 
 if (!fs.existsSync(DIST_HTML_PATH)) {
   console.log('⚠️ dist/index.html not found, skipping startup diagnostic injection.');
   process.exit(0);
 }
 
+// Generate deterministic or deployment-linked build identifier
+const buildId = process.env.VERCEL_GIT_COMMIT_SHA
+  ? process.env.VERCEL_GIT_COMMIT_SHA.slice(0, 8)
+  : (process.env.BUILD_ID || Date.now().toString(36));
+
+// Write version.json for deployment verification
+const versionInfo = {
+  app: 'meribaari-frontend',
+  buildId: buildId,
+  builtAt: new Date().toISOString()
+};
+fs.writeFileSync(path.join(DIST_DIR, 'version.json'), JSON.stringify(versionInfo, null, 2), 'utf8');
+console.log(`✅ Generated dist/version.json (Build ID: ${buildId})`);
+
 let html = fs.readFileSync(DIST_HTML_PATH, 'utf8');
 
 const headDiagnosticScript = `
     <!-- MeriBaari Pre-React Startup Diagnostic & Error Capture -->
+    <meta name="meribaari-build-id" content="${buildId}" />
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
     <meta http-equiv="Pragma" content="no-cache" />
     <meta http-equiv="Expires" content="0" />
     <script>
       (function() {
+        window.__MERIBAARI_BUILD_ID__ = "${buildId}";
         window.__mb_errors = [];
         window.__mb_show_error = function() {
           var fb = document.getElementById('mb-startup-fallback');
@@ -30,14 +47,29 @@ const headDiagnosticScript = `
           if (msg) msg.textContent = 'A loading error occurred before the app could start:';
         };
 
+        // Capture phase listener to catch 404/network failures on <script> and <link> tags
         window.addEventListener('error', function(e) {
+          if (e && e.target && (e.target.tagName === 'SCRIPT' || e.target.tagName === 'LINK')) {
+            var src = e.target.src || e.target.href || '';
+            if (src.indexOf('/_expo/') !== -1 || src.indexOf('/assets/') !== -1) {
+              console.warn('[MeriBaari Asset Load Failure]', src);
+              var reloadKey = '__mb_reload_' + (src.split('/').pop() || 'chunk');
+              if (window.sessionStorage && !sessionStorage.getItem(reloadKey)) {
+                sessionStorage.setItem(reloadKey, '1');
+                var u = new URL(window.location.href);
+                u.searchParams.set('_upd', Date.now().toString());
+                window.location.replace(u.toString());
+                return;
+              }
+            }
+          }
           var text = (e && e.message) || String(e || 'Unknown error');
           var file = (e && e.filename) ? (e.filename.split('/').pop() + ':' + (e.lineno || '')) : '';
           var full = text + (file ? ' [' + file + ']' : '');
           window.__mb_errors.push(full);
           console.error('[MeriBaari Startup Error]', e);
           window.__mb_show_error();
-        });
+        }, true);
 
         window.addEventListener('unhandledrejection', function(e) {
           var r = e && e.reason;

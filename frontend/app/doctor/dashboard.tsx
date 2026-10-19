@@ -123,7 +123,7 @@ export default function DoctorDashboard() {
 
       if (verifiedDocId) {
         const [dashRes, apptsRes, sumRes, recsRes, sRes] = await Promise.all([
-          api.get("/doctor/dashboard", { bypassCache: shouldBypass }),
+          api.get(`/doctor/dashboard?date=${targetDate}`, { bypassCache: shouldBypass }),
           api.get(`/doctor/appointments?date=${targetDate}`, { bypassCache: shouldBypass }),
           api.get("/appointments/calendar-summary", { bypassCache: shouldBypass }).catch(() => []),
           api.get("/doctor/receptionists", { bypassCache: shouldBypass }).catch(() => []),
@@ -136,7 +136,7 @@ export default function DoctorDashboard() {
         sessRes = sRes;
       } else {
         const [dashRes, apptsRes, sumRes, recsRes] = await Promise.all([
-          api.get("/doctor/dashboard", { bypassCache: shouldBypass }),
+          api.get(`/doctor/dashboard?date=${targetDate}`, { bypassCache: shouldBypass }),
           api.get(`/doctor/appointments?date=${targetDate}`, { bypassCache: shouldBypass }),
           api.get("/appointments/calendar-summary", { bypassCache: shouldBypass }).catch(() => []),
           api.get("/doctor/receptionists", { bypassCache: shouldBypass }).catch(() => []),
@@ -648,11 +648,25 @@ export default function DoctorDashboard() {
         ) : (
           <View style={styles.sessionBarPlaceholder}>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
-              <ActivityIndicator size="small" color={colors.brandPrimary} />
+              {loading ? (
+                <ActivityIndicator size="small" color={colors.brandPrimary} />
+              ) : (
+                <Ionicons name="time-outline" size={24} color={colors.muted} />
+              )}
               <View style={{ flex: 1 }}>
                 <Text style={styles.placeholderTitle}>Consultation Session & Timing</Text>
-                <Text style={styles.placeholderSub}>Loading OPD session status and timings...</Text>
+                <Text style={styles.placeholderSub}>
+                  {loading ? "Loading OPD session status and timings..." : "Session not started. Consultation session is inactive."}
+                </Text>
               </View>
+              {!loading && (
+                <Pressable
+                  onPress={() => load(false, true)}
+                  style={{ padding: spacing.xs }}
+                >
+                  <Ionicons name="refresh" size={18} color={colors.brandPrimary} />
+                </Pressable>
+              )}
             </View>
           </View>
         )}

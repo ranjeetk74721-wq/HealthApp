@@ -130,6 +130,8 @@ _push_client = httpx.AsyncClient(
 app = FastAPI()
 app.add_middleware(GZipMiddleware, minimum_size=500)  # Enable gzip compression for responses larger than 500 bytes
 
+BACKEND_VERSION = os.environ.get("RENDER_GIT_COMMIT", os.environ.get("COMMIT_REF", "1.0.0"))[:8]
+
 # Explicit production origins and configurable origins from environment
 PROD_ORIGINS = [
     "https://www.meribaariapp.in",
@@ -178,6 +180,11 @@ async def general_rate_limit_middleware(request: Request, call_next):
     if path.startswith("/api/") and not path.startswith("/api/ws/") and not path == "/health":
         enforce_general_ip_rate_limit(request)
     response = await call_next(request)
+    if path.startswith("/api/") or path == "/health":
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Backend-Version"] = BACKEND_VERSION
     return response
 
 
@@ -234,8 +241,12 @@ async def ensure_db_indexes():
             # doctors
             db.doctors.create_index([("id", 1)], unique=True),
             db.doctors.create_index([("user_id", 1)]),
+            db.doctors.create_index([("hospital_id", 1)]),
             db.doctors.create_index([("specialty", 1)]),
             db.doctors.create_index([("city", 1)]),
+            # appointments indexes for high-frequency calendar & queue queries
+            db.appointments.create_index([("date", 1), ("status", 1)]),
+            db.appointments.create_index([("hospital_id", 1), ("date", 1)]),
             # doctor schedule configs
             db.doctor_schedule_configs.create_index([("id", 1)], unique=True),
             db.doctor_schedule_configs.create_index([("doctor_id", 1), ("date_type", 1)]),
@@ -276,14 +287,23 @@ async def root():
 async def health_check():
     try:
         await client.admin.command("ping")
-        return {"status": "ok", "database": "connected"}
+        return {"status": "ok", "database": "connected", "version": BACKEND_VERSION}
     except Exception:
-        return {"status": "degraded", "database": "unavailable"}
+        return {"status": "degraded", "database": "unavailable", "version": BACKEND_VERSION}
 
 
 @api_router.get("/health")
 async def api_health_check():
     return await health_check()
+
+
+@api_router.get("/version")
+async def get_version():
+    return {
+        "service": "meribaari-api",
+        "version": BACKEND_VERSION,
+        "database": "connected",
+    }
 
 Role = Literal["patient", "doctor", "receptionist", "owner", "admin"]
 
@@ -392,7 +412,7 @@ class Appointment(BaseModel):
 
 class AppointmentUpdateDetailsBody(BaseModel):
     patient_name: str
-    patient_mobile: str
+    patient_mobile: Optional[str] = None
     patient_address: Optional[str] = None
     payment_amount: Optional[float] = None
     payment_status: Optional[str] = None
@@ -586,7 +606,7 @@ class VerifyOTPBody(BaseModel):
 
 class AddPatientBody(BaseModel):
     full_name: str
-    mobile: str
+    mobile: Optional[str] = None
     age: Optional[int] = None
     gender: Optional[str] = None
     symptoms: Optional[str] = None
@@ -984,15 +1004,28 @@ async def check_appointment_access(user: dict, appt: dict) -> bool:
         return True
     if role == "receptionist":
         user_hosp = user.get("hospital_id")
+        user_id = user.get("id") or user.get("user_id")
+        user_doc_id = user.get("doctor_id")
+
+        if user_doc_id and appt.get("doctor_id") == user_doc_id:
+            return True
+
         if user_hosp:
-            if appt.get("hospital_id") == user_hosp:
+            user_hosp_norm = str(user_hosp).strip().lower()
+            appt_hosp_norm = str(appt.get("hospital_id") or "").strip().lower()
+            if appt_hosp_norm and appt_hosp_norm == user_hosp_norm:
                 return True
             doctor = await db.doctors.find_one({"id": appt.get("doctor_id")})
-            if doctor and doctor.get("hospital_id") == user_hosp:
-                return True
+            if doctor:
+                doc_hosp_norm = str(doctor.get("hospital_id") or "").strip().lower()
+                if doc_hosp_norm and doc_hosp_norm == user_hosp_norm:
+                    return True
+                if user_id and (
+                    doctor.get("receptionist_id") == user_id
+                    or user_id in (doctor.get("receptionist_ids") or [])
+                ):
+                    return True
             return False
-        if user.get("doctor_id") and appt.get("doctor_id") == user.get("doctor_id"):
-            return True
         return True
     return False
 
@@ -3741,10 +3774,11 @@ async def update_patient_details(
     if not name or len(name) < 2:
         raise HTTPException(status_code=400, detail="Patient name must be at least 2 characters long")
 
-    # Contact number validation
-    clean_mobile = normalize_mobile(body.patient_mobile)
-    if not clean_mobile or len(clean_mobile) < 10:
-        raise HTTPException(status_code=400, detail="Please enter a valid 10-digit contact number")
+    # Contact number validation (optional for walk-ins without mobile)
+    clean_mobile = normalize_mobile(body.patient_mobile) if body.patient_mobile and body.patient_mobile.strip() else None
+    if body.patient_mobile and body.patient_mobile.strip():
+        if not clean_mobile or len(clean_mobile) < 10:
+            raise HTTPException(status_code=400, detail="Please enter a valid 10-digit contact number")
 
     # Payment amount validation
     clean_amount = None
@@ -3960,15 +3994,18 @@ async def doctor_appointments(
 
 
 @api_router.get("/doctor/dashboard")
-async def doctor_dashboard(user: dict = Depends(require_role("doctor"))):
+async def doctor_dashboard(
+    date: Optional[str] = None,
+    user: dict = Depends(require_role("doctor"))
+):
     d = await db.doctors.find_one({"user_id": user["id"]}, {"_id": 0})
     if not d:
         raise HTTPException(status_code=404, detail="Doctor profile not found")
-    today = get_ist_now().strftime("%Y-%m-%d")
-    all_today = await db.appointments.find({"doctor_id": d["id"], "date": today}, {"_id": 0}).to_list(500)
+    target_date = date or get_ist_now().strftime("%Y-%m-%d")
+    all_today = await db.appointments.find({"doctor_id": d["id"], "date": target_date, "status": {"$ne": "cancelled"}}, {"_id": 0}).to_list(500)
     completed = [a for a in all_today if a["status"] == "completed"]
     pending = [a for a in all_today if a["status"] in ("booked", "arrived", "in_consultation")]
-    earnings = sum(d["fees"] for a in completed)
+    earnings = sum((d.get("fees") or 0) for a in completed)
     return {
         "doctor": d,
         "total_patients": len(all_today),
@@ -6035,11 +6072,39 @@ async def reception_queue(
             pass
 
     q: dict = {"date": target_date}
-    if user.get("hospital_id"):
-        docs = await db.doctors.find({"hospital_id": user["hospital_id"]}, {"id": 1}).to_list(None)
+    doc_query_conditions = []
+    hid = (user.get("hospital_id") or "").strip()
+    if hid:
+        doc_query_conditions.extend([
+            {"hospital_id": hid},
+            {"hospital_id": hid.upper()},
+            {"hospital_id": hid.lower()},
+            {"hospital_id": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}}
+        ])
+    rec_doc_id = user.get("doctor_id") or user.get("assigned_doctor_id")
+    if rec_doc_id:
+        doc_query_conditions.append({"id": rec_doc_id})
+    user_id = user.get("id")
+    if user_id:
+        doc_query_conditions.append({"receptionist_id": user_id})
+        doc_query_conditions.append({"receptionist_ids": user_id})
+
+    if doc_query_conditions:
+        docs = await db.doctors.find({"$or": doc_query_conditions}, {"id": 1, "hospital_id": 1, "receptionist_id": 1, "receptionist_ids": 1}).to_list(500)
         valid_doc_ids = [d["id"] for d in docs]
         if doctor_id:
-            if doctor_id not in valid_doc_ids:
+            if valid_doc_ids and doctor_id not in valid_doc_ids:
+                # Direct check on doctor document for security
+                doc_obj = await db.doctors.find_one({"id": doctor_id})
+                doc_hosp = ((doc_obj or {}).get("hospital_id") or "").strip().upper()
+                is_authorized = bool(doc_obj and (
+                    (hid and doc_hosp == hid.upper()) or
+                    (rec_doc_id and rec_doc_id == doctor_id) or
+                    (user_id and (doc_obj.get("receptionist_id") == user_id or user_id in (doc_obj.get("receptionist_ids") or [])))
+                ))
+                if not is_authorized:
+                    return []
+            elif not valid_doc_ids:
                 return []
             q["doctor_id"] = doctor_id
         else:
@@ -6121,15 +6186,24 @@ async def reception_queue(
 
 @api_router.get("/reception/doctors")
 async def reception_doctors(user: dict = Depends(require_role("receptionist", "doctor"))):
-    q = {}
+    or_conditions = []
     hid = (user.get("hospital_id") or "").strip()
     if hid:
-        q["$or"] = [
+        or_conditions.extend([
             {"hospital_id": hid},
             {"hospital_id": hid.upper()},
             {"hospital_id": hid.lower()},
             {"hospital_id": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}}
-        ]
+        ])
+    rec_doc_id = user.get("doctor_id") or user.get("assigned_doctor_id")
+    if rec_doc_id:
+        or_conditions.append({"id": rec_doc_id})
+    user_id = user.get("id")
+    if user_id:
+        or_conditions.append({"receptionist_id": user_id})
+        or_conditions.append({"receptionist_ids": user_id})
+
+    q = {"$or": or_conditions} if or_conditions else {}
     docs = await db.doctors.find(q, {"_id": 0}).to_list(200)
     return docs
 
@@ -6401,15 +6475,20 @@ async def emergency_insert(body: dict, user: dict = Depends(require_role("recept
 
 @api_router.post("/reception/add-patient")
 async def reception_add_patient(body: AddPatientBody, user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner"))):
-    """Receptionist adds a patient (with all details) and optionally books an appointment."""
-    mobile = normalize_mobile(body.mobile)
-    if not mobile or len(mobile) < 10:
-        raise HTTPException(status_code=400, detail="Enter a valid mobile number")
+    """Receptionist adds a patient (with all details) and optionally books an appointment.
+    Mobile number is optional for receptionist walk-in registrations.
+    """
+    mobile = normalize_mobile(body.mobile) if body.mobile and body.mobile.strip() else None
+    if body.mobile and body.mobile.strip():
+        if not mobile or len(mobile) < 10:
+            raise HTTPException(status_code=400, detail="Enter a valid 10-digit mobile number")
     if not body.full_name or not body.full_name.strip():
         raise HTTPException(status_code=400, detail="Full name is required")
 
-    # Find or create patient user
-    existing = await db.users.find_one({"mobile": mobile})
+    # Find or create patient user (only query by mobile if mobile is provided)
+    existing = None
+    if mobile:
+        existing = await db.users.find_one({"mobile": mobile})
     if existing:
         # Update details if missing
         updates = {}
@@ -6458,9 +6537,14 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
         # Resolve the clinic session (creates default if none exists)
         resolved_session_id = await resolve_clinic_session_id(body.doctor_id, appt_date, session_id_requested, hosp_id)
 
-        # Check for existing appointment in same session (multi-session: patient may book other sessions)
+        # Check for existing appointment in same session (do not check patient_mobile if mobile is None)
+        if mobile:
+            or_clauses = [{"patient_id": patient_id}, {"patient_mobile": mobile}]
+        else:
+            or_clauses = [{"patient_id": patient_id}]
+
         dup_filter: dict = {
-            "$or": [{"patient_id": patient_id}, {"patient_mobile": mobile}],
+            "$or": or_clauses,
             "date": appt_date,
             "status": {"$in": ["booked", "arrived", "in_consultation", "completed", "skipped"]},
         }
@@ -6522,8 +6606,8 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
             "payment_amount": doctor.get("fees") if doctor else None,
             "prescription": None,
             "symptoms": body.symptoms,
-            "sms_status": "pending",
-            "sms_last_sent_at": now_iso(),
+            "sms_status": "pending" if mobile else "skipped",
+            "sms_last_sent_at": now_iso() if mobile else None,
             "created_at": now_iso(),
         }
         try:
@@ -6534,33 +6618,38 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
                 detail="This patient already has an active appointment for today."
             )
 
-        # Trigger AiSensy WhatsApp appointment utility message
+        # Trigger AiSensy WhatsApp appointment utility message only if mobile exists
         eta_data = await calculate_appointment_eta(appt, doctor=doctor)
-        dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
         expected_time_val = eta_data.get("expected_turn_time") or "As per live queue"
-        hour_val = expected_time_val if (" – " in expected_time_val or " - " in expected_time_val) else format_renflair_hour(expected_time_val, default="2")
         appt["expected_turn_time"] = expected_time_val
         appt["expected_time"] = expected_time_val
         appt["eta_minutes"] = eta_data.get("eta_minutes", 0)
-        hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
-        # Immediate non-blocking response state
-        appt["sms_status"] = "PENDING"
-        appt["sms_provider"] = get_sms_provider()
 
-        asyncio.create_task(
-            dispatch_appointment_sms_background(
-                appt_id=appt_id,
-                patient_mobile=mobile,
-                token_number=appt["token_number"],
-                hour_val=hour_val,
-                hospital_name=hospital_name,
-                patient_name=patient_name,
-                doctor_name=doctor.get("full_name", "Doctor"),
-                expected_time_val=expected_time_val,
-                dynamic_link=dynamic_link,
-                appt_date=appt_date,
+        if mobile:
+            dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
+            hour_val = expected_time_val if (" – " in expected_time_val or " - " in expected_time_val) else format_renflair_hour(expected_time_val, default="2")
+            hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
+            # Immediate non-blocking response state
+            appt["sms_status"] = "PENDING"
+            appt["sms_provider"] = get_sms_provider()
+
+            asyncio.create_task(
+                dispatch_appointment_sms_background(
+                    appt_id=appt_id,
+                    patient_mobile=mobile,
+                    token_number=appt["token_number"],
+                    hour_val=hour_val,
+                    hospital_name=hospital_name,
+                    patient_name=patient_name,
+                    doctor_name=doctor.get("full_name", "Doctor"),
+                    expected_time_val=expected_time_val,
+                    dynamic_link=dynamic_link,
+                    appt_date=appt_date,
+                )
             )
-        )
+        else:
+            appt["sms_status"] = "NOT_APPLICABLE"
+            appt["sms_provider"] = None
 
         appt.pop("_id", None)
         await broadcast_doctor_update(body.doctor_id, "patient_added")

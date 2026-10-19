@@ -129,8 +129,8 @@ export default function PatientDetailsModal({
       return;
     }
 
-    const cleanMobile = mobile.replace(/[^0-9]/g, "");
-    if (!cleanMobile || cleanMobile.length < 10) {
+    const cleanMobile = mobile.trim() ? mobile.replace(/[^0-9]/g, "") : null;
+    if (mobile.trim() && (!cleanMobile || cleanMobile.length < 10)) {
       setErrorMsg("Please enter a valid 10-digit contact number.");
       return;
     }
@@ -428,13 +428,13 @@ export default function PatientDetailsModal({
                 </View>
 
                 <View style={styles.formGroup}>
-                  <Text style={styles.formLabel}>Contact Number *</Text>
+                  <Text style={styles.formLabel}>Contact Number (Optional)</Text>
                   <TextInput
                     testID="input-patient-mobile"
                     value={mobile}
                     onChangeText={(val) => setMobile(val.replace(/[^0-9]/g, "").slice(0, 10))}
                     keyboardType="phone-pad"
-                    placeholder="10-digit mobile number"
+                    placeholder="10-digit mobile number (or leave blank)"
                     placeholderTextColor={colors.muted}
                     style={styles.textInput}
                   />
