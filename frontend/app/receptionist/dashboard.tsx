@@ -136,6 +136,7 @@ export default function ReceptionistDashboard() {
   const [configuredSessions, setConfiguredSessions] = useState<any[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [selectedWindowId, setSelectedWindowId] = useState<string | null>(null);
+  const [consultationMode, setConsultationMode] = useState<"walkin" | "regular" | "no_mobile">("walkin");
   const [pName, setPName] = useState("");
   const [pMobile, setPMobile] = useState("");
   const [pAge, setPAge] = useState("");
@@ -887,6 +888,7 @@ export default function ReceptionistDashboard() {
     setPName(""); setPMobile(""); setPAge(""); setPGender(null);
     setPSymptoms(""); setPAddress(""); setPSlot(""); setAddError(null);
     setSelectedSessionId(null); setSelectedWindowId(null);
+    setConsultationMode("walkin");
   };
 
   const onOpenAddPatient = () => {
@@ -904,9 +906,19 @@ export default function ReceptionistDashboard() {
     if (addPatientSubmittingRef.current) return;
     setAddError(null);
     setAddIsTimeout(false);
-    if (!pName.trim()) return setAddError("Name is required");
+
+    // Patient Full Name is required
+    if (!pName.trim()) return setAddError("Patient full name is required");
+
     const cleanMobile = pMobile.replace(/[^0-9]/g, "");
-    if (pMobile.trim() && cleanMobile.length < 10) return setAddError("Enter valid 10-digit mobile");
+
+    // Mobile Validation:
+    // If mobile is entered (non-empty), it must be a valid 10-digit number.
+    // If left empty, no error is triggered.
+    if (pMobile.trim() && cleanMobile.length !== 10) {
+      return setAddError("Enter valid 10-digit mobile");
+    }
+
     const effectiveDocId = selectedDocRef.current || selectedDoc;
     if (!effectiveDocId) return setAddError("Select a doctor first");
 
@@ -914,26 +926,28 @@ export default function ReceptionistDashboard() {
     setAddLoading(true);
     setAddVerifying(false);
     try {
+      const isNoMobile = consultationMode === "no_mobile";
       const selectedSession = configuredSessions.find((s) => s.id === selectedSessionId);
       const selectedWindow = selectedSession?.booking_windows?.find((w: any) => w.id === selectedWindowId);
-      const effectiveSlot =
-        pSlot ||
-        (selectedWindow ? `${selectedWindow.start_time} - ${selectedWindow.end_time}` : (selectedSession ? selectedSession.session_name : "Walk-in"));
+      const effectiveSlot = isNoMobile
+        ? (pSlot || "Consultation Without Mobile")
+        : (pSlot || (selectedWindow ? `${selectedWindow.start_time} - ${selectedWindow.end_time}` : (selectedSession ? selectedSession.session_name : (consultationMode === "regular" ? "Regular Consultation" : "Walk-in"))));
 
       const res = await api.post(
         "/reception/add-patient",
         {
           full_name: pName.trim(),
-          mobile: cleanMobile || undefined,
+          mobile: cleanMobile.length === 10 ? cleanMobile : undefined,
           age: pAge ? parseInt(pAge, 10) : undefined,
           gender: pGender,
-          symptoms: pSymptoms || undefined,
-          address: pAddress || undefined,
+          symptoms: pSymptoms ? pSymptoms.trim() : undefined,
+          address: pAddress ? pAddress.trim() : undefined,
           doctor_id: effectiveDocId,
-          session_id: selectedSessionId || undefined,
+          session_id: isNoMobile ? (configuredSessions[0]?.id || selectedSessionId || undefined) : (selectedSessionId || undefined),
           booking_window_id: selectedWindowId || undefined,
           slot_time: (selectedWindow ? `${selectedWindow.start_time} - ${selectedWindow.end_time}` : pSlot) || undefined,
           slot: effectiveSlot,
+          consultation_mode: isNoMobile ? "no_mobile" : (consultationMode === "regular" ? "regular" : "walk_in"),
           date: selectedDate,
         },
         { timeoutMs: 12000 }
@@ -1456,7 +1470,11 @@ export default function ReceptionistDashboard() {
                         </Text>
                         {a.patient_mobile ? (
                           <Text style={styles.patientContactMeta}>📞 {a.patient_mobile}</Text>
-                        ) : null}
+                        ) : (
+                          <Text style={[styles.patientContactMeta, { color: colors.muted, fontStyle: "italic" }]}>
+                            📞 Walk-in (No Mobile)
+                          </Text>
+                        )}
                         {a.expected_turn_time && !isCompleted ? (
                           <View style={styles.etaRow}>
                             <Ionicons
@@ -1872,45 +1890,97 @@ export default function ReceptionistDashboard() {
               {/* 1. Doctor Sessions Selection */}
               <Text style={styles.label}>1. Doctor Session (सत्र चुनें)</Text>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 4 }}>
+                {/* 1. General Walk-in */}
                 <Pressable
+                  testID="session-chip-walkin"
                   onPress={() => {
+                    setConsultationMode("walkin");
                     setSelectedSessionId(null);
                     setSelectedWindowId(null);
+                    setPSlot("Walk-in");
                   }}
                   style={[
                     styles.recSessionChip,
-                    selectedSessionId === null && styles.recSessionChipActive,
+                    consultationMode === "walkin" && selectedSessionId === null && styles.recSessionChipActive,
                   ]}
                 >
-                  <Text style={[styles.recSessionText, selectedSessionId === null && { color: "#fff" }]}>
+                  <Text style={[styles.recSessionText, consultationMode === "walkin" && selectedSessionId === null && { color: "#fff" }]}>
                     General Walk-in
                   </Text>
                 </Pressable>
-                {configuredSessions.map((sess) => {
-                  const isSessActive = selectedSessionId === sess.id;
-                  return (
-                    <Pressable
-                      key={sess.id}
-                      onPress={() => {
-                        setSelectedSessionId(sess.id);
-                        setSelectedWindowId(null);
-                        setPSlot(`${sess.start_time} - ${sess.end_time}`);
-                      }}
-                      style={[
-                        styles.recSessionChip,
-                        isSessActive && styles.recSessionChipActive,
-                      ]}
-                    >
-                      <Text style={[styles.recSessionText, isSessActive && { color: "#fff" }]}>
-                        {sess.session_name} ({sess.start_time} - {sess.end_time})
-                      </Text>
-                    </Pressable>
-                  );
-                })}
+
+                {/* 2. Regular Consultation (or configured sessions) */}
+                {configuredSessions.length > 0 ? (
+                  configuredSessions.map((sess) => {
+                    const isSessActive = consultationMode === "regular" && selectedSessionId === sess.id;
+                    return (
+                      <Pressable
+                        key={sess.id}
+                        testID={`session-chip-${sess.id}`}
+                        onPress={() => {
+                          setConsultationMode("regular");
+                          setSelectedSessionId(sess.id);
+                          setSelectedWindowId(null);
+                          setPSlot(`${sess.start_time} - ${sess.end_time}`);
+                        }}
+                        style={[
+                          styles.recSessionChip,
+                          isSessActive && styles.recSessionChipActive,
+                        ]}
+                      >
+                        <Text style={[styles.recSessionText, isSessActive && { color: "#fff" }]}>
+                          {sess.session_name || "Regular Consultation"} {sess.start_time ? `(${sess.start_time} - ${sess.end_time})` : ""}
+                        </Text>
+                      </Pressable>
+                    );
+                  })
+                ) : (
+                  <Pressable
+                    testID="session-chip-regular"
+                    onPress={() => {
+                      setConsultationMode("regular");
+                      setSelectedSessionId(null);
+                      setSelectedWindowId(null);
+                      setPSlot("Regular Consultation");
+                    }}
+                    style={[
+                      styles.recSessionChip,
+                      consultationMode === "regular" && styles.recSessionChipActive,
+                    ]}
+                  >
+                    <Text style={[styles.recSessionText, consultationMode === "regular" && { color: "#fff" }]}>
+                      Regular Consultation
+                    </Text>
+                  </Pressable>
+                )}
+
+                {/* 3. Consultation Without Mobile (बिना मोबाइल परामर्श) */}
+                <Pressable
+                  testID="session-chip-no-mobile"
+                  onPress={() => {
+                    setConsultationMode("no_mobile");
+                    if (configuredSessions.length > 0) {
+                      setSelectedSessionId(configuredSessions[0].id);
+                    } else {
+                      setSelectedSessionId(null);
+                    }
+                    setSelectedWindowId(null);
+                    setPSlot("Consultation Without Mobile");
+                  }}
+                  style={[
+                    styles.recSessionChip,
+                    consultationMode === "no_mobile" && styles.recSessionChipActive,
+                    consultationMode === "no_mobile" && { backgroundColor: colors.brandPrimary },
+                  ]}
+                >
+                  <Text style={[styles.recSessionText, consultationMode === "no_mobile" && { color: "#fff", fontWeight: "700" }]}>
+                    Consultation Without Mobile (बिना मोबाइल परामर्श)
+                  </Text>
+                </Pressable>
               </ScrollView>
 
               {/* 2. Booking Windows / Slots */}
-              {selectedSessionId && (
+              {selectedSessionId && consultationMode !== "no_mobile" && (
                 (() => {
                   const chosen = configuredSessions.find((s) => s.id === selectedSessionId);
                   const wins = chosen?.booking_windows || [];
@@ -1953,10 +2023,23 @@ export default function ReceptionistDashboard() {
               {/* 3. Patient Details */}
               <Text style={styles.label}>3. Patient Full Name*</Text>
               <TextInput testID="ap-name" editable={!addLoading} placeholder="Patient name" placeholderTextColor={colors.muted} value={pName} onChangeText={setPName} style={styles.input} />
-              <Text style={styles.label}>Mobile Number (Optional - ऐच्छिक)</Text>
+              <Text style={[styles.label, consultationMode === "no_mobile" && { color: colors.brandPrimary, fontWeight: "700" }]}>
+                {consultationMode === "no_mobile"
+                  ? "Mobile Number (Optional - ऐच्छिक - बिना मोबाइल परामर्श)"
+                  : "Mobile Number (Optional - ऐच्छिक)"}
+              </Text>
               <View style={styles.mobileWrap}>
                 <View style={styles.ccBadge}><Text style={styles.ccText}>+91</Text></View>
-                <TextInput testID="ap-mobile" editable={!addLoading} placeholder="98765 43210 (or leave blank)" placeholderTextColor={colors.muted} value={pMobile} onChangeText={(t) => setPMobile(t.replace(/[^0-9]/g, "").slice(0, 10))} keyboardType="phone-pad" style={styles.mobileInput} />
+                <TextInput
+                  testID="ap-mobile"
+                  editable={!addLoading}
+                  placeholder={consultationMode === "no_mobile" ? "No mobile required (leave blank)" : "98765 43210 (or leave blank)"}
+                  placeholderTextColor={colors.muted}
+                  value={pMobile}
+                  onChangeText={(t) => setPMobile(t.replace(/[^0-9]/g, "").slice(0, 10))}
+                  keyboardType="phone-pad"
+                  style={styles.mobileInput}
+                />
               </View>
               <View style={{ flexDirection: "row", gap: spacing.sm }}>
                 <View style={{ flex: 1 }}>

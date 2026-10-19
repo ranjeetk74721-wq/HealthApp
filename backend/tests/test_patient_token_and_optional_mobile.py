@@ -426,3 +426,97 @@ async def test_hospital_and_doctor_isolation(test_env):
     other_queue = await reception_queue(date="2026-10-19", doctor_id="doc_101", user=rec_user_hosp_b)
     assert isinstance(other_queue, list)
     assert len(other_queue) == 0
+
+
+# =====================================================================
+# 5. Dedicated "Consultation Without Mobile (बिना मोबाइल परामर्श)" Tests
+# =====================================================================
+
+@pytest.mark.asyncio
+async def test_consultation_without_mobile_mode_end_to_end(test_env):
+    rec_user = test_env["receptionist"]
+    doc_user = {
+        "id": "user_doc_101",
+        "role": "doctor",
+    }
+
+    # 1. Register first patient without mobile
+    res1 = await reception_add_patient(
+        AddPatientBody(
+            full_name="Ramesh Kumar",
+            mobile=None,
+            doctor_id="doc_101",
+            date="2026-10-19",
+            symptoms="Headache and fever",
+            consultation_mode="no_mobile",
+            slot="Consultation Without Mobile",
+        ),
+        rec_user,
+    )
+    assert res1["ok"] is True
+    appt1 = res1["appointment"]
+    assert appt1["token_number"] == 1
+    assert appt1["patient_name"] == "Ramesh Kumar"
+    assert appt1["patient_mobile"] is None
+    assert appt1["consultation_mode"] == "no_mobile"
+    assert appt1["sms_status"] == "NOT_APPLICABLE"
+    assert appt1["status"] == "arrived"
+
+    # 2. Register second patient without mobile on same date and same doctor
+    res2 = await reception_add_patient(
+        AddPatientBody(
+            full_name="Sita Devi",
+            mobile="",
+            doctor_id="doc_101",
+            date="2026-10-19",
+            consultation_mode="no_mobile",
+            slot="Consultation Without Mobile",
+        ),
+        rec_user,
+    )
+    assert res2["ok"] is True
+    appt2 = res2["appointment"]
+    # Distinct consecutive token
+    assert appt2["token_number"] == 2
+    assert appt2["patient_name"] == "Sita Devi"
+    assert appt2["patient_mobile"] is None
+    assert appt2["consultation_mode"] == "no_mobile"
+    assert appt2["sms_status"] == "NOT_APPLICABLE"
+
+    # 3. Invalid non-empty mobile (e.g. 5 digits) triggers validation error
+    with pytest.raises(HTTPException) as exc_info:
+        await reception_add_patient(
+            AddPatientBody(
+                full_name="Invalid Mobile Patient",
+                mobile="12345",
+                doctor_id="doc_101",
+                date="2026-10-19",
+                consultation_mode="no_mobile",
+            ),
+            rec_user,
+        )
+    assert exc_info.value.status_code == 400
+    assert "Enter a valid 10-digit mobile number" in exc_info.value.detail
+
+    # 4. Verify receptionist queue returns both mobile-less patients in real queue
+    q = await reception_queue(date="2026-10-19", doctor_id="doc_101", user=rec_user)
+    assert len(q) == 2
+    assert q[0]["token_number"] == 1
+    assert q[0]["patient_name"] == "Ramesh Kumar"
+    assert q[0]["patient_mobile"] is None
+    assert q[1]["token_number"] == 2
+    assert q[1]["patient_name"] == "Sita Devi"
+    assert q[1]["patient_mobile"] is None
+
+    # 5. Verify doctor panel returns both mobile-less patients
+    doc_appts = await doctor_appointments(date="2026-10-19", user=doc_user)
+    assert len(doc_appts) == 2
+    assert doc_appts[0]["token_number"] == 1
+    assert doc_appts[0]["patient_name"] == "Ramesh Kumar"
+    assert doc_appts[1]["token_number"] == 2
+    assert doc_appts[1]["patient_name"] == "Sita Devi"
+
+    # 6. Verify doctor session status was NOT automatically started
+    session = await get_or_create_doctor_session("doc_101", "2026-10-19")
+    assert session["status"] == "not_started"
+

@@ -622,6 +622,7 @@ class AddPatientBody(BaseModel):
     patient_area: Optional[str] = None
     patient_latitude: Optional[float] = None
     patient_longitude: Optional[float] = None
+    consultation_mode: Optional[str] = None  # "no_mobile", "walk_in", "regular"
 
 
 # ── Multi-Session Models ──────────────────────────────────────────────────────
@@ -6606,6 +6607,7 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
             "payment_amount": doctor.get("fees") if doctor else None,
             "prescription": None,
             "symptoms": body.symptoms,
+            "consultation_mode": getattr(body, "consultation_mode", None) or ("no_mobile" if not mobile else "walk_in"),
             "sms_status": "pending" if mobile else "skipped",
             "sms_last_sent_at": now_iso() if mobile else None,
             "created_at": now_iso(),
