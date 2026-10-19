@@ -273,9 +273,57 @@ export default function RootLayout() {
     window.addEventListener("error", handleWindowError);
     window.addEventListener("unhandledrejection", handleUnhandledRejection);
 
+    // ── Active Background Deployment Auto-Synchronizer ────────────────────────
+    // Automatically detects when a new frontend build is deployed while a user has an existing tab open
+    let checkTimer: any = null;
+    const currentBuildId = (window as any).__MERIBAARI_BUILD_ID__;
+
+    const checkForUpdates = async () => {
+      try {
+        const res = await fetch(`/version.json?_t=${Date.now()}`, {
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache", "Pragma": "no-cache" },
+        });
+        if (!res.ok) return;
+        const info = await res.json();
+        const serverBuildId = info?.buildId;
+        if (serverBuildId && currentBuildId && serverBuildId !== currentBuildId) {
+          const lastReload = safeSessionStorageGet("mb_version_reload_ts");
+          const now = Date.now();
+          if (!lastReload || now - parseInt(lastReload, 10) > 30000) {
+            safeSessionStorageSet("mb_version_reload_ts", now.toString());
+            if ("caches" in window) {
+              try {
+                const keys = await caches.keys();
+                await Promise.all(keys.map((k) => caches.delete(k)));
+              } catch {}
+            }
+            window.location.reload();
+          }
+        }
+      } catch {
+        // Network unavailable or offline, ignore
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        checkForUpdates();
+      }
+    };
+
+    window.addEventListener("focus", checkForUpdates);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    checkTimer = setInterval(checkForUpdates, 60000);
+    const initialTimer = setTimeout(checkForUpdates, 5000);
+
     return () => {
       window.removeEventListener("error", handleWindowError);
       window.removeEventListener("unhandledrejection", handleUnhandledRejection);
+      if (checkTimer) clearInterval(checkTimer);
+      clearTimeout(initialTimer);
+      window.removeEventListener("focus", checkForUpdates);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, []);
 
