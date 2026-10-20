@@ -2262,6 +2262,17 @@ async def notify_appointment_booked(appt: dict, doctor: dict, eta_data: dict) ->
         logger.warning(f"notify_appointment_booked error: {e}")
 
 
+_background_tasks = set()
+
+
+def launch_background_task(coro):
+    """Launch and retain strong reference to background task preventing GC collection."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 async def dispatch_appointment_sms_background(
     appt_id: str,
     patient_mobile: str,
@@ -2318,6 +2329,8 @@ async def dispatch_appointment_sms_background(
             sms_updates["sms_provider_message_id"] = sms_res["message_id"]
         if sms_res.get("error_code") or sms_res.get("code"):
             sms_updates["sms_error_code"] = sms_res.get("error_code") or sms_res.get("code")
+        if sms_res.get("error"):
+            sms_updates["sms_error"] = str(sms_res.get("error"))
         if sms_res.get("sms_text"):
             sms_updates["sms_text"] = sms_res["sms_text"]
         await db.appointments.update_one({"id": appt_id}, {"$set": sms_updates})
@@ -6594,6 +6607,10 @@ async def reception_cancel_appointment(body: QueueActionBody, user: dict = Depen
     return {"ok": True, "message": "Appointment cancelled successfully"}
 
 
+@app.post("/api/reception/correct_status")
+@app.post("/reception/correct_status")
+@app.post("/api/appointments/{appt_id}/correct-status")
+@app.post("/appointments/{appt_id}/correct-status")
 @api_router.post("/reception/correct_status")
 @api_router.post("/api/reception/correct_status")
 @api_router.post("/appointments/{appt_id}/correct-status")
@@ -6988,15 +7005,26 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
         appt["expected_time"] = expected_time_val
         appt["eta_minutes"] = eta_data.get("eta_minutes", 0)
 
+        # Persist ETA calculations directly to database so appointment lists reflect them immediately
+        await db.appointments.update_one(
+            {"id": appt_id},
+            {"$set": {
+                "expected_turn_time": expected_time_val,
+                "expected_time": expected_time_val,
+                "eta_minutes": appt["eta_minutes"],
+            }}
+        )
+
         if mobile:
             dynamic_link = f"{get_app_public_url()}/appointment/{secure_token}"
             hour_val = expected_time_val if (" – " in expected_time_val or " - " in expected_time_val) else format_renflair_hour(expected_time_val, default="2")
             hospital_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
+            doctor_display_name = doctor.get("full_name") or doctor.get("name") or "Doctor"
             # Immediate non-blocking response state
             appt["sms_status"] = "PENDING"
             appt["sms_provider"] = get_sms_provider()
 
-            asyncio.create_task(
+            launch_background_task(
                 dispatch_appointment_sms_background(
                     appt_id=appt_id,
                     patient_mobile=mobile,
@@ -7004,7 +7032,7 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
                     hour_val=hour_val,
                     hospital_name=hospital_name,
                     patient_name=patient_name,
-                    doctor_name=doctor.get("full_name", "Doctor"),
+                    doctor_name=doctor_display_name,
                     expected_time_val=expected_time_val,
                     dynamic_link=dynamic_link,
                     appt_date=appt_date,
@@ -7031,7 +7059,10 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
     }
 
 
+@app.post("/api/reception/appointments/{appt_id}/send-link")
+@app.post("/reception/appointments/{appt_id}/send-link")
 @api_router.post("/reception/appointments/{appt_id}/send-link")
+@api_router.post("/api/reception/appointments/{appt_id}/send-link")
 async def reception_send_appointment_link(
     appt_id: str,
     user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner")),
@@ -7091,6 +7122,8 @@ async def reception_send_appointment_link(
         sms_updates["sms_provider_message_id"] = sms_res["message_id"]
     if sms_res.get("error_code") or sms_res.get("code"):
         sms_updates["sms_error_code"] = sms_res.get("error_code") or sms_res.get("code")
+    if sms_res.get("error"):
+        sms_updates["sms_error"] = str(sms_res.get("error"))
     if sms_res.get("sms_text"):
         sms_updates["sms_text"] = sms_res["sms_text"]
     await db.appointments.update_one(

@@ -66,7 +66,7 @@ def get_aisensy_otp_campaign_name() -> str:
         or os.environ.get("AISENSY_CAMPAIGN_NAME")
         or "Meribaari_otp_api"
     ).strip().strip("'\"")
-    if not raw_name:
+    if not raw_name or raw_name.lower() in ("placeholder", "meribari", "meribaari_appointment"):
         return "Meribaari_otp_api"
     return raw_name
 
@@ -74,12 +74,7 @@ def get_aisensy_otp_campaign_name() -> str:
 def get_aisensy_appt_campaign_name() -> str:
     """
     Retrieve live API campaign / template name for Appointment Confirmation / Utility messages.
-    Fallback priority:
-    1. AISENSY_APPT_CAMPAIGN_NAME
-    2. AISENSY_UTILITY_CAMPAIGN_NAME
-    3. Key_name / KEY_NAME
-    4. AISENSY_CAMPAIGN_NAME
-    5. Default "Meribaari_appointment_api"
+    Ensures safe fallback to the verified production template 'Meribaari_appointment_api'.
     """
     raw_name = (
         os.environ.get("AISENSY_APPT_CAMPAIGN_NAME")
@@ -89,7 +84,14 @@ def get_aisensy_appt_campaign_name() -> str:
         or os.environ.get("AISENSY_CAMPAIGN_NAME")
         or "Meribaari_appointment_api"
     ).strip().strip("'\"")
-    if not raw_name:
+    # Sanitize: never use placeholder or OTP campaign name for appointment confirmations
+    if not raw_name or raw_name.lower() in (
+        "placeholder",
+        "meribari",
+        "meribaari_appointment",
+        "meribaari_otp",
+        "meribaari_otp_api",
+    ):
         return "Meribaari_appointment_api"
     return raw_name
 
@@ -549,12 +551,17 @@ async def send_aisensy_appointment(
             "error_code": "MISSING_TOKEN_NUMBER",
         }
 
-    clean_hosp = (hospital_name or kwargs.get("clinic_name") or "MeriBaari Clinic").strip()
-    clean_doc = (doctor_name or "Doctor").strip()
+    clean_hosp = re.sub(r"[\r\n\t]+", " ", str(hospital_name or kwargs.get("clinic_name") or "MeriBaari Clinic")).strip()
+    clean_doc = re.sub(r"[\r\n\t]+", " ", str(doctor_name or "Doctor")).strip()
     raw_time = expected_time or kwargs.get("estimated_time") or "As per live queue"
     clean_time = format_expected_time_range(raw_time) if raw_time else "As per live queue"
     if not clean_time:
         clean_time = "As per live queue"
+    # Normalize Unicode dashes and collapse whitespace for WhatsApp template stability
+    clean_time = clean_time.replace("\u2013", "-").replace("\u2014", "-")
+    clean_time = re.sub(r"[\r\n\t]+", " ", clean_time).strip()
+    if len(clean_time) > 45:
+        clean_time = clean_time[:42] + "..."
 
     template_params = [
         str(clean_hosp),

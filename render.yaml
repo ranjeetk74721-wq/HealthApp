@@ -24,4 +24,14 @@ services:
         value: https://www.meribaariapp.in
       - key: QUEUE_ETA_CHANGE_THRESHOLD_MINUTES
         value: "10"
+      - key: SMS_PROVIDER
+        value: "aisensy"
+      - key: AISENSY_BASE_URL
+        value: "https://backend.aisensy.com/campaign/t1/api/v2"
+      - key: AISENSY_OTP_CAMPAIGN_NAME
+        value: "Meribaari_otp_api"
+      - key: AISENSY_APPT_CAMPAIGN_NAME
+        value: "Meribaari_appointment_api"
+      - key: AISENSY_API_KEY
+        sync: false
     healthCheckPath: /health
