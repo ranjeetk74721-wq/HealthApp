@@ -721,6 +721,9 @@ class OwnerUpdateReceptionistBody(BaseModel):
 
 class DoctorSelfUpdateBody(BaseModel):
     """Doctor updates own profile."""
+    full_name: Optional[str] = None
+    name: Optional[str] = None
+    email: Optional[str] = None
     fees: Optional[int] = None
     timings: Optional[str] = None
     bio: Optional[str] = None
@@ -728,8 +731,34 @@ class DoctorSelfUpdateBody(BaseModel):
     phone: Optional[str] = None
     mobile: Optional[str] = None
     photo: Optional[str] = None
+    specialization: Optional[str] = None
+    department: Optional[str] = None
+    clinic_name: Optional[str] = None
+    hospital_name: Optional[str] = None
+    current_password: Optional[str] = None
     password: Optional[str] = None
+    new_password: Optional[str] = None
     avg_consult_minutes: Optional[int] = None
+
+
+class DoctorUpdateReceptionistBody(BaseModel):
+    """Doctor updates receptionist profile."""
+    full_name: Optional[str] = None
+    name: Optional[str] = None
+    email: Optional[str] = None
+    mobile: Optional[str] = None
+    phone: Optional[str] = None
+    status: Optional[str] = None  # "active" or "inactive"
+    login_disabled: Optional[bool] = None
+    password: Optional[str] = None
+
+
+class CorrectStatusBody(BaseModel):
+    """Doctor or Receptionist corrects patient appointment status."""
+    appointment_id: Optional[str] = None
+    new_status: str
+    reason: Optional[str] = None
+
 
 
 class AddSpecialtyBody(BaseModel):
@@ -6530,6 +6559,159 @@ async def reception_cancel_appointment(body: QueueActionBody, user: dict = Depen
     return {"ok": True, "message": "Appointment cancelled successfully"}
 
 
+@api_router.post("/reception/correct_status")
+@api_router.post("/api/reception/correct_status")
+@api_router.post("/appointments/{appt_id}/correct-status")
+@api_router.post("/api/appointments/{appt_id}/correct-status")
+async def correct_appointment_status(
+    body: CorrectStatusBody,
+    appt_id: Optional[str] = None,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner"))
+):
+    target_id = appt_id or body.appointment_id
+    if not target_id:
+        raise HTTPException(status_code=400, detail="appointment_id is required")
+    
+    appt = await db.appointments.find_one({"id": target_id})
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    
+    # ── Strict Hospital & Doctor Authorization Check ──
+    user_role = user.get("role")
+    user_hid = (user.get("hospital_id") or "").strip().upper()
+    user_id = user.get("id")
+    
+    doctor = await db.doctors.find_one({"id": appt["doctor_id"]})
+    doc_hid = ((doctor or {}).get("hospital_id") or "").strip().upper()
+    
+    if user_role == "doctor":
+        is_owner = (user_id == (doctor or {}).get("user_id") or user_id == appt["doctor_id"])
+        same_hosp = bool(user_hid and doc_hid and user_hid == doc_hid)
+        if not is_owner and not same_hosp:
+            raise HTTPException(status_code=403, detail="Forbidden: You are not authorized to modify patients of another doctor/hospital")
+    elif user_role == "receptionist":
+        assigned = (user.get("doctor_id") == appt["doctor_id"] or user.get("assigned_doctor_id") == appt["doctor_id"])
+        same_hosp = bool(user_hid and doc_hid and user_hid == doc_hid)
+        if not assigned and not same_hosp:
+            raise HTTPException(status_code=403, detail="Forbidden: You are not authorized to modify patients of another hospital")
+    
+    # Map input status string to canonical internal status
+    raw_status = (body.new_status or "").strip().lower().replace(" ", "_")
+    STATUS_MAP = {
+        "waiting": "arrived",
+        "arrived": "arrived",
+        "booked": "booked",
+        "called": "called",
+        "ready": "called",
+        "ready_for_consultation": "called",
+        "in_consultation": "in_consultation",
+        "completed": "completed",
+        "skipped": "skipped",
+        "cancelled": "cancelled",
+    }
+    new_canonical = STATUS_MAP.get(raw_status)
+    if not new_canonical:
+        raise HTTPException(status_code=400, detail=f"Invalid status '{body.new_status}'. Allowed: Waiting, Called, In Consultation, Completed, Skipped, Cancelled")
+    
+    old_status = appt.get("status")
+    if old_status == new_canonical:
+        return {"ok": True, "message": f"Appointment is already in '{new_canonical}' status", "appointment": appt}
+    
+    now = now_iso()
+    time_12 = format_ist_12hr()
+    appt_date = appt.get("date") or get_ist_now().strftime("%Y-%m-%d")
+    
+    # ── Transition Business Rules Validation ──
+    # Rule 8: Prevent marking completed if another consultation is actively in progress
+    if new_canonical == "completed":
+        active_in_consult = await db.appointments.find_one({
+            "doctor_id": appt["doctor_id"],
+            "date": appt_date,
+            "status": "in_consultation",
+            "id": {"$ne": target_id}
+        })
+        if active_in_consult and old_status != "in_consultation":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot mark Completed while patient Token #{active_in_consult.get('token_number')} is actively in consultation"
+            )
+
+    # If setting to in_consultation, check if another patient is in consultation
+    if new_canonical == "in_consultation":
+        active_in_consult = await db.appointments.find_one({
+            "doctor_id": appt["doctor_id"],
+            "date": appt_date,
+            "status": "in_consultation",
+            "id": {"$ne": target_id}
+        })
+        if active_in_consult:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Patient Token #{active_in_consult.get('token_number')} is currently in consultation. Complete or skip them before starting another."
+            )
+    
+    set_fields: dict = {
+        "status": new_canonical,
+        "updated_at": now,
+        "last_status_change": {
+            "from_status": old_status,
+            "to_status": new_canonical,
+            "changed_by": user_id,
+            "changed_by_name": user.get("full_name") or user.get("name"),
+            "role": user_role,
+            "timestamp": now,
+            "reason": body.reason or "Status correction"
+        }
+    }
+    
+    if new_canonical == "arrived":
+        set_fields["rejoined_at"] = now
+    elif new_canonical == "in_consultation":
+        if not appt.get("consultation_started_at"):
+            set_fields["consultation_started_at"] = time_12
+        if not appt.get("started_at"):
+            set_fields["started_at"] = now
+    elif new_canonical == "completed":
+        if not appt.get("consultation_completed_at"):
+            set_fields["consultation_completed_at"] = time_12
+        if not appt.get("completed_at"):
+            set_fields["completed_at"] = now
+        set_fields["payment_status"] = "paid"
+    elif new_canonical == "skipped":
+        set_fields["skipped_at"] = now
+    elif new_canonical == "cancelled":
+        set_fields["cancelled_at"] = now
+        set_fields["cancellation_reason"] = body.reason or "Corrected to cancelled"
+        set_fields["cancelled_by"] = user_id
+    
+    audit_meta = {
+        "appointment_id": target_id,
+        "old_status": old_status,
+        "new_status": new_canonical,
+        "reason": body.reason or "Status correction"
+    }
+    await audit(user_id, "appointment.correct_status", target=target_id, meta=audit_meta)
+    
+    await db.appointments.update_one(
+        {"id": target_id},
+        {
+            "$set": set_fields,
+            "$push": {"status_history": set_fields["last_status_change"]}
+        }
+    )
+    
+    await broadcast_doctor_update(appt["doctor_id"], "status_corrected")
+    asyncio.create_task(notify_queue_movement(appt["doctor_id"]))
+    
+    updated_appt = await db.appointments.find_one({"id": target_id}, {"_id": 0})
+    return {
+        "ok": True,
+        "message": f"Patient status successfully corrected from '{old_status}' to '{new_canonical}'",
+        "appointment": updated_appt
+    }
+
+
+
 
 @api_router.post("/reception/reschedule")
 async def reception_reschedule_appointment(body: ReceptionRescheduleBody, user: dict = Depends(require_role("receptionist", "doctor"))):
@@ -7209,27 +7391,117 @@ async def ws_appt_queue(ws: WebSocket, appointment_id: str):
 
 # ============ DOCTOR SELF-UPDATE ============
 @api_router.post("/doctor/update_profile")
+@api_router.put("/doctor/profile")
+@api_router.put("/api/doctor/profile")
+@app.put("/api/doctor/profile")
 async def doctor_update_profile(body: DoctorSelfUpdateBody, user: dict = Depends(require_role("doctor"))):
-    updates = {k: v for k, v in body.model_dump().items() if v is not None}
-    if not updates:
-        return {"ok": True, "message": "No changes"}
-    
-    if "photo" in updates and updates["photo"]:
-        validate_photo_size(updates["photo"])
-    
-    password_val = updates.pop("password", None)
-    if password_val and password_val.strip():
-        await db.users.update_one({"id": user["id"]}, {"$set": {"password_hash": hash_password(password_val.strip())}})
-    
+    doc = await db.doctors.find_one({"user_id": user["id"]})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Doctor profile not found")
+
+    raw_data = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not raw_data:
+        return {"ok": True, "message": "No changes", "doctor": doc}
+
+    updates = {}
+    user_updates = {}
+
+    # 1. Full name / Name
+    name_val = (raw_data.get("full_name") or raw_data.get("name") or "").strip()
+    if name_val:
+        if len(name_val) < 2:
+            raise HTTPException(status_code=400, detail="Name must be at least 2 characters long")
+        updates["full_name"] = name_val
+        user_updates["full_name"] = name_val
+
+    # 2. Email Address
+    if "email" in raw_data and raw_data["email"]:
+        email_val = raw_data["email"].strip().lower()
+        if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email_val):
+            raise HTTPException(status_code=400, detail="Invalid email address format")
+        dup_user = await db.users.find_one({"email": email_val, "id": {"$ne": user["id"]}})
+        if dup_user:
+            raise HTTPException(status_code=400, detail="Email is already registered by another account")
+        updates["email"] = email_val
+        user_updates["email"] = email_val
+
+    # 3. Mobile / Phone
+    mob_val = raw_data.get("mobile") if raw_data.get("mobile") is not None else raw_data.get("phone")
+    if mob_val is not None:
+        clean_mob = re.sub(r"[^0-9]", "", str(mob_val))
+        if clean_mob:
+            if len(clean_mob) < 10:
+                raise HTTPException(status_code=400, detail="Mobile number must contain at least 10 digits")
+            updates["mobile"] = clean_mob
+            updates["phone"] = clean_mob
+            user_updates["mobile"] = clean_mob
+            user_updates["phone"] = clean_mob
+        else:
+            updates["mobile"] = ""
+            updates["phone"] = ""
+            user_updates["mobile"] = ""
+            user_updates["phone"] = ""
+
+    # 4. Specialization & Hospital / Clinic Details
+    if "specialization" in raw_data and raw_data["specialization"] is not None:
+        updates["specialization"] = raw_data["specialization"].strip()
+    if "department" in raw_data and raw_data["department"] is not None:
+        updates["department"] = raw_data["department"].strip()
+    if "clinic_name" in raw_data and raw_data["clinic_name"] is not None:
+        updates["clinic_name"] = raw_data["clinic_name"].strip()
+    if "hospital_name" in raw_data and raw_data["hospital_name"] is not None:
+        updates["hospital_name"] = raw_data["hospital_name"].strip()
+
+    # 5. Professional details
+    if "fees" in raw_data and raw_data["fees"] is not None:
+        updates["fees"] = int(raw_data["fees"])
+    if "timings" in raw_data and raw_data["timings"] is not None:
+        updates["timings"] = raw_data["timings"].strip()
+    if "bio" in raw_data and raw_data["bio"] is not None:
+        updates["bio"] = raw_data["bio"].strip()
+    if "address" in raw_data and raw_data["address"] is not None:
+        updates["address"] = raw_data["address"].strip()
+    if "avg_consult_minutes" in raw_data and raw_data["avg_consult_minutes"] is not None:
+        updates["avg_consult_minutes"] = max(1, int(raw_data["avg_consult_minutes"]))
+
+    # 6. Profile Photo
+    if "photo" in raw_data and raw_data["photo"]:
+        validate_photo_size(raw_data["photo"])
+        updates["photo"] = raw_data["photo"]
+    elif "photo" in raw_data and raw_data["photo"] == "":
+        updates["photo"] = None
+
+    # 7. Password update with secure verification
+    new_pwd = raw_data.get("new_password") or raw_data.get("password")
+    curr_pwd = raw_data.get("current_password")
+    if new_pwd and new_pwd.strip():
+        new_pwd = new_pwd.strip()
+        if len(new_pwd) < 6:
+            raise HTTPException(status_code=400, detail="New password must be at least 6 characters")
+        user_doc = await db.users.find_one({"id": user["id"]})
+        if curr_pwd:
+            if not user_doc or not verify_password(curr_pwd, user_doc.get("password_hash", "")):
+                raise HTTPException(status_code=400, detail="Current password is incorrect")
+        user_updates["password_hash"] = hash_password(new_pwd)
+
+    if user_updates:
+        user_updates["updated_at"] = now_iso()
+        await db.users.update_one({"id": user["id"]}, {"$set": user_updates})
+
     if updates:
+        updates["updated_at"] = now_iso()
         await db.doctors.update_one({"user_id": user["id"]}, {"$set": updates})
-    
+
     # If wait-time-affecting fields changed, broadcast to patients so their ETA refreshes live
-    if "avg_consult_minutes" in updates or "timings" in updates or "fees" in updates:
-        d = await db.doctors.find_one({"user_id": user["id"]}, {"_id": 0, "id": 1})
-        if d:
-            await broadcast_doctor_update(d["id"], "doctor_profile_updated")
-    return {"ok": True, "updated": list(updates.keys()) + (["password"] if password_val else [])}
+    if any(k in updates for k in ("avg_consult_minutes", "timings", "fees", "full_name")):
+        await broadcast_doctor_update(doc["id"], "doctor_profile_updated")
+
+    all_updated = list(updates.keys()) + ([k for k in user_updates.keys() if k not in updates])
+    await audit(user["id"], "doctor.update_profile", target=doc["id"], meta={"updated_fields": all_updated})
+
+    updated_doc = await db.doctors.find_one({"user_id": user["id"]}, {"_id": 0})
+    return {"ok": True, "updated": all_updated, "doctor": updated_doc}
+
 
 
 # ============ OWNER ENDPOINTS ============
@@ -7680,6 +7952,97 @@ async def doctor_add_receptionist(body: DoctorAddReceptionistBody, user: dict = 
     rec_user.pop("password_hash", None)
     await audit(user["id"], "doctor.add_receptionist", target=rec_id)
     return {"ok": True, "receptionist": rec_user}
+
+
+@api_router.get("/doctor/receptionists/{receptionist_id}")
+@api_router.get("/api/doctor/receptionists/{receptionist_id}")
+async def doctor_get_receptionist(receptionist_id: str, user: dict = Depends(require_role("doctor"))):
+    hid = await get_doctor_hospital_id(user)
+    rec_id = receptionist_id.strip()
+    r = await db.users.find_one({"$or": [{"id": rec_id}, {"email": rec_id.lower()}], "role": "receptionist"}, {"_id": 0, "password_hash": 0})
+    if not r:
+        raise HTTPException(status_code=404, detail="Receptionist not found")
+
+    r_hid = (r.get("hospital_id") or r.get("hospital_code") or "").strip().upper()
+    is_assigned = (r.get("doctor_id") == user.get("id") or r.get("created_by_doctor") == user.get("id"))
+    if r_hid and hid and r_hid != hid and not is_assigned:
+        raise HTTPException(status_code=403, detail="Forbidden: Cannot view receptionist from another hospital")
+
+    return r
+
+
+@api_router.put("/doctor/receptionists/{receptionist_id}")
+@api_router.put("/api/doctor/receptionists/{receptionist_id}")
+@api_router.patch("/doctor/receptionists/{receptionist_id}")
+@api_router.patch("/api/doctor/receptionists/{receptionist_id}")
+async def doctor_update_receptionist(
+    receptionist_id: str,
+    body: DoctorUpdateReceptionistBody,
+    user: dict = Depends(require_role("doctor"))
+):
+    hid = await get_doctor_hospital_id(user)
+    rec_id = receptionist_id.strip()
+    r = await db.users.find_one({"$or": [{"id": rec_id}, {"email": rec_id.lower()}], "role": "receptionist"})
+    if not r:
+        raise HTTPException(status_code=404, detail="Receptionist not found")
+
+    r_hid = (r.get("hospital_id") or r.get("hospital_code") or "").strip().upper()
+    is_assigned = (r.get("doctor_id") == user.get("id") or r.get("created_by_doctor") == user.get("id"))
+    if r_hid and hid and r_hid != hid and not is_assigned:
+        raise HTTPException(status_code=403, detail="Forbidden: Cannot edit receptionist from another hospital")
+
+    updates = {}
+    name_val = (body.full_name or body.name or "").strip()
+    if name_val:
+        if len(name_val) < 2:
+            raise HTTPException(status_code=400, detail="Name must be at least 2 characters long")
+        updates["full_name"] = name_val
+
+    if body.email is not None and body.email.strip():
+        email_val = body.email.strip().lower()
+        if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email_val):
+            raise HTTPException(status_code=400, detail="Invalid email address format")
+        dup = await db.users.find_one({"email": email_val, "id": {"$ne": r["id"]}})
+        if dup:
+            raise HTTPException(status_code=400, detail="Email is already registered by another account")
+        updates["email"] = email_val
+
+    mob_val = body.mobile if body.mobile is not None else body.phone
+    if mob_val is not None:
+        clean_m = re.sub(r"[^0-9]", "", str(mob_val))
+        if clean_m:
+            if len(clean_m) < 10:
+                raise HTTPException(status_code=400, detail="Mobile number must contain at least 10 digits")
+            updates["mobile"] = clean_m
+            updates["phone"] = clean_m
+        else:
+            updates["mobile"] = ""
+            updates["phone"] = ""
+
+    if body.status is not None and body.status.strip():
+        st = body.status.strip().lower()
+        if st not in ("active", "inactive"):
+            raise HTTPException(status_code=400, detail="Status must be 'active' or 'inactive'")
+        updates["status"] = st
+        updates["login_disabled"] = (st == "inactive")
+    elif body.login_disabled is not None:
+        updates["login_disabled"] = bool(body.login_disabled)
+        updates["status"] = "inactive" if body.login_disabled else "active"
+
+    if body.password is not None and body.password.strip():
+        pwd = body.password.strip()
+        if len(pwd) < 6:
+            raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+        updates["password_hash"] = hash_password(pwd)
+
+    if updates:
+        updates["updated_at"] = now_iso()
+        await db.users.update_one({"id": r["id"]}, {"$set": updates})
+        await audit(user["id"], "doctor.update_receptionist", target=r["id"], meta={"updated_fields": list(updates.keys())})
+
+    updated_r = await db.users.find_one({"id": r["id"]}, {"_id": 0, "password_hash": 0})
+    return {"ok": True, "receptionist": updated_r}
+
 
 
 @api_router.delete("/doctor/receptionists/{receptionist_id}")

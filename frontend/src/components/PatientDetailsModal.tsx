@@ -9,6 +9,7 @@ import {
   TextInput,
   ActivityIndicator,
   Platform,
+  Alert,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { api } from "@/src/api/client";
@@ -30,6 +31,12 @@ export default function PatientDetailsModal({
   const [isEditing, setIsEditing] = useState(false);
   const [loadingFresh, setLoadingFresh] = useState(false);
 
+  // Status correction states
+  const [isCorrectingStatus, setIsCorrectingStatus] = useState(false);
+  const [targetStatus, setTargetStatus] = useState("arrived");
+  const [correctionReason, setCorrectionReason] = useState("");
+  const [statusUpdating, setStatusUpdating] = useState(false);
+
   // Form states
   const [name, setName] = useState("");
   const [mobile, setMobile] = useState("");
@@ -45,6 +52,7 @@ export default function PatientDetailsModal({
 
   // Current active details object
   const [details, setDetails] = useState<any | null>(null);
+
 
   useEffect(() => {
     if (appointment && visible) {
@@ -198,6 +206,70 @@ export default function PatientDetailsModal({
     }
   };
 
+  const handleCorrectStatus = async (overrideStatus?: string) => {
+    const desired = overrideStatus || targetStatus;
+    if (!desired) return;
+    const current = currentData.status || "booked";
+    if (desired === current) {
+      setErrorMsg(`Patient is already in '${desired.replace("_", " ")}' status.`);
+      return;
+    }
+
+    const doCorrection = async () => {
+      setStatusUpdating(true);
+      setErrorMsg(null);
+      setSuccessMsg(null);
+      try {
+        const res = await api.post("/reception/correct_status", {
+          appointment_id: currentData.id,
+          new_status: desired,
+          reason: correctionReason.trim() || undefined,
+        });
+
+        const updated = res.appointment || {
+          ...currentData,
+          status: desired === "waiting" ? "arrived" : desired,
+        };
+
+        setDetails(updated);
+        setSuccessMsg(res.message || "Patient status updated successfully!");
+        setIsCorrectingStatus(false);
+        setCorrectionReason("");
+        if (onUpdated) {
+          onUpdated(updated);
+        }
+      } catch (err: any) {
+        setErrorMsg(err.message || "Failed to correct patient status.");
+      } finally {
+        setStatusUpdating(false);
+      }
+    };
+
+    const oldLabel = String(current).replace("_", " ").toUpperCase();
+    const newLabel = String(desired).replace("_", " ").toUpperCase();
+    const promptText = `Change patient Token #${currentData.token_number} (${currentData.patient_name}) from ${oldLabel} to ${newLabel}?`;
+
+    if (Platform.OS === "web") {
+      const ok = typeof window !== "undefined" && window.confirm ? window.confirm(`Confirm Status Correction:\n${promptText}`) : true;
+      if (ok) {
+        await doCorrection();
+      }
+    } else {
+      Alert.alert("Confirm Status Correction", promptText, [
+        { text: "Cancel", style: "cancel" },
+        { text: "Confirm", onPress: doCorrection },
+      ]);
+    }
+  };
+
+  const STATUS_CHOICES = [
+    { id: "arrived", label: "Waiting", desc: "Return to active queue at original token position", icon: "time-outline", color: colors.warning },
+    { id: "in_consultation", label: "In Consultation", desc: "Currently inside doctor cabin", icon: "play-circle-outline", color: colors.brandPrimary },
+    { id: "completed", label: "Completed", desc: "Consultation finished", icon: "checkmark-done-circle-outline", color: colors.success },
+    { id: "skipped", label: "Skipped", desc: "Patient not present when called", icon: "arrow-forward-circle-outline", color: "#B45309" },
+    { id: "cancelled", label: "Cancelled", desc: "Cancelled appointment", icon: "close-circle-outline", color: colors.error },
+  ];
+
   const statusColor =
     currentData.status === "completed"
       ? colors.success
@@ -205,7 +277,12 @@ export default function PatientDetailsModal({
       ? colors.brandPrimary
       : currentData.status === "arrived"
       ? colors.warning
+      : currentData.status === "skipped"
+      ? "#B45309"
+      : currentData.status === "cancelled"
+      ? colors.error
       : colors.info;
+
 
   const paymentStatusColor =
     (currentData.payment_status || "").toLowerCase() === "paid"
@@ -305,6 +382,144 @@ export default function PatientDetailsModal({
                       {currentData.date || "--"}
                     </Text>
                   </View>
+                </View>
+
+                {/* ── Status Correction & Accidental Skip Recovery Card ── */}
+                <View style={styles.card}>
+                  <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                      <Ionicons name="swap-horizontal-outline" size={18} color={colors.brandPrimary} />
+                      <Text style={styles.cardTitle}>Queue Status &amp; Correction</Text>
+                    </View>
+                    <Pressable
+                      testID="toggle-correct-status-panel-btn"
+                      onPress={() => {
+                        setIsCorrectingStatus(!isCorrectingStatus);
+                        setTargetStatus(currentData.status === "skipped" ? "arrived" : currentData.status || "arrived");
+                      }}
+                      style={styles.correctStatusToggleBtn}
+                    >
+                      <Ionicons name={isCorrectingStatus ? "close" : "create-outline"} size={14} color={colors.brandPrimary} />
+                      <Text style={styles.correctStatusToggleText}>
+                        {isCorrectingStatus ? "Cancel" : "Correct Status"}
+                      </Text>
+                    </Pressable>
+                  </View>
+
+                  {/* Quick-Recovery Banner for Skipped Patients */}
+                  {currentData.status === "skipped" && !isCorrectingStatus && (
+                    <View style={styles.skippedRecoveryBox}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.skippedRecoveryTitle}>Accidentally Skipped?</Text>
+                        <Text style={styles.skippedRecoverySub}>
+                          Restore this patient back to the active Waiting queue with their original Token #{currentData.token_number}.
+                        </Text>
+                      </View>
+                      <Pressable
+                        testID="quick-recover-skipped-btn"
+                        disabled={statusUpdating}
+                        onPress={() => handleCorrectStatus("arrived")}
+                        style={styles.quickRecoverBtn}
+                      >
+                        {statusUpdating ? (
+                          <ActivityIndicator size="small" color="#fff" />
+                        ) : (
+                          <>
+                            <Ionicons name="refresh-circle-outline" size={16} color="#fff" />
+                            <Text style={styles.quickRecoverBtnText}>Restore to Waiting</Text>
+                          </>
+                        )}
+                      </Pressable>
+                    </View>
+                  )}
+
+                  {/* Expanded Status Correction Panel */}
+                  {isCorrectingStatus && (
+                    <View style={{ marginTop: spacing.md, gap: spacing.sm }}>
+                      <Text style={styles.helperText}>
+                        Select the correct status to fix an accidental change. Token #{currentData.token_number} and payment records remain completely intact.
+                      </Text>
+
+                      <View style={{ gap: 6, marginTop: 4 }}>
+                        {STATUS_CHOICES.map((choice) => {
+                          const isSelected = targetStatus === choice.id;
+                          const isCurrent = (currentData.status || "booked") === choice.id;
+                          return (
+                            <Pressable
+                              key={choice.id}
+                              testID={`status-option-${choice.id}`}
+                              onPress={() => setTargetStatus(choice.id)}
+                              style={[
+                                styles.statusOptionCard,
+                                isSelected && { borderColor: choice.color, backgroundColor: choice.color + "12" },
+                              ]}
+                            >
+                              <View style={{ flexDirection: "row", alignItems: "center", gap: 10, flex: 1 }}>
+                                <Ionicons name={choice.icon as any} size={18} color={choice.color} />
+                                <View style={{ flex: 1 }}>
+                                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                                    <Text style={[styles.statusOptionLabel, isSelected && { color: choice.color, fontWeight: "700" }]}>
+                                      {choice.label}
+                                    </Text>
+                                    {isCurrent && (
+                                      <Text style={styles.currentStatusBadge}>(Current)</Text>
+                                    )}
+                                  </View>
+                                  <Text style={styles.statusOptionDesc}>{choice.desc}</Text>
+                                </View>
+                              </View>
+                              <View
+                                style={[
+                                  styles.radioCircle,
+                                  isSelected && { borderColor: choice.color, backgroundColor: choice.color },
+                                ]}
+                              >
+                                {isSelected && <View style={styles.radioInner} />}
+                              </View>
+                            </Pressable>
+                          );
+                        })}
+                      </View>
+
+                      <View style={{ marginTop: 6 }}>
+                        <Text style={styles.formLabel}>Reason for Correction (Optional)</Text>
+                        <TextInput
+                          testID="input-correction-reason"
+                          value={correctionReason}
+                          onChangeText={setCorrectionReason}
+                          placeholder="e.g. Patient was present, accidental button tap"
+                          placeholderTextColor={colors.muted}
+                          style={[styles.textInput, { fontSize: font.sm }]}
+                        />
+                      </View>
+
+                      <View style={{ flexDirection: "row", gap: 8, marginTop: 4 }}>
+                        <Pressable
+                          onPress={() => setIsCorrectingStatus(false)}
+                          disabled={statusUpdating}
+                          style={[styles.secondaryBtn, { flex: 1, paddingVertical: 10 }]}
+                        >
+                          <Text style={styles.secondaryBtnText}>Cancel</Text>
+                        </Pressable>
+
+                        <Pressable
+                          testID="apply-status-correction-btn"
+                          disabled={statusUpdating}
+                          onPress={() => handleCorrectStatus()}
+                          style={[styles.primaryBtn, { flex: 2, paddingVertical: 10 }]}
+                        >
+                          {statusUpdating ? (
+                            <ActivityIndicator size="small" color="#fff" />
+                          ) : (
+                            <>
+                              <Ionicons name="checkmark-circle-outline" size={16} color="#fff" />
+                              <Text style={styles.primaryBtnText}>Apply Correction</Text>
+                            </>
+                          )}
+                        </Pressable>
+                      </View>
+                    </View>
+                  )}
                 </View>
 
                 {/* Section 1: Patient Information */}
@@ -915,4 +1130,96 @@ const styles = StyleSheet.create({
     fontSize: font.sm,
     fontWeight: "700",
   },
+  correctStatusToggleBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: radius.md,
+    backgroundColor: colors.brandSecondary,
+  },
+  correctStatusToggleText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: colors.brandPrimary,
+  },
+  skippedRecoveryBox: {
+    marginTop: spacing.sm,
+    padding: spacing.md,
+    backgroundColor: "#FEF3C7",
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: "#FCD34D",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  skippedRecoveryTitle: {
+    fontSize: font.sm,
+    fontWeight: "800",
+    color: "#92400E",
+  },
+  skippedRecoverySub: {
+    fontSize: 11,
+    color: "#78350F",
+    marginTop: 2,
+  },
+  quickRecoverBtn: {
+    backgroundColor: "#D97706",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: radius.md,
+  },
+  quickRecoverBtnText: {
+    color: "#fff",
+    fontSize: font.xs,
+    fontWeight: "700",
+  },
+  statusOptionCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: spacing.sm,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.surface,
+  },
+  statusOptionLabel: {
+    fontSize: font.sm,
+    fontWeight: "600",
+    color: colors.onSurface,
+  },
+  currentStatusBadge: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: colors.muted,
+  },
+  statusOptionDesc: {
+    fontSize: 11,
+    color: colors.muted,
+    marginTop: 1,
+  },
+  radioCircle: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    borderWidth: 2,
+    borderColor: colors.borderStrong,
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 8,
+  },
+  radioInner: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#fff",
+  },
 });
+

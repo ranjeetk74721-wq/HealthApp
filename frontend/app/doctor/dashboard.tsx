@@ -32,6 +32,7 @@ const rowActions = [
   { label: "Call",    path: "/reception/start_consultation", color: colors.brandPrimary, icon: "mic"              as const, showOn: ["arrived", "booked"] },
   { label: "Done",    path: "/reception/complete",           color: colors.success,      icon: "checkmark-done"   as const, showOn: ["in_consultation", "arrived"] },
   { label: "Skip",    path: "/reception/skip",               color: colors.warning,      icon: "arrow-forward"    as const, showOn: ["booked", "arrived"] },
+  { label: "Restore", path: "/reception/correct_status",     color: "#D97706",           icon: "refresh-circle"   as const, showOn: ["skipped"] },
 ];
 
 const STATUS_COLORS: Record<string, string> = {
@@ -64,11 +65,17 @@ export default function DoctorDashboard() {
   const [prescOpen, setPrescOpen] = useState<any | null>(null);
   const [prescText, setPrescText] = useState("");
   const [editOpen, setEditOpen]   = useState(false);
+  const [editName, setEditName]   = useState("");
+  const [editEmail, setEditEmail] = useState("");
+  const [editMobile, setEditMobile] = useState("");
+  const [editSpecialization, setEditSpecialization] = useState("");
+  const [editClinicName, setEditClinicName] = useState("");
   const [editFees, setEditFees]   = useState("");
   const [editTimings, setEditTimings] = useState("");
   const [editBio, setEditBio]         = useState("");
   const [editAvgMin, setEditAvgMin]   = useState("");
   const [editPhoto, setEditPhoto]     = useState<string | null>(null);
+  const [editCurrentPassword, setEditCurrentPassword] = useState("");
   const [editPassword, setEditPassword] = useState("");
   const [editError, setEditError]     = useState<string | null>(null);
   const [editSaving, setEditSaving]   = useState(false);
@@ -87,6 +94,18 @@ export default function DoctorDashboard() {
   const [recMobile, setRecMobile] = useState("");
   const [recSaving, setRecSaving] = useState(false);
   const [recError, setRecError] = useState<string | null>(null);
+
+  // Receptionist edit state
+  const [editRecModalOpen, setEditRecModalOpen] = useState(false);
+  const [editRecId, setEditRecId] = useState("");
+  const [editRecName, setEditRecName] = useState("");
+  const [editRecEmail, setEditRecEmail] = useState("");
+  const [editRecMobile, setEditRecMobile] = useState("");
+  const [editRecStatus, setEditRecStatus] = useState<"active" | "inactive">("active");
+  const [editRecPassword, setEditRecPassword] = useState("");
+  const [editRecSaving, setEditRecSaving] = useState(false);
+  const [editRecError, setEditRecError] = useState<string | null>(null);
+
 
   const wsRef = useRef<WebSocket | null>(null);
   const wsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -344,11 +363,17 @@ export default function DoctorDashboard() {
     if (actionLoadingMap[appt_id]) return; // Per-patient immediate guard
     setActionLoadingMap((prev) => ({ ...prev, [appt_id]: actionName || "loading" }));
     try {
-      await api.post(path, { appointment_id: appt_id });
+      const payload: any = { appointment_id: appt_id };
+      if (path.includes("correct_status")) {
+        payload.new_status = "arrived";
+        payload.reason = "Restored from skipped by doctor";
+      }
+      await api.post(path, payload);
       // Optimistic local update upon confirmed backend write
-      if (optimisticStatus) {
+      const targetStat = path.includes("correct_status") ? "arrived" : optimisticStatus;
+      if (targetStat) {
         setAppts((prev) =>
-          prev.map((a) => (a.id === appt_id ? { ...a, status: optimisticStatus } : a))
+          prev.map((a) => (a.id === appt_id ? { ...a, status: targetStat } : a))
         );
       }
       await load(true, true);
@@ -373,11 +398,17 @@ export default function DoctorDashboard() {
   };
 
   const openEditProfile = () => {
+    setEditName(data?.doctor?.full_name || user?.full_name || "");
+    setEditEmail(data?.doctor?.email || user?.email || "");
+    setEditMobile(data?.doctor?.mobile || data?.doctor?.phone || user?.mobile || "");
+    setEditSpecialization(data?.doctor?.specialization || data?.doctor?.department || "");
+    setEditClinicName(data?.doctor?.clinic_name || data?.doctor?.hospital_name || "");
     setEditFees(String(data?.doctor?.fees ?? ""));
     setEditTimings(data?.doctor?.timings ?? "");
     setEditBio(data?.doctor?.bio ?? "");
     setEditAvgMin(String(data?.doctor?.avg_consult_minutes ?? 15));
     setEditPhoto(data?.doctor?.photo || null);
+    setEditCurrentPassword("");
     setEditPassword("");
     setEditError(null);
     setEditOpen(true);
@@ -428,7 +459,32 @@ export default function DoctorDashboard() {
     setEditSaving(true);
     setEditError(null);
     try {
+      if (!editName.trim() || editName.trim().length < 2) {
+        setEditError("Full name must be at least 2 characters");
+        setEditSaving(false);
+        return;
+      }
+      if (editEmail.trim()) {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(editEmail.trim())) {
+          setEditError("Please enter a valid email address");
+          setEditSaving(false);
+          return;
+        }
+      }
+      const cleanMob = editMobile.replace(/[^0-9]/g, "");
+      if (editMobile.trim() && cleanMob.length < 10) {
+        setEditError("Mobile number must contain at least 10 digits");
+        setEditSaving(false);
+        return;
+      }
+
       const updates: any = {};
+      if (editName.trim() !== (data?.doctor?.full_name || "")) updates.full_name = editName.trim();
+      if (editEmail.trim().toLowerCase() !== (data?.doctor?.email || "").toLowerCase()) updates.email = editEmail.trim().toLowerCase();
+      if (cleanMob !== (data?.doctor?.mobile || data?.doctor?.phone || "")) updates.mobile = cleanMob;
+      if (editSpecialization.trim() !== (data?.doctor?.specialization || "")) updates.specialization = editSpecialization.trim();
+      if (editClinicName.trim() !== (data?.doctor?.clinic_name || "")) updates.clinic_name = editClinicName.trim();
       if (editFees && parseInt(editFees, 10) !== data?.doctor?.fees) updates.fees = parseInt(editFees, 10);
       if (editTimings && editTimings !== data?.doctor?.timings) updates.timings = editTimings;
       if (editBio !== (data?.doctor?.bio || "")) updates.bio = editBio;
@@ -436,13 +492,16 @@ export default function DoctorDashboard() {
       if (!isNaN(avgMinNum) && avgMinNum > 0 && avgMinNum !== (data?.doctor?.avg_consult_minutes ?? 15)) {
         updates.avg_consult_minutes = avgMinNum;
       }
+      if (editCurrentPassword.trim()) {
+        updates.current_password = editCurrentPassword.trim();
+      }
       if (editPassword.trim()) {
         if (editPassword.length < 6) {
           setEditError("New password must be at least 6 characters");
           setEditSaving(false);
           return;
         }
-        updates.password = editPassword.trim();
+        updates.new_password = editPassword.trim();
       }
       if (editPhoto !== (data?.doctor?.photo || null)) {
         updates.photo = editPhoto || "";
@@ -479,6 +538,59 @@ export default function DoctorDashboard() {
       setRecError(e.message || "Failed to add receptionist");
     } finally { setRecSaving(false); }
   };
+
+  const openEditReceptionist = (r: any) => {
+    setEditRecId(r.id);
+    setEditRecName(r.full_name || "");
+    setEditRecEmail(r.email || "");
+    setEditRecMobile(r.mobile || r.phone || "");
+    setEditRecStatus((r.status === "inactive" || r.login_disabled) ? "inactive" : "active");
+    setEditRecPassword("");
+    setEditRecError(null);
+    setEditRecModalOpen(true);
+  };
+
+  const handleSaveEditReceptionist = async () => {
+    setEditRecError(null);
+    if (!editRecName.trim() || editRecName.trim().length < 2) {
+      setEditRecError("Name must be at least 2 characters long");
+      return;
+    }
+    if (!editRecEmail.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(editRecEmail.trim())) {
+      setEditRecError("Please enter a valid email address");
+      return;
+    }
+    const cleanMob = editRecMobile.replace(/[^0-9]/g, "");
+    if (editRecMobile.trim() && cleanMob.length < 10) {
+      setEditRecError("Mobile number must be at least 10 digits");
+      return;
+    }
+    if (editRecPassword.trim() && editRecPassword.trim().length < 6) {
+      setEditRecError("Password must be at least 6 characters");
+      return;
+    }
+
+    setEditRecSaving(true);
+    try {
+      const payload: any = {
+        full_name: editRecName.trim(),
+        email: editRecEmail.trim().toLowerCase(),
+        mobile: cleanMob || undefined,
+        status: editRecStatus,
+      };
+      if (editRecPassword.trim()) {
+        payload.password = editRecPassword.trim();
+      }
+      await api.put(`/doctor/receptionists/${editRecId}`, payload);
+      setEditRecModalOpen(false);
+      load(true);
+    } catch (e: any) {
+      setEditRecError(e.message || "Failed to update receptionist");
+    } finally {
+      setEditRecSaving(false);
+    }
+  };
+
 
   const handleDeleteReceptionist = (id: string, name?: string) => {
     Alert.alert(
@@ -745,17 +857,38 @@ export default function DoctorDashboard() {
         {receptionists.length === 0 ? (
           <Text style={{ color: colors.muted, fontSize: font.sm }}>No receptionists assigned yet.</Text>
         ) : (
-          receptionists.map((r) => (
-            <View key={r.id} style={{ flexDirection: "row", alignItems: "center", backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, marginBottom: 4 }}>
-              <View style={{ flex: 1 }}>
-                <Text style={{ fontSize: font.base, fontWeight: "600", color: colors.onSurface }}>{r.full_name}</Text>
-                <Text style={{ fontSize: 11, color: colors.muted }}>{r.email} {r.mobile || r.phone ? `· ${r.mobile || r.phone}` : ""}</Text>
+          receptionists.map((r) => {
+            const isInactive = r.status === "inactive" || r.login_disabled;
+            return (
+              <View key={r.id} style={{ flexDirection: "row", alignItems: "center", backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, marginBottom: 4, gap: 8 }}>
+                <View style={{ flex: 1 }}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                    <Text style={{ fontSize: font.base, fontWeight: "600", color: colors.onSurface }}>{r.full_name}</Text>
+                    <View style={{ paddingHorizontal: 6, paddingVertical: 1, borderRadius: radius.sm, backgroundColor: isInactive ? "#F1F5F9" : "#ECFDF5", borderWidth: 1, borderColor: isInactive ? "#CBD5E1" : "#A7F3D0" }}>
+                      <Text style={{ fontSize: 9, fontWeight: "700", color: isInactive ? "#64748B" : "#059669" }}>
+                        {isInactive ? "INACTIVE" : "ACTIVE"}
+                      </Text>
+                    </View>
+                  </View>
+                  <Text style={{ fontSize: 11, color: colors.muted, marginTop: 2 }}>{r.email} {r.mobile || r.phone ? `· ${r.mobile || r.phone}` : ""}</Text>
+                </View>
+                <Pressable
+                  testID={`edit-receptionist-btn-${r.id}`}
+                  onPress={() => openEditReceptionist(r)}
+                  style={{ padding: spacing.xs, backgroundColor: colors.brandSecondary, borderRadius: radius.sm }}
+                >
+                  <Ionicons name="create-outline" size={17} color={colors.brandPrimary} />
+                </Pressable>
+                <Pressable
+                  testID={`delete-receptionist-btn-${r.id}`}
+                  onPress={() => handleDeleteReceptionist(r.id, r.full_name)}
+                  style={{ padding: spacing.xs }}
+                >
+                  <Ionicons name="trash-outline" size={18} color={colors.error} />
+                </Pressable>
               </View>
-              <Pressable onPress={() => handleDeleteReceptionist(r.id, r.full_name)} style={{ padding: spacing.xs }}>
-                <Ionicons name="trash-outline" size={18} color={colors.error} />
-              </Pressable>
-            </View>
-          ))
+            );
+          })
         )}
 
         {/* ── Next patient card ── */}
@@ -933,7 +1066,9 @@ export default function DoctorDashboard() {
                     const targetStatus =
                       act.label === "Call" ? "in_consultation" :
                       act.label === "Done" ? "completed" :
-                      act.label === "Arrived" ? "arrived" : "skipped";
+                      act.label === "Arrived" ? "arrived" :
+                      act.label === "Restore" ? "arrived" : "skipped";
+
                     return (
                       <Pressable
                         key={act.label}
@@ -1026,6 +1161,115 @@ export default function DoctorDashboard() {
         </KeyboardAvoidingView>
       </Modal>
 
+      {/* ── Edit Receptionist Modal ── */}
+      <Modal transparent visible={editRecModalOpen} animationType="slide" onRequestClose={() => setEditRecModalOpen(false)}>
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setEditRecModalOpen(false)}>
+            <Pressable style={[styles.sheet, { maxHeight: "90%" }]} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.sheetHandle} />
+              <Text style={styles.sheetTitle}>Edit Receptionist</Text>
+              <Text style={styles.sheetSub}>Update receptionist profile, status, or reset credentials</Text>
+
+              <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 20 }}>
+                <Text style={styles.editLabel}>Full Name*</Text>
+                <TextInput
+                  testID="edit-rec-name"
+                  value={editRecName}
+                  onChangeText={setEditRecName}
+                  placeholder="e.g. Rahul Sharma"
+                  placeholderTextColor={colors.muted}
+                  style={styles.editInput}
+                />
+
+                <Text style={styles.editLabel}>Login Email*</Text>
+                <TextInput
+                  testID="edit-rec-email"
+                  value={editRecEmail}
+                  onChangeText={setEditRecEmail}
+                  keyboardType="email-address"
+                  autoCapitalize="none"
+                  placeholder="receptionist@hospital.com"
+                  placeholderTextColor={colors.muted}
+                  style={styles.editInput}
+                />
+
+                <Text style={styles.editLabel}>Mobile Number (Optional)</Text>
+                <TextInput
+                  testID="edit-rec-mobile"
+                  value={editRecMobile}
+                  onChangeText={setEditRecMobile}
+                  keyboardType="phone-pad"
+                  placeholder="9876543210"
+                  placeholderTextColor={colors.muted}
+                  style={styles.editInput}
+                />
+
+                <Text style={styles.editLabel}>Account Status</Text>
+                <View style={{ flexDirection: "row", gap: 10, marginVertical: 4 }}>
+                  <Pressable
+                    testID="edit-rec-status-active"
+                    onPress={() => setEditRecStatus("active")}
+                    style={[
+                      styles.segmentBtn,
+                      editRecStatus === "active" && { backgroundColor: "#ECFDF5", borderColor: "#059669" },
+                    ]}
+                  >
+                    <Ionicons name="checkmark-circle" size={16} color={editRecStatus === "active" ? "#059669" : colors.muted} />
+                    <Text style={{ fontSize: font.sm, fontWeight: "700", color: editRecStatus === "active" ? "#059669" : colors.muted }}>
+                      Active
+                    </Text>
+                  </Pressable>
+
+                  <Pressable
+                    testID="edit-rec-status-inactive"
+                    onPress={() => setEditRecStatus("inactive")}
+                    style={[
+                      styles.segmentBtn,
+                      editRecStatus === "inactive" && { backgroundColor: "#F1F5F9", borderColor: "#64748B" },
+                    ]}
+                  >
+                    <Ionicons name="pause-circle" size={16} color={editRecStatus === "inactive" ? "#64748B" : colors.muted} />
+                    <Text style={{ fontSize: font.sm, fontWeight: "700", color: editRecStatus === "inactive" ? "#64748B" : colors.muted }}>
+                      Inactive (Disabled)
+                    </Text>
+                  </Pressable>
+                </View>
+
+                <Text style={styles.editLabel}>Reset Password (leave empty to keep current)</Text>
+                <TextInput
+                  testID="edit-rec-password"
+                  value={editRecPassword}
+                  onChangeText={setEditRecPassword}
+                  secureTextEntry
+                  placeholder="New password (min 6 chars)"
+                  placeholderTextColor={colors.muted}
+                  style={styles.editInput}
+                />
+
+                {editRecError ? (
+                  <Text style={{ color: colors.error, fontSize: font.sm, marginTop: 6, textAlign: "center" }}>
+                    {editRecError}
+                  </Text>
+                ) : null}
+
+                <Pressable
+                  testID="save-edit-receptionist-btn"
+                  onPress={handleSaveEditReceptionist}
+                  disabled={editRecSaving}
+                  style={styles.saveBtn}
+                >
+                  {editRecSaving ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <Text style={styles.saveBtnText}>Update Receptionist</Text>
+                  )}
+                </Pressable>
+              </ScrollView>
+            </Pressable>
+          </Pressable>
+        </KeyboardAvoidingView>
+      </Modal>
+
       {/* ── Edit Profile Modal ── */}
       <Modal transparent visible={editOpen} animationType="slide" onRequestClose={() => setEditOpen(false)}>
         <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
@@ -1033,7 +1277,7 @@ export default function DoctorDashboard() {
             <Pressable style={[styles.sheet, { maxHeight: "88%" }]} onPress={(e) => e.stopPropagation()}>
               <View style={styles.sheetHandle} />
               <Text style={styles.sheetTitle}>Update My Profile</Text>
-              <Text style={styles.sheetSub}>Update your consultation fees, timings, photo &amp; password</Text>
+              <Text style={styles.sheetSub}>Update your personal details, consultation fees, timings, photo &amp; password</Text>
               
               <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ gap: spacing.xs, paddingBottom: 20 }}>
                 {/* Photo section */}
@@ -1059,9 +1303,75 @@ export default function DoctorDashboard() {
                   </View>
                 </View>
 
-                {/* Password section */}
-                <Text style={styles.editLabel}>Change Password (leave empty to keep current)</Text>
+                {/* Personal Information */}
+                <Text style={styles.editLabel}>Full Name*</Text>
                 <TextInput
+                  testID="edit-doc-fullname"
+                  value={editName}
+                  onChangeText={setEditName}
+                  placeholder="Dr. Full Name"
+                  placeholderTextColor={colors.muted}
+                  style={styles.editInput}
+                />
+
+                <Text style={styles.editLabel}>Login Email Address</Text>
+                <TextInput
+                  testID="edit-doc-email"
+                  value={editEmail}
+                  onChangeText={setEditEmail}
+                  keyboardType="email-address"
+                  autoCapitalize="none"
+                  placeholder="doctor@hospital.com"
+                  placeholderTextColor={colors.muted}
+                  style={styles.editInput}
+                />
+
+                <Text style={styles.editLabel}>Contact / Mobile Number</Text>
+                <TextInput
+                  testID="edit-doc-mobile"
+                  value={editMobile}
+                  onChangeText={setEditMobile}
+                  keyboardType="phone-pad"
+                  placeholder="9876543210"
+                  placeholderTextColor={colors.muted}
+                  style={styles.editInput}
+                />
+
+                <Text style={styles.editLabel}>Specialization / Department</Text>
+                <TextInput
+                  testID="edit-doc-specialization"
+                  value={editSpecialization}
+                  onChangeText={setEditSpecialization}
+                  placeholder="e.g. General Physician, Pediatrics"
+                  placeholderTextColor={colors.muted}
+                  style={styles.editInput}
+                />
+
+                <Text style={styles.editLabel}>Hospital or Clinic Name</Text>
+                <TextInput
+                  testID="edit-doc-clinic-name"
+                  value={editClinicName}
+                  onChangeText={setEditClinicName}
+                  placeholder="e.g. MeriBaari Wellness Clinic"
+                  placeholderTextColor={colors.muted}
+                  style={styles.editInput}
+                />
+
+                {/* Password section with current password verification */}
+                <Text style={styles.editLabel}>Current Password (required only if changing password)</Text>
+                <TextInput
+                  testID="edit-doc-current-password"
+                  value={editCurrentPassword}
+                  onChangeText={setEditCurrentPassword}
+                  secureTextEntry
+                  placeholder="Current Password"
+                  placeholderTextColor={colors.muted}
+                  style={styles.editInput}
+                />
+
+                <Text style={styles.editLabel}>New Password (leave empty to keep current)</Text>
+                <TextInput
+                  testID="edit-doc-new-password"
                   value={editPassword}
                   onChangeText={setEditPassword}
                   secureTextEntry
@@ -1093,6 +1403,7 @@ export default function DoctorDashboard() {
           </Pressable>
         </KeyboardAvoidingView>
       </Modal>
+
 
       {/* ── Patient Details View / Edit Modal (deferred until selected) ── */}
       {!!selectedPatientAppt && (
@@ -1317,4 +1628,18 @@ const styles = StyleSheet.create({
   hintTxt: { fontSize: 11, color: colors.muted, marginTop: 4, fontStyle: "italic" },
   saveBtn: { backgroundColor: colors.brandPrimary, borderRadius: radius.md, padding: spacing.lg, alignItems: "center", marginTop: spacing.md },
   saveBtnText: { color: colors.onBrandPrimary, fontSize: font.lg, fontWeight: "700" },
+  segmentBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.md,
+    backgroundColor: colors.surface,
+  },
 });
+
