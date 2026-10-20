@@ -23,6 +23,7 @@ import bcrypt
 import jwt
 import json
 import sys
+import inspect
 
 # Ensure backend directory is in sys.path for local and external module resolution
 _backend_dir = str(Path(__file__).resolve().parent)
@@ -1484,7 +1485,7 @@ async def safe_db_find_one(collection, filter_dict, projection=None):
         return None
     try:
         res = find_fn(filter_dict) if projection is None else find_fn(filter_dict, projection)
-        if asyncio.iscoroutine(res):
+        if inspect.isawaitable(res):
             return await res
         if isinstance(res, dict):
             return res
