@@ -194,7 +194,7 @@ export default function DoctorSessionBar({
               : isDelayed
               ? "Delayed"
               : status === "completed" || status === "ended"
-              ? "Ended"
+              ? (waitingCount > 0 ? "Session Inactive (Patients Waiting)" : "Ended")
               : "Not Started"}
           </Text>
         </View>
@@ -337,8 +337,8 @@ export default function DoctorSessionBar({
             <Text style={styles.actionColLabel}>Shifts & Slots</Text>
           </Pressable>
 
-          {/* Start Session Button (when not started) */}
-          {status === "not_started" && (
+          {/* Start Session Button (when not started, or when completed/ended to begin next shift) */}
+          {(status === "not_started" || status === "completed" || status === "ended") && (
             <Pressable
               testID="start-consultation-btn"
               onPress={handleStartConsultation}

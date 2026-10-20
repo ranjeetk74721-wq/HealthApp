@@ -1875,8 +1875,29 @@ async def calculate_appointment_eta(
             is_estimate_pending = True
             eta_minutes = 0
         elif session_status == "completed":
-            expected_turn_time = "Consultation session ended"
-            eta_minutes = 0
+            if my_position > 0:
+                # Active appointment still waiting for consultation — do not show "ended"
+                exp_start_str = session.get("expected_start_time") or session.get("original_start_time") or "10:00 AM"
+                if appt_session_id and not appt_session_id.endswith("_default"):
+                    custom_sess = schedule_config
+                    if custom_sess is None and hasattr(db, "doctor_schedule_configs") and hasattr(db.doctor_schedule_configs, "find_one"):
+                        custom_sess = await db.doctor_schedule_configs.find_one({"id": appt_session_id}, {"_id": 0, "start_time": 1, "date_overrides": 1})
+                    if custom_sess:
+                        override_start = (custom_sess.get("date_overrides", {}).get(appt_date) or {}).get("start_time")
+                        exp_start_str = override_start or custom_sess.get("start_time") or exp_start_str
+                start_dt = parse_time_to_ist_dt(appt_date, exp_start_str)
+                pos = len(active_ahead)
+                if start_dt and start_dt > ist_now:
+                    patient_start_dt = start_dt + timedelta(minutes=pos * per)
+                    patient_end_dt = patient_start_dt + timedelta(minutes=WINDOW_WIDTH_MINUTES)
+                    expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
+                    eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60))
+                else:
+                    expected_turn_time = "Session in queue. Waiting for consultation to begin."
+                    eta_minutes = 0
+            else:
+                expected_turn_time = "Consultation session ended"
+                eta_minutes = 0
         elif session_status == "paused" or doc_status == "paused":
             exp_resume_str = session.get("expected_resume_time")
             resume_dt = parse_time_to_ist_dt(appt_date, exp_resume_str) if exp_resume_str else None
@@ -4114,15 +4135,20 @@ async def doctor_profile(user: dict = Depends(require_role("doctor"))):
 @app.get("/doctor/appointments")
 async def doctor_appointments(
     date: Optional[str] = None,
+    doctor_id: Optional[str] = None,
     user: dict = Depends(require_role("doctor", "admin", "owner", "developer"))
 ):
-    d = await db.doctors.find_one({"user_id": user["id"]})
-    if not d:
+    doc_id = doctor_id
+    if not doc_id:
+        d = await db.doctors.find_one({"$or": [{"user_id": user["id"]}, {"id": user.get("doctor_id", user["id"])}, {"id": user["id"]}]})
+        if d:
+            doc_id = d["id"]
+    if not doc_id:
         return []
     today = get_ist_now().strftime("%Y-%m-%d")
     target_date = date or today
     appts = await db.appointments.find(
-        {"doctor_id": d["id"], "date": target_date, "status": {"$ne": "cancelled"}},
+        {"doctor_id": doc_id, "date": target_date, "status": {"$ne": "cancelled"}},
         {"_id": 0},
     ).sort("token_number", 1).to_list(500)
     # Batch-fetch missing patient addresses to eliminate N+1 queries
@@ -5003,9 +5029,6 @@ async def start_doctor_session(
     session_date = body.date or get_ist_now().strftime("%Y-%m-%d")
     session = await get_or_create_doctor_session(doctor_id, session_date)
 
-    if session.get("status") == "completed":
-        raise HTTPException(status_code=400, detail="Session is already completed")
-
     actual_time = format_ist_12hr()
     updated = await db.doctor_sessions.find_one_and_update(
         {"id": session["id"]},
@@ -5018,6 +5041,7 @@ async def start_doctor_session(
                 "paused_at": None,
                 "expected_resume_time": None,
                 "pause_reason": None,
+                "ended_at": None,
                 "updated_at": now_iso(),
             },
             "$inc": {"version": 1},
@@ -6248,9 +6272,11 @@ async def reception_queue(
     if user_id:
         doc_query_conditions.append({"receptionist_id": user_id})
         doc_query_conditions.append({"receptionist_ids": user_id})
+        doc_query_conditions.append({"user_id": user_id})
+        doc_query_conditions.append({"id": user_id})
 
     if doc_query_conditions:
-        docs = await db.doctors.find({"$or": doc_query_conditions}, {"id": 1, "hospital_id": 1, "receptionist_id": 1, "receptionist_ids": 1}).to_list(500)
+        docs = await db.doctors.find({"$or": doc_query_conditions}, {"id": 1, "hospital_id": 1, "receptionist_id": 1, "receptionist_ids": 1, "user_id": 1}).to_list(500)
         valid_doc_ids = [d["id"] for d in docs]
         if doctor_id:
             if valid_doc_ids and doctor_id not in valid_doc_ids:
@@ -6260,12 +6286,20 @@ async def reception_queue(
                 is_authorized = bool(doc_obj and (
                     (hid and doc_hosp == hid.upper()) or
                     (rec_doc_id and rec_doc_id == doctor_id) or
-                    (user_id and (doc_obj.get("receptionist_id") == user_id or user_id in (doc_obj.get("receptionist_ids") or [])))
+                    (user_id and (doc_obj.get("receptionist_id") == user_id or user_id in (doc_obj.get("receptionist_ids") or []) or doc_obj.get("user_id") == user_id or doc_obj.get("id") == user_id))
                 ))
                 if not is_authorized:
                     return []
             elif not valid_doc_ids:
-                return []
+                doc_obj = await db.doctors.find_one({"id": doctor_id})
+                doc_hosp = ((doc_obj or {}).get("hospital_id") or "").strip().upper()
+                is_authorized = bool(doc_obj and (
+                    (not hid) or (doc_hosp == hid.upper()) or
+                    (rec_doc_id and rec_doc_id == doctor_id) or
+                    (user_id and (doc_obj.get("receptionist_id") == user_id or user_id in (doc_obj.get("receptionist_ids") or []) or doc_obj.get("user_id") == user_id or doc_obj.get("id") == user_id))
+                ))
+                if not is_authorized:
+                    return []
             q["doctor_id"] = doctor_id
         else:
             q["doctor_id"] = {"$in": valid_doc_ids}
