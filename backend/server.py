@@ -6785,7 +6785,10 @@ async def emergency_insert(body: dict, user: dict = Depends(require_role("recept
     return doc
 
 
+@app.post("/api/reception/add-patient")
+@app.post("/reception/add-patient")
 @api_router.post("/reception/add-patient")
+@api_router.post("/api/reception/add-patient")
 async def reception_add_patient(body: AddPatientBody, user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner"))):
     """Receptionist adds a patient (with all details) and optionally books an appointment.
     Mobile number is optional for receptionist walk-in registrations.
@@ -6909,7 +6912,7 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
             "id": appt_id,
             "secure_token": secure_token,
             "doctor_id": body.doctor_id,
-            "doctor_name": doctor["full_name"],
+            "doctor_name": doctor.get("full_name") or doctor.get("name", "Doctor"),
             "hospital_id": hosp_id,
             "patient_id": patient_id,
             "patient_name": patient_name,
@@ -7334,6 +7337,7 @@ async def dev_test_sms(
 @app.websocket("/api/ws/queue/doctor/{doctor_id}")
 @app.websocket("/ws/queue/doctor/{doctor_id}")
 @api_router.websocket("/ws/queue/doctor/{doctor_id}")
+@api_router.websocket("/api/ws/queue/doctor/{doctor_id}")
 async def ws_doctor_queue(ws: WebSocket, doctor_id: str):
     channel = f"doctor:{doctor_id}"
     await manager.connect(channel, ws)
@@ -7360,9 +7364,23 @@ async def ws_doctor_queue(ws: WebSocket, doctor_id: str):
         await manager.disconnect(channel, ws)
 
 
+@app.get("/api/ws/queue/doctor/{doctor_id}")
+@app.get("/ws/queue/doctor/{doctor_id}")
+@api_router.get("/ws/queue/doctor/{doctor_id}")
+@api_router.get("/api/ws/queue/doctor/{doctor_id}")
+async def ws_doctor_queue_http_fallback(doctor_id: str):
+    """Informative response when a client connects via HTTP instead of WebSocket protocol (RFC 6455)."""
+    return JSONResponse(
+        status_code=status.HTTP_426_UPGRADE_REQUIRED,
+        content={"detail": "WebSocket Upgrade Required", "channel": f"doctor:{doctor_id}"},
+        headers={"Upgrade": "websocket", "Connection": "Upgrade"}
+    )
+
+
 @app.websocket("/api/ws/queue/appt/{appointment_id}")
 @app.websocket("/ws/queue/appt/{appointment_id}")
 @api_router.websocket("/ws/queue/appt/{appointment_id}")
+@api_router.websocket("/api/ws/queue/appt/{appointment_id}")
 async def ws_appt_queue(ws: WebSocket, appointment_id: str):
     channel = f"appt:{appointment_id}"
     await manager.connect(channel, ws)
@@ -7387,6 +7405,19 @@ async def ws_appt_queue(ws: WebSocket, appointment_id: str):
     finally:
         hb_task.cancel()
         await manager.disconnect(channel, ws)
+
+
+@app.get("/api/ws/queue/appt/{appointment_id}")
+@app.get("/ws/queue/appt/{appointment_id}")
+@api_router.get("/ws/queue/appt/{appointment_id}")
+@api_router.get("/api/ws/queue/appt/{appointment_id}")
+async def ws_appt_queue_http_fallback(appointment_id: str):
+    """Informative response when a client connects via HTTP instead of WebSocket protocol (RFC 6455)."""
+    return JSONResponse(
+        status_code=status.HTTP_426_UPGRADE_REQUIRED,
+        content={"detail": "WebSocket Upgrade Required", "channel": f"appt:{appointment_id}"},
+        headers={"Upgrade": "websocket", "Connection": "Upgrade"}
+    )
 
 
 # ============ DOCTOR SELF-UPDATE ============
