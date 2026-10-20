@@ -1446,19 +1446,139 @@ async def get_or_create_default_clinic_session(doctor_id: str, date: str, hospit
     return saved or default_session
 
 
+async def safe_db_find_one(collection, filter_dict, projection=None):
+    """Safely executes find_one on a collection or mock collection, supporting coroutines and dicts."""
+    if collection is None:
+        return None
+    find_fn = getattr(collection, "find_one", None)
+    if not callable(find_fn):
+        return None
+    try:
+        res = find_fn(filter_dict) if projection is None else find_fn(filter_dict, projection)
+        if asyncio.iscoroutine(res):
+            return await res
+        if isinstance(res, dict):
+            return res
+        return None
+    except Exception:
+        return None
+
+
 async def resolve_clinic_session_id(doctor_id: str, date: str, session_id: Optional[str], hospital_id: Optional[str] = None) -> Optional[str]:
     """
-    If session_id is explicitly given, return it (after verifying it exists).
-    Otherwise return the default (first) session's ID for that doctor+date.
+    If session_id is explicitly given, return it (after verifying it exists and belongs to doctor_id).
+    Supports:
+    1. Existing sessions in db.clinic_sessions.
+    2. Sessions created via Doctor Session Manager in db.doctor_schedule_configs (date-specific or recurring).
+    3. Synthesized default sessions ending in '_default' (safely validated against doctor existence and hospital context).
+    Otherwise returns the default (first) session's ID for that doctor+date.
     Returns None only if no sessions exist and default creation fails.
     """
     if session_id:
-        sess = await db.clinic_sessions.find_one({"id": session_id, "doctor_id": doctor_id})
-        if not sess:
-            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
-        return session_id
+        clean_sid = str(session_id).strip()
+        if not clean_sid:
+            default = await get_or_create_default_clinic_session(doctor_id, date, hospital_id)
+            return default.get("id")
+
+        # 1. Synthesized default session check (e.g. "<doctor_id>_default")
+        if clean_sid.endswith("_default"):
+            doc = await safe_db_find_one(getattr(db, "doctors", None), {"id": doctor_id}, {"_id": 0, "id": 1, "hospital_id": 1})
+            if not doc:
+                raise HTTPException(status_code=404, detail="Doctor not found")
+            expected_prefix = f"{doctor_id}_default"
+            if clean_sid != expected_prefix:
+                raise HTTPException(status_code=403, detail="Default session does not belong to requested doctor")
+            default = await get_or_create_default_clinic_session(doctor_id, date, hospital_id or doc.get("hospital_id"))
+            return default.get("id") or clean_sid
+
+        # 2. Check in db.clinic_sessions (legacy & date-specific instances)
+        cs_sess = await safe_db_find_one(getattr(db, "clinic_sessions", None), {"id": clean_sid, "doctor_id": doctor_id})
+        if cs_sess:
+            return clean_sid
+
+        # 3. Check in db.doctor_schedule_configs (Doctor Session Manager sessions)
+        sched_sess = await safe_db_find_one(getattr(db, "doctor_schedule_configs", None), {"id": clean_sid, "doctor_id": doctor_id})
+        if sched_sess:
+            # Check hospital context if provided
+            if hospital_id and sched_sess.get("clinic_id") and sched_sess["clinic_id"] != hospital_id:
+                doc = await safe_db_find_one(getattr(db, "doctors", None), {"id": doctor_id}, {"_id": 0, "hospital_id": 1})
+                if doc and doc.get("hospital_id") and doc["hospital_id"] != hospital_id:
+                    raise HTTPException(status_code=403, detail="Session does not belong to specified hospital")
+
+            # Validate date schedule eligibility
+            date_type = sched_sess.get("date_type")
+            if date_type == "date":
+                sess_date = sched_sess.get("date")
+                if sess_date and sess_date != date:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Session '{sched_sess.get('session_name', 'Session')}' is scheduled for {sess_date}, not {date}."
+                    )
+            elif date_type == "recurring":
+                try:
+                    weekday_name = datetime.strptime(date, "%Y-%m-%d").strftime("%A")
+                except Exception:
+                    weekday_name = get_ist_now().strftime("%A")
+                days_of_week = sched_sess.get("days_of_week") or []
+                if days_of_week and weekday_name not in days_of_week:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Session '{sched_sess.get('session_name', 'Session')}' is not scheduled on {weekday_name}."
+                    )
+
+            # Check date overrides for cancellation / closure
+            overrides = sched_sess.get("date_overrides") or {}
+            date_override = overrides.get(date)
+            if date_override and date_override.get("status") in ("cancelled", "closed"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Session '{sched_sess.get('session_name', 'Session')}' is {date_override.get('status')} on {date}."
+                )
+
+            # Idempotently ensure an adapter record exists in db.clinic_sessions
+            try:
+                existing_cs = await safe_db_find_one(getattr(db, "clinic_sessions", None), {"id": clean_sid})
+                if not existing_cs and hasattr(db, "clinic_sessions") and hasattr(db.clinic_sessions, "update_one"):
+                    max_sess = await safe_db_find_one(
+                        getattr(db, "clinic_sessions", None),
+                        {"doctor_id": doctor_id, "date": date},
+                    )
+                    next_num = (max_sess.get("session_number", 0) if max_sess else 0) + 1
+                    h_id = hospital_id or sched_sess.get("clinic_id") or "default"
+                    await db.clinic_sessions.update_one(
+                        {"id": clean_sid},
+                        {"$setOnInsert": {
+                            "id": clean_sid,
+                            "doctor_id": doctor_id,
+                            "hospital_id": h_id,
+                            "date": date,
+                            "session_number": next_num,
+                            "session_name": sched_sess.get("session_name", "Consultation Session"),
+                            "start_time": sched_sess.get("start_time", "10:00 AM"),
+                            "end_time": sched_sess.get("end_time", "06:00 PM"),
+                            "status": "not_started",
+                            "actual_start_time": None,
+                            "actual_end_time": None,
+                            "created_at": now_iso(),
+                            "updated_at": now_iso(),
+                        }},
+                        upsert=True,
+                    )
+            except Exception:
+                pass
+
+            return clean_sid
+
+        # Check if session exists under another doctor (ownership security violation)
+        other_sess = await safe_db_find_one(getattr(db, "clinic_sessions", None), {"id": clean_sid}) or await safe_db_find_one(getattr(db, "doctor_schedule_configs", None), {"id": clean_sid})
+        if other_sess:
+            raise HTTPException(status_code=403, detail="Session does not belong to the requested doctor")
+
+        raise HTTPException(status_code=404, detail=f"Session not found: {clean_sid}")
+
     default = await get_or_create_default_clinic_session(doctor_id, date, hospital_id)
     return default.get("id")
+
 
 
 # Field projections for high-performance live ETA calculations
@@ -3402,11 +3522,18 @@ async def create_appointment(
     if resolved_session_id:
         dup_filter["session_id"] = resolved_session_id
 
-    existing_appointment = await db.appointments.find_one(dup_filter, {"_id": 1})
+    existing_appointment = await db.appointments.find_one(dup_filter, {"_id": 1, "session_id": 1, "session_name": 1})
     if existing_appointment:
+        sess_name_found = existing_appointment.get("session_name")
+        if not sess_name_found and existing_appointment.get("session_id"):
+            es = await safe_db_find_one(getattr(db, "doctor_schedule_configs", None), {"id": existing_appointment["session_id"]}, {"_id": 0, "session_name": 1})
+            if not es:
+                es = await safe_db_find_one(getattr(db, "clinic_sessions", None), {"id": existing_appointment["session_id"]}, {"_id": 0, "session_name": 1})
+            sess_name_found = es.get("session_name") if es else None
+        existing_sess_name = f" in '{sess_name_found}'" if sess_name_found else " for this doctor/session"
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="You already have an active appointment for this doctor/session."
+            detail=f"You already have an active appointment{existing_sess_name}."
         )
 
     # ── Session & location-based booking window validation ───────────────────
@@ -3466,7 +3593,9 @@ async def create_appointment(
     # Fetch session name for display if not already resolved from schedule config
     sess_name = None
     if resolved_session_id:
-        cs = await db.clinic_sessions.find_one({"id": resolved_session_id}, {"_id": 0, "session_name": 1})
+        cs = await safe_db_find_one(getattr(db, "doctor_schedule_configs", None), {"id": resolved_session_id}, {"_id": 0, "session_name": 1})
+        if not cs:
+            cs = await safe_db_find_one(getattr(db, "clinic_sessions", None), {"id": resolved_session_id}, {"_id": 0, "session_name": 1})
         if cs:
             sess_name = cs.get("session_name")
     if not session_name:
@@ -6552,12 +6681,17 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
         if resolved_session_id:
             dup_filter["session_id"] = resolved_session_id
 
-        existing_appointment = await db.appointments.find_one(dup_filter, {"_id": 1, "session_id": 1})
+        existing_appointment = await db.appointments.find_one(dup_filter, {"_id": 1, "session_id": 1, "session_name": 1})
         if existing_appointment:
             existing_sess_name = ""
-            if existing_appointment.get("session_id"):
-                es = await db.clinic_sessions.find_one({"id": existing_appointment["session_id"]}, {"_id": 0, "session_name": 1})
-                existing_sess_name = f" in {es.get('session_name', 'that session')}" if es else ""
+            sess_name_found = existing_appointment.get("session_name")
+            if not sess_name_found and existing_appointment.get("session_id"):
+                es = await safe_db_find_one(getattr(db, "doctor_schedule_configs", None), {"id": existing_appointment["session_id"]}, {"_id": 0, "session_name": 1})
+                if not es:
+                    es = await safe_db_find_one(getattr(db, "clinic_sessions", None), {"id": existing_appointment["session_id"]}, {"_id": 0, "session_name": 1})
+                sess_name_found = es.get("session_name") if es else None
+            if sess_name_found:
+                existing_sess_name = f" in '{sess_name_found}'"
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"This patient already has an active appointment{existing_sess_name} for today."
@@ -6565,22 +6699,29 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
 
         token_number = await allocate_next_token_for_session(hosp_id, body.doctor_id, appt_date, resolved_session_id)
 
-        # Fetch session name for display
-        sess_name = "Walk-in"
-        if resolved_session_id:
-            cs = await db.clinic_sessions.find_one({"id": resolved_session_id}, {"_id": 0, "session_name": 1, "start_time": 1, "end_time": 1})
+        # Fetch session name for display from doctor_schedule_configs or clinic_sessions
+        target_sid = resolved_session_id or getattr(body, "session_id", None)
+        session_name = None
+        clinic_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
+        if target_sid and not str(target_sid).endswith("_default"):
+            sess_doc = await safe_db_find_one(getattr(db, "doctor_schedule_configs", None), {"id": target_sid}, {"_id": 0, "session_name": 1, "clinic_name": 1})
+            if sess_doc:
+                session_name = sess_doc.get("session_name")
+                if sess_doc.get("clinic_name"):
+                    clinic_name = sess_doc["clinic_name"]
+
+        if not session_name and target_sid:
+            cs = await safe_db_find_one(getattr(db, "clinic_sessions", None), {"id": target_sid}, {"_id": 0, "session_name": 1, "start_time": 1, "end_time": 1})
             if cs:
-                sess_name = cs.get("session_name") or "Walk-in"
+                session_name = cs.get("session_name")
+
+        sess_name = session_name or "Walk-in"
         appt_id = str(uuid.uuid4())
         secure_token = secrets.token_urlsafe(16)
 
-        session_name = None
-        clinic_name = doctor.get("hospital_name") or doctor.get("clinic_name") or "MeriBaari Clinic"
-        if getattr(body, "session_id", None) and not body.session_id.endswith("_default"):
-            sess_doc = await db.doctor_schedule_configs.find_one({"id": body.session_id})
-            if sess_doc:
-                session_name = sess_doc.get("session_name")
-                clinic_name = sess_doc.get("clinic_name") or clinic_name
+        effective_slot = body.slot
+        if not effective_slot or effective_slot == "Walk-in":
+            effective_slot = session_name or (body.slot or "Walk-in")
 
         appt = {
             "id": appt_id,
@@ -6593,9 +6734,9 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
             "patient_mobile": mobile,
             "patient_address": body.address,
             "date": appt_date,
-            "slot": body.slot or sess_name or "Walk-in",
-            "session_id": resolved_session_id or getattr(body, "session_id", None),
-            "session_name": session_name or (sess_name if resolved_session_id else None),
+            "slot": effective_slot,
+            "session_id": target_sid,
+            "session_name": session_name or (sess_name if target_sid else None),
             "booking_window_id": getattr(body, "booking_window_id", None),
             "clinic_name": clinic_name,
             "patient_city": getattr(body, "patient_city", None),

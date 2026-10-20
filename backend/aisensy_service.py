@@ -66,8 +66,7 @@ def get_aisensy_otp_campaign_name() -> str:
         or os.environ.get("AISENSY_CAMPAIGN_NAME")
         or "Meribaari_otp_api"
     ).strip().strip("'\"")
-    # Automatically map known legacy or misspelled campaign names to the live approved campaign
-    if raw_name.lower() in ("meribari", "meribaari", "meribaari_otp", "meribari_otp", ""):
+    if not raw_name:
         return "Meribaari_otp_api"
     return raw_name
 
@@ -90,10 +89,10 @@ def get_aisensy_appt_campaign_name() -> str:
         or os.environ.get("AISENSY_CAMPAIGN_NAME")
         or "Meribaari_appointment_api"
     ).strip().strip("'\"")
-    # Automatically map known legacy or misspelled campaign names to the live approved campaign
-    if raw_name.lower() in ("meribaari_appointment", "meribari_appointment", "meribaari_utility", ""):
+    if not raw_name:
         return "Meribaari_appointment_api"
     return raw_name
+
 
 
 def get_aisensy_endpoint() -> str:
