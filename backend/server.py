@@ -134,21 +134,34 @@ app.add_middleware(GZipMiddleware, minimum_size=500)  # Enable gzip compression 
 BACKEND_VERSION = os.environ.get("RENDER_GIT_COMMIT", os.environ.get("COMMIT_REF", "1.0.0"))[:8]
 
 # Explicit production origins and configurable origins from environment
-PROD_ORIGINS = [
+raw_prod_origins = [
     "https://www.meribaariapp.in",
     "https://meribaariapp.in",
 ]
 _env_origins = os.environ.get("ALLOWED_ORIGINS", "").strip()
+_allow_all_by_env = False
 if _env_origins:
-    PROD_ORIGINS.extend([o.strip() for o in _env_origins.split(",") if o.strip()])
+    for o in _env_origins.split(","):
+        stripped = o.strip()
+        if stripped == "*":
+            _allow_all_by_env = True
+        elif stripped:
+            raw_prod_origins.append(stripped)
 
-# Allow local development (localhost, 127.0.0.1, LAN private IPs: 10.x, 172.16-31.x, 192.168.x) and Vercel preview domains
-DEV_ORIGIN_REGEX = r"^(https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)(:\d+)?|https://.*\.vercel\.app)$"
+# Never include "*" in allow_origins when allow_credentials=True,
+# because W3C Fetch spec rejects "Access-Control-Allow-Origin: *" combined with credentials.
+clean_prod_origins = list(dict.fromkeys([o for o in raw_prod_origins if o and o != "*"]))
+
+# Allow local development (localhost, 127.0.0.1, LAN private IPs), Vercel preview domains, and meribaariapp.in
+if _allow_all_by_env:
+    origin_regex = r"^https?://.*$"
+else:
+    origin_regex = r"^(https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)(:\d+)?|https://.*\.vercel\.app|https://([a-zA-Z0-9-]+\.)*meribaariapp\.in)$"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=PROD_ORIGINS,
-    allow_origin_regex=DEV_ORIGIN_REGEX,
+    allow_origins=clean_prod_origins,
+    allow_origin_regex=origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

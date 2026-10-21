@@ -36,7 +36,25 @@ export function isPrivateDevHost(hostname: string): boolean {
 }
 
 export function getBackendBase(): string {
-  // 1. Explicitly configured backend URL
+  // 1. Web browser resolution
+  if (Platform.OS === "web" && typeof window !== "undefined") {
+    const { hostname, protocol } = window.location;
+    // Local / LAN development web: resolve backend to laptop host on port 8000
+    if (protocol === "http:" && isPrivateDevHost(hostname)) {
+      return `http://${hostname}:8000`;
+    }
+    // Deployed web (e.g. Vercel at https://www.meribaariapp.in or preview) -> use relative path
+    // because vercel.json proxies /api to Render backend without cross-origin CORS overhead
+    if (
+      hostname === "www.meribaariapp.in" ||
+      hostname === "meribaariapp.in" ||
+      hostname.endsWith(".vercel.app")
+    ) {
+      return "";
+    }
+  }
+
+  // 2. Explicitly configured backend URL
   if (process.env.EXPO_PUBLIC_BACKEND_URL) {
     const raw = process.env.EXPO_PUBLIC_BACKEND_URL.trim();
     if (raw) {
@@ -56,15 +74,8 @@ export function getBackendBase(): string {
     }
   }
 
-  // 2. Web browser resolution
+  // 3. Web browser fallback for HTTPS
   if (Platform.OS === "web" && typeof window !== "undefined") {
-    const { hostname, protocol } = window.location;
-    // Local / LAN development web: resolve backend to laptop host on port 8000
-    if (protocol === "http:" && isPrivateDevHost(hostname)) {
-      return `http://${hostname}:8000`;
-    }
-    // Deployed web (e.g. Vercel at https://www.meribaariapp.in) -> use relative path
-    // because vercel.json proxies /api to Render backend
     return "";
   }
 
