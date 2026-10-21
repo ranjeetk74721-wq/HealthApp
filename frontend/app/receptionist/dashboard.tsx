@@ -159,6 +159,7 @@ export default function ReceptionistDashboard() {
   const wsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestIdRef = useRef(0);
   const sessionReqIdRef = useRef(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const pollingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isFetchingRef = useRef(false);
   const hasPendingUpdateRef = useRef(false);
@@ -238,6 +239,15 @@ export default function ReceptionistDashboard() {
     }
   }, []);
 
+  // Cleanup abort controller on component unmount
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, []);
+
   // 1. Fetch Doctor List independently (separation of discovery from queue refresh)
   const fetchDoctors = useCallback(async (silent = false) => {
     if (!silent) {
@@ -304,6 +314,13 @@ export default function ReceptionistDashboard() {
     }
     isFetchingRef.current = true;
 
+    // Abort previous in-flight request if this is a user-initiated change/retry
+    if (!silent && abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const currentAbortController = new AbortController();
+    abortControllerRef.current = currentAbortController;
+
     const curReqId = ++requestIdRef.current;
     const curSessReqId = ++sessionReqIdRef.current;
 
@@ -326,10 +343,26 @@ export default function ReceptionistDashboard() {
 
     try {
       const [qRes, sessResult, sumRes, confSessRes] = await Promise.allSettled([
-        api.get(`/reception/queue?doctor_id=${doctorId}&date=${targetDate}`, { bypassCache: true, timeoutMs: 12000 }),
-        api.get(`/doctor/${doctorId}/session?date=${targetDate}`, { bypassCache: true, timeoutMs: 10000 }),
-        api.get(`/appointments/calendar-summary?doctor_id=${doctorId}`, { bypassCache: true, timeoutMs: 12000 }),
-        api.get(`/doctor/${doctorId}/sessions?date=${targetDate}&target_date=${targetDate}`, { bypassCache: true, timeoutMs: 12000 }),
+        api.get(`/reception/queue?doctor_id=${doctorId}&date=${targetDate}`, {
+          signal: currentAbortController.signal,
+          bypassCache: true,
+          timeoutMs: 20000,
+        }),
+        api.get(`/doctor/${doctorId}/session?date=${targetDate}`, {
+          signal: currentAbortController.signal,
+          bypassCache: true,
+          timeoutMs: 15000,
+        }),
+        api.get(`/appointments/calendar-summary?doctor_id=${doctorId}`, {
+          signal: currentAbortController.signal,
+          bypassCache: true,
+          timeoutMs: 15000,
+        }),
+        api.get(`/doctor/${doctorId}/sessions?date=${targetDate}&target_date=${targetDate}`, {
+          signal: currentAbortController.signal,
+          bypassCache: true,
+          timeoutMs: 15000,
+        }),
       ]);
 
       clearTimeout(slowTimer);
@@ -342,11 +375,23 @@ export default function ReceptionistDashboard() {
         setQueueError(null);
       } else {
         const qErr = qRes.reason;
+        if (qErr?.name === "AbortError") {
+          return; // Superceded by a newer request
+        }
         if (qErr?.status === 401 || (qErr?.message && (qErr.message.includes("401") || qErr.message.includes("expired")))) {
           await handleAuthExpired();
           return;
         }
-        setQueueError(qErr?.message || "Failed to load patient queue");
+        // Preserve previously loaded queue data during temporary refresh failure
+        if (queue.length > 0) {
+          setIsStale(true);
+        } else {
+          setQueueError(
+            qErr?.message?.includes("timed out")
+              ? "The queue request timed out due to a slow connection. Tap retry below to reload."
+              : (qErr?.message || "Failed to load patient queue")
+          );
+        }
       }
 
       // 2. Session handling: isolate 403, error, empty, and success
@@ -362,6 +407,7 @@ export default function ReceptionistDashboard() {
           }
         } else {
           const errReason = sessResult.reason;
+          if (errReason?.name === "AbortError") return;
           const errMsg = errReason?.message || "";
           const is401 = errReason?.status === 401 || errMsg.includes("401") || errMsg.includes("authenticated") || errMsg.includes("expired");
           if (is401) {
@@ -403,6 +449,7 @@ export default function ReceptionistDashboard() {
     } catch (err: any) {
       clearTimeout(slowTimer);
       if (curReqId !== requestIdRef.current) return;
+      if (err?.name === "AbortError") return;
       setIsStale(true);
       const is401 = err?.status === 401 || (err?.message && (err.message.includes("401") || err.message.includes("authenticated") || err.message.includes("expired")));
       if (is401) {
@@ -425,7 +472,7 @@ export default function ReceptionistDashboard() {
         }
       }
     }
-  }, [docSession, handleAuthExpired]);
+  }, [queue, docSession, handleAuthExpired]);
   useEffect(() => { refreshDoctorDataRef.current = refreshDoctorData; }, [refreshDoctorData]);
 
   // Dedicated Retry for session alone without reloading entire dashboard
@@ -1156,6 +1203,10 @@ export default function ReceptionistDashboard() {
                   testID={`select-doc-${d.id}`}
                   onPress={() => {
                     if (d.id !== selectedDoc) {
+                      if (abortControllerRef.current) {
+                        abortControllerRef.current.abort();
+                      }
+                      isFetchingRef.current = false;
                       setQueue([]);
                       setDocSession(null);
                       setSessionState({ status: "idle" });
@@ -1420,18 +1471,22 @@ export default function ReceptionistDashboard() {
                 <Pressable
                   testID="retry-queue-btn"
                   onPress={() => {
+                    setQueueError(null);
+                    setRefreshing(true);
                     if (selectedDocRef.current) {
                       refreshDoctorData(selectedDocRef.current, selectedDateRef.current, false);
                     }
                   }}
                   style={{
                     backgroundColor: "#DC2626",
-                    paddingHorizontal: 16,
-                    paddingVertical: 10,
+                    paddingHorizontal: 18,
+                    paddingVertical: 12,
                     borderRadius: 8,
+                    minHeight: 44,
                     flexDirection: "row",
                     alignItems: "center",
-                    gap: 6,
+                    justifyContent: "center",
+                    gap: 8,
                   }}
                 >
                   <Ionicons name="refresh" size={16} color="#fff" />
@@ -1836,10 +1891,16 @@ export default function ReceptionistDashboard() {
                 summaryData={summaryData}
                 selectedDate={selectedDate}
                 onSelectDate={(date) => {
-                  setSelectedDate(date);
-                  selectedDateRef.current = date;
-                  if (selectedDocRef.current) {
-                    refreshDoctorData(selectedDocRef.current, date, false);
+                  if (date !== selectedDate) {
+                    if (abortControllerRef.current) {
+                      abortControllerRef.current.abort();
+                    }
+                    isFetchingRef.current = false;
+                    setSelectedDate(date);
+                    selectedDateRef.current = date;
+                    if (selectedDocRef.current) {
+                      refreshDoctorData(selectedDocRef.current, date, false);
+                    }
                   }
                 }}
               />
@@ -1862,7 +1923,17 @@ export default function ReceptionistDashboard() {
       ) : null}
 
       {/* ── FABs (Add Patient & Emergency) ── */}
-      <View style={[styles.fabRow, { bottom: Math.max(insets.bottom + 12, 20) }]} pointerEvents="box-none">
+      <View
+        style={[
+          styles.fabRow,
+          {
+            bottom: Math.max(insets.bottom + 12, 20),
+            left: Math.max(insets.left + 16, 16),
+            right: Math.max(insets.right + 16, 16),
+          },
+        ]}
+        pointerEvents="box-none"
+      >
         <Pressable
           testID="add-patient-btn"
           disabled={addLoading || !selectedDoc}
@@ -2384,7 +2455,8 @@ const styles = StyleSheet.create({
   },
   filterChip: {
     paddingHorizontal: spacing.md,
-    paddingVertical: 6,
+    paddingVertical: 8,
+    minHeight: 38,
     borderRadius: radius.pill,
     backgroundColor: colors.surface,
     borderWidth: 1,
@@ -2522,7 +2594,7 @@ const styles = StyleSheet.create({
   iconBtn: { width: 40, height: 40, borderRadius: radius.pill, backgroundColor: colors.surface, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.border },
   docPickerWrap: { paddingBottom: spacing.sm, borderBottomWidth: 1, borderBottomColor: colors.divider, backgroundColor: colors.surfaceSecondary },
   docPickerRow: { gap: spacing.sm, paddingHorizontal: spacing.lg },
-  docChip: { flexShrink: 0, paddingHorizontal: spacing.md, height: 36, justifyContent: "center", borderRadius: radius.pill, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border, maxWidth: 200 },
+  docChip: { flexShrink: 0, paddingHorizontal: spacing.md, height: 40, minHeight: 40, justifyContent: "center", borderRadius: radius.pill, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border, maxWidth: 220 },
   docChipActive: { backgroundColor: colors.brandPrimary, borderColor: colors.brandPrimary },
   docChipText: { fontSize: font.sm, color: colors.onSurface, fontWeight: "500" },
   kpiRow: {
@@ -2568,10 +2640,12 @@ const styles = StyleSheet.create({
   manageShiftsBtn: {
     backgroundColor: colors.brandPrimary,
     paddingHorizontal: spacing.md,
-    paddingVertical: 8,
+    paddingVertical: 10,
+    minHeight: 44,
     borderRadius: radius.md,
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "center",
     gap: 6,
   },
   sectionHeaderRow: {
@@ -2667,8 +2741,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     backgroundColor: colors.brandPrimary,
     borderRadius: radius.sm,
-    paddingVertical: 9,
-    paddingHorizontal: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    minHeight: 44,
     gap: 6,
   },
   primaryActionBtnLabel: {
@@ -2684,9 +2759,10 @@ const styles = StyleSheet.create({
   actionColBtn: {
     flex: 1,
     minWidth: 70,
+    minHeight: 44,
     alignItems: "center",
     justifyContent: "center",
-    paddingVertical: 7,
+    paddingVertical: 8,
     paddingHorizontal: 8,
     borderRadius: radius.sm,
     borderWidth: 1,
@@ -2700,8 +2776,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     backgroundColor: "#059669",
     borderRadius: radius.sm,
-    paddingVertical: 10,
+    paddingVertical: 12,
     paddingHorizontal: 14,
+    minHeight: 44,
     gap: 8,
   },
   actionColBtnLabel: {
@@ -2790,8 +2867,8 @@ const styles = StyleSheet.create({
   fabRow: {
     position: "absolute",
     bottom: 24,
-    left: 20,
-    right: 20,
+    left: 16,
+    right: 16,
     flexDirection: "row",
     justifyContent: "space-between",
     gap: spacing.sm,
@@ -2800,6 +2877,7 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.md,
+    minHeight: 48,
     borderRadius: radius.pill,
     flexDirection: "row",
     alignItems: "center",

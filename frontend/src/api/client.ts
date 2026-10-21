@@ -474,6 +474,13 @@ async function request(path: string, opts: RequestOpts = {}, retryCount = 0): Pr
 
     if (opts.timeoutMs && opts.timeoutMs > 0) {
       const controller = new AbortController();
+      if (opts.signal) {
+        if (opts.signal.aborted) {
+          controller.abort();
+        } else {
+          opts.signal.addEventListener("abort", () => controller.abort(), { once: true });
+        }
+      }
       signal = controller.signal;
       timeoutId = setTimeout(() => {
         didTimeout = true;
@@ -484,10 +491,20 @@ async function request(path: string, opts: RequestOpts = {}, retryCount = 0): Pr
     try {
       res = await fetch(url, { ...opts, headers, signal });
     } catch (err: any) {
-      if (didTimeout || err?.name === "AbortError") {
+      if (didTimeout) {
+        // Safe transient retry for idempotent GET requests on timeout (e.g. Render spin-up or mobile network switch)
+        if (method === "GET" && retryCount < 1) {
+          await new Promise((r) => setTimeout(r, 1000));
+          return request(path, opts, retryCount + 1);
+        }
         throw new TimeoutError(
           `Request to ${cleanPath} timed out after ${opts.timeoutMs}ms. Please check your connection.`,
         );
+      }
+
+      if (err?.name === "AbortError") {
+        // Caller cancelled request (e.g. doctor or date changed)
+        throw err;
       }
 
       // Safe transient retry for idempotent GET requests (handles mobile network switch or Render cold-start)

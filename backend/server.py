@@ -243,6 +243,9 @@ async def ensure_db_indexes():
             db.doctors.create_index([("id", 1)], unique=True),
             db.doctors.create_index([("user_id", 1)]),
             db.doctors.create_index([("hospital_id", 1)]),
+            db.doctors.create_index([("hospital_code", 1)]),
+            db.doctors.create_index([("receptionist_id", 1)]),
+            db.doctors.create_index([("receptionist_ids", 1)]),
             db.doctors.create_index([("specialty", 1)]),
             db.doctors.create_index([("city", 1)]),
             # appointments indexes for high-frequency calendar & queue queries
@@ -6287,6 +6290,8 @@ async def auto_refer_queue(body: AutoReferBody, user: dict = Depends(require_rol
     }
 
 
+_last_unserved_rollover_ts: float = 0.0
+
 # ============ RECEPTIONIST endpoints ============
 @api_router.get("/reception/queue")
 async def reception_queue(
@@ -6294,6 +6299,7 @@ async def reception_queue(
     date: Optional[str] = None,
     user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer"))
 ):
+    global _last_unserved_rollover_ts
     today = get_ist_now().strftime("%Y-%m-%d")
     target_date = date or today
     target_date_clean = str(target_date).split("T")[0].strip()
@@ -6301,7 +6307,9 @@ async def reception_queue(
     # Rollover check for day-end: mark any past date unfinished appointments as 'unserved'
     # Requirement: "At day-end, move the previous day’s queue out of today’s active view while preserving history.
     # Unfinished appointments must remain identifiable as unserved or unfinished; never automatically mark them completed."
-    if target_date_clean == today:
+    # Throttled to at most once every 10 minutes to avoid continuous full-collection write scans on every GET request
+    if target_date_clean == today and (time.time() - _last_unserved_rollover_ts > 600):
+        _last_unserved_rollover_ts = time.time()
         try:
             await db.appointments.update_many(
                 {"date": {"$lt": today}, "status": {"$in": ["booked", "arrived"]}},
@@ -6312,45 +6320,15 @@ async def reception_queue(
 
     date_values = list(dict.fromkeys([target_date, target_date_clean, f"{target_date_clean}T00:00:00"]))
     q: dict = {"date": {"$in": date_values} if len(date_values) > 1 else target_date_clean}
-    doc_query_conditions = []
     hid = (user.get("hospital_id") or user.get("hospital_code") or "").strip()
-    if hid:
-        doc_query_conditions.extend([
-            {"hospital_id": hid},
-            {"hospital_id": hid.upper()},
-            {"hospital_id": hid.lower()},
-            {"hospital_id": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}},
-            {"hospital_code": hid},
-            {"hospital_code": hid.upper()},
-            {"hospital_code": hid.lower()},
-            {"hospital_code": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}},
-        ])
-    rec_doc_id = user.get("doctor_id") or user.get("assigned_doctor_id")
-    if rec_doc_id:
-        doc_query_conditions.append({"id": rec_doc_id})
-        doc_query_conditions.append({"user_id": rec_doc_id})
-    user_id = user.get("id")
-    if user_id:
-        doc_query_conditions.append({"receptionist_id": user_id})
-        doc_query_conditions.append({"receptionist_ids": user_id})
-        doc_query_conditions.append({"user_id": user_id})
-        doc_query_conditions.append({"id": user_id})
-
-    valid_doc_ids = []
-    if doc_query_conditions:
-        docs = await db.doctors.find(
-            {"$or": doc_query_conditions},
-            {"id": 1, "hospital_id": 1, "hospital_code": 1, "receptionist_id": 1, "receptionist_ids": 1, "user_id": 1}
-        ).to_list(500)
-        for d in docs:
-            if d.get("id"): valid_doc_ids.append(d["id"])
-            if d.get("user_id"): valid_doc_ids.append(d["user_id"])
-
     clean_doc_id = doctor_id.strip() if doctor_id and doctor_id.strip() not in ("undefined", "null") else None
+
     if clean_doc_id:
         doc_obj = await db.doctors.find_one({"$or": [{"id": clean_doc_id}, {"user_id": clean_doc_id}]})
         doc_ids = list(filter(None, [clean_doc_id, doc_obj.get("id") if doc_obj else None, doc_obj.get("user_id") if doc_obj else None]))
         doc_hosp = (((doc_obj or {}).get("hospital_id") or (doc_obj or {}).get("hospital_code")) or "").strip().upper()
+        rec_doc_id = user.get("doctor_id") or user.get("assigned_doctor_id")
+        user_id = user.get("id")
         is_authorized = bool(doc_obj and (
             (hid and hid.upper() == doc_hosp) or
             (rec_doc_id and rec_doc_id in doc_ids) or
@@ -6360,8 +6338,40 @@ async def reception_queue(
         if not is_authorized:
             return []
         q["doctor_id"] = {"$in": doc_ids} if len(doc_ids) > 1 else clean_doc_id
-    elif valid_doc_ids:
-        q["doctor_id"] = {"$in": valid_doc_ids}
+    else:
+        doc_query_conditions = []
+        if hid:
+            doc_query_conditions.extend([
+                {"hospital_id": hid},
+                {"hospital_id": hid.upper()},
+                {"hospital_id": hid.lower()},
+                {"hospital_code": hid},
+                {"hospital_code": hid.upper()},
+                {"hospital_code": hid.lower()},
+            ])
+        rec_doc_id = user.get("doctor_id") or user.get("assigned_doctor_id")
+        if rec_doc_id:
+            doc_query_conditions.append({"id": rec_doc_id})
+            doc_query_conditions.append({"user_id": rec_doc_id})
+        user_id = user.get("id")
+        if user_id:
+            doc_query_conditions.append({"receptionist_id": user_id})
+            doc_query_conditions.append({"receptionist_ids": user_id})
+            doc_query_conditions.append({"user_id": user_id})
+            doc_query_conditions.append({"id": user_id})
+
+        valid_doc_ids = []
+        if doc_query_conditions:
+            docs = await db.doctors.find(
+                {"$or": doc_query_conditions},
+                {"id": 1, "hospital_id": 1, "hospital_code": 1, "receptionist_id": 1, "receptionist_ids": 1, "user_id": 1}
+            ).to_list(500)
+            for d in docs:
+                if d.get("id"): valid_doc_ids.append(d["id"])
+                if d.get("user_id"): valid_doc_ids.append(d["user_id"])
+
+        if valid_doc_ids:
+            q["doctor_id"] = {"$in": valid_doc_ids}
 
     appts = await db.appointments.find(q, {"_id": 0}).sort([("queue_order", 1), ("token_number", 1)]).to_list(500)
 
@@ -6382,7 +6392,10 @@ async def reception_queue(
     if missing_pids:
         try:
             users = await db.users.find({"id": {"$in": missing_pids}}, {"_id": 0, "id": 1, "address": 1}).to_list(len(missing_pids))
-            user_address_map = {u["id"]: u["address"] for u in users if u.get("address")}
+            user_address_map = {u["id"]: u.get("address") for u in users}
+            for pid in missing_pids:
+                if pid not in user_address_map:
+                    user_address_map[pid] = None
         except Exception:
             pass
 
@@ -6395,6 +6408,9 @@ async def reception_queue(
                 if d.get("fees") is not None:
                     if d.get("id"): doc_fee_map[d["id"]] = d["fees"]
                     if d.get("user_id"): doc_fee_map[d["user_id"]] = d["fees"]
+            for did in doc_ids_needed:
+                if did not in doc_fee_map:
+                    doc_fee_map[did] = 0
         except Exception:
             pass
 
@@ -6411,6 +6427,18 @@ async def reception_queue(
             sess_ids = [f"{did}_{target_date_clean}" for did in unique_doc_ids]
             sess_records = await db.doctor_sessions.find({"id": {"$in": sess_ids}}, SESSION_ETA_PROJECTION).to_list(len(sess_ids))
             session_cache = {s["id"]: s for s in sess_records}
+            # Pre-initialize missing sessions once so calculate_appointment_eta does not trigger sequential queries
+            for did in unique_doc_ids:
+                s_key = f"{did}_{target_date_clean}"
+                if s_key not in session_cache:
+                    s_created = await get_or_create_doctor_session(
+                        did,
+                        target_date_clean,
+                        doctor=doctor_cache.get(did),
+                        existing_appts=appts,
+                    )
+                    if s_created:
+                        session_cache[s_key] = s_created
         except Exception:
             pass
 
@@ -6418,24 +6446,11 @@ async def reception_queue(
     for a in appts:
         if not a.get("patient_address") and a.get("patient_id"):
             if a["patient_id"] in user_address_map:
-                a["patient_address"] = user_address_map[a["patient_id"]]
-            else:
-                try:
-                    u = await db.users.find_one({"id": a["patient_id"]}, {"_id": 0, "address": 1})
-                    if u and u.get("address"):
-                        a["patient_address"] = u["address"]
-                except Exception:
-                    pass
+                if user_address_map[a["patient_id"]]:
+                    a["patient_address"] = user_address_map[a["patient_id"]]
         if a.get("payment_amount") is None and a.get("doctor_id"):
-            if a["doctor_id"] in doc_fee_map:
+            if a["doctor_id"] in doc_fee_map and doc_fee_map[a["doctor_id"]]:
                 a["payment_amount"] = doc_fee_map[a["doctor_id"]]
-            else:
-                try:
-                    doc_fee = await db.doctors.find_one({"$or": [{"id": a["doctor_id"]}, {"user_id": a["doctor_id"]}]}, {"_id": 0, "fees": 1})
-                    if doc_fee and doc_fee.get("fees") is not None:
-                        a["payment_amount"] = doc_fee["fees"]
-                except Exception:
-                    pass
         if not a.get("payment_status"):
             a["payment_status"] = "pending"
 
