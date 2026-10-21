@@ -18,7 +18,8 @@
     "lint": "eslint app src",
     "typecheck": "tsc --noEmit",
     "doctor": "npx expo-doctor",
-    "test": "npm run lint && npm run typecheck"
+    "test:updates": "node ./scripts/test-update-synchronization.js",
+    "test": "npm run lint && npm run typecheck && npm run test:updates"
   },
   "dependencies": {
     "@expo/metro-runtime": "6.1.2",

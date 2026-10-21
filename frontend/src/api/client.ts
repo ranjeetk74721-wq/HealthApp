@@ -137,6 +137,15 @@ interface CacheEntry {
 const _cache: Map<string, CacheEntry> = new Map();
 const _inFlight: Map<string, Promise<any>> = new Map();
 
+// Active in-flight mutation tracker: prevents automatic reloads during submissions
+let _activeMutationsCount = 0;
+export function isMutationInFlight(): boolean {
+  return _activeMutationsCount > 0;
+}
+if (typeof window !== "undefined") {
+  (window as any).__MERIBAARI_MUTATION_IN_FLIGHT__ = () => _activeMutationsCount > 0;
+}
+
 // 30 seconds for static metadata (specialties, clinic profiles)
 const STATIC_CACHE_TTL_MS = 30_000;
 // 2 seconds for real-time operational queues & appointments to eliminate duplicate parallel fetches while guaranteeing fresh data
@@ -281,8 +290,10 @@ export function getTargetedInvalidationPrefixes(path: string, _method: string): 
     cleanPath === "/reception/auto-refer" ||
     cleanPath === "/reception/add-patient" ||
     cleanPath === "/reception/reorder" ||
-    /^\/appointments\/[^/]+\/(?:cancel|patient-details|reschedule|refer)$/.test(cleanPath) ||
-    /^\/reception\/(?:mark_arrived|arrive|start_consultation|complete|skip|rejoin|unskip|cancel|call|no-show)$/.test(cleanPath) ||
+    cleanPath === "/reception/correct_status" ||
+    cleanPath === "/api/reception/correct_status" ||
+    /^\/appointments\/[^/]+\/(?:cancel|patient-details|reschedule|refer|correct-status)$/.test(cleanPath) ||
+    /^\/reception\/(?:mark_arrived|arrive|start_consultation|complete|skip|rejoin|unskip|cancel|call|no-show|correct_status)$/.test(cleanPath) ||
     /^\/reception\/appointments\/[^/]+\/send-link$/.test(cleanPath) ||
     /^\/doctor\/(?:call|complete|no-show|skip|unskip|prescription|auto-refer)$/.test(cleanPath)
   ) {
@@ -571,7 +582,12 @@ async function request(path: string, opts: RequestOpts = {}, retryCount = 0): Pr
     }
   }
 
-  return await exec();
+  _activeMutationsCount++;
+  try {
+    return await exec();
+  } finally {
+    _activeMutationsCount = Math.max(0, _activeMutationsCount - 1);
+  }
 }
 
 export const api = {

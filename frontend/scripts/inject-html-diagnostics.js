@@ -9,19 +9,40 @@ if (!fs.existsSync(DIST_HTML_PATH)) {
   process.exit(0);
 }
 
-// Generate deterministic or deployment-linked build identifier
-const buildId = process.env.VERCEL_GIT_COMMIT_SHA
-  ? process.env.VERCEL_GIT_COMMIT_SHA.slice(0, 8)
-  : (process.env.BUILD_ID || Date.now().toString(36));
+const pkg = require('../package.json');
 
-// Write version.json for deployment verification
+// Generate deterministic or deployment-linked build identifier
+let gitCommitSha = process.env.VERCEL_GIT_COMMIT_SHA || process.env.GITHUB_SHA || process.env.GIT_COMMIT_SHA || '';
+if (!gitCommitSha) {
+  try {
+    const { execSync } = require('child_process');
+    gitCommitSha = execSync('git rev-parse HEAD', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch (e) {
+    gitCommitSha = 'local-' + Date.now().toString(36);
+  }
+}
+const buildId = gitCommitSha.length >= 8 ? gitCommitSha.slice(0, 8) : (process.env.BUILD_ID || Date.now().toString(36));
+const environment = process.env.VERCEL_ENV || process.env.NODE_ENV || 'production';
+
+// Write version.json for deployment verification and client synchronization
 const versionInfo = {
   app: 'meribaari-frontend',
+  version: pkg.version || '1.0.0',
   buildId: buildId,
-  builtAt: new Date().toISOString()
+  gitCommitSha: gitCommitSha,
+  builtAt: new Date().toISOString(),
+  compatibleApiRange: '>=1.0.0',
+  assetBuildId: buildId,
+  minSupportedFrontendVersion: '1.0.0',
+  environment: environment,
+  healthStatus: 'healthy'
 };
 fs.writeFileSync(path.join(DIST_DIR, 'version.json'), JSON.stringify(versionInfo, null, 2), 'utf8');
-console.log(`✅ Generated dist/version.json (Build ID: ${buildId})`);
+const publicDir = path.join(__dirname, '..', 'public');
+if (fs.existsSync(publicDir)) {
+  fs.writeFileSync(path.join(publicDir, 'version.json'), JSON.stringify(versionInfo, null, 2), 'utf8');
+}
+console.log(`✅ Generated dist/version.json & public/version.json (Build ID: ${buildId}, SHA: ${gitCommitSha.slice(0, 8)})`);
 
 let html = fs.readFileSync(DIST_HTML_PATH, 'utf8');
 

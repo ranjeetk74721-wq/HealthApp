@@ -278,9 +278,158 @@ export default function RootLayout() {
     let checkTimer: any = null;
     const currentBuildId = (window as any).__MERIBAARI_BUILD_ID__;
 
+    const isSafeToAutoReload = (): boolean => {
+      if (typeof document === "undefined") return true;
+
+      // 1. Check if an API mutation (booking, registration, status change, billing) is in flight
+      if (typeof (window as any).__MERIBAARI_MUTATION_IN_FLIGHT__ === "function") {
+        if ((window as any).__MERIBAARI_MUTATION_IN_FLIGHT__()) {
+          return false;
+        }
+      }
+
+      // 2. Check if user is typing or has focus in an input, textarea, or contentEditable element
+      const activeEl = document.activeElement;
+      if (
+        activeEl &&
+        (activeEl.tagName === "INPUT" ||
+          activeEl.tagName === "TEXTAREA" ||
+          (activeEl as HTMLElement).isContentEditable)
+      ) {
+        return false;
+      }
+
+      // 3. Check for any visible text inputs or textareas containing unsaved user input
+      try {
+        const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input, textarea");
+        for (let i = 0; i < inputs.length; i++) {
+          const el = inputs[i];
+          if (
+            (el.type === "text" || el.type === "tel" || el.type === "number" || el.tagName === "TEXTAREA") &&
+            el.value &&
+            el.value.trim().length > 0 &&
+            el.offsetParent !== null
+          ) {
+            return false;
+          }
+        }
+      } catch {}
+
+      // 4. Check for active consultation or unsaved form explicit flags
+      if (
+        (window as any).__MERIBAARI_ACTIVE_CONSULTATION__ ||
+        (window as any).__MERIBAARI_UNSAVED_FORM__
+      ) {
+        return false;
+      }
+
+      // 5. Check if a modal dialog is open
+      const modal = document.querySelector('[role="dialog"], [aria-modal="true"], .modal, .modal-open');
+      if (modal) return false;
+
+      return true;
+    };
+
+    const showUpdateBanner = (applyUpdateFn: () => void) => {
+      if (typeof document === "undefined" || document.getElementById("mb-update-banner")) return;
+      const banner = document.createElement("div");
+      banner.id = "mb-update-banner";
+      banner.style.position = "fixed";
+      banner.style.bottom = "24px";
+      banner.style.right = "24px";
+      banner.style.zIndex = "999999";
+      banner.style.backgroundColor = "#0F172A";
+      banner.style.color = "#FFFFFF";
+      banner.style.padding = "14px 18px";
+      banner.style.borderRadius = "12px";
+      banner.style.boxShadow = "0 10px 25px -5px rgba(0, 0, 0, 0.4)";
+      banner.style.display = "flex";
+      banner.style.alignItems = "center";
+      banner.style.gap = "14px";
+      banner.style.fontFamily = "system-ui, -apple-system, sans-serif";
+      banner.style.fontSize = "13px";
+      banner.style.maxWidth = "400px";
+
+      banner.innerHTML = `
+        <div style="flex: 1;">
+          <div style="font-weight: 600; font-size: 13px; margin-bottom: 2px;">⚡ Update Ready</div>
+          <div style="font-size: 12px; color: #94A3B8;">A new version is available. Update when convenient.</div>
+        </div>
+        <button id="mb-update-btn" style="background-color: #0284C7; color: white; border: none; padding: 6px 12px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer;">
+          Update Now
+        </button>
+        <button id="mb-dismiss-btn" style="background: transparent; color: #94A3B8; border: none; font-size: 15px; cursor: pointer; padding: 0 4px;">
+          ✕
+        </button>
+      `;
+
+      document.body.appendChild(banner);
+
+      document.getElementById("mb-update-btn")?.addEventListener("click", applyUpdateFn);
+      document.getElementById("mb-dismiss-btn")?.addEventListener("click", () => banner.remove());
+    };
+
+    const applyUpdate = async () => {
+      const now = Date.now();
+      safeSessionStorageSet("mb_version_reload_ts", now.toString());
+      if ("caches" in window) {
+        try {
+          const keys = await caches.keys();
+          await Promise.all(keys.map((k) => caches.delete(k)));
+        } catch {}
+      }
+      window.location.reload();
+    };
+
+    const verifyReleaseReady = async (serverBuildId: string): Promise<boolean> => {
+      try {
+        const res = await fetch(`/version.json?_t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) return false;
+        const manifest = await res.json();
+        if (manifest.buildId !== serverBuildId || manifest.healthStatus !== "healthy") {
+          return false;
+        }
+        const headRes = await fetch("/", { method: "HEAD", cache: "no-store" });
+        return headRes.ok;
+      } catch {
+        return false;
+      }
+    };
+
+    // Coordinate updates across tabs
+    const broadcastChannel =
+      typeof BroadcastChannel !== "undefined"
+        ? new BroadcastChannel("meribaari_release_channel")
+        : null;
+
+    if (broadcastChannel) {
+      broadcastChannel.onmessage = async (event) => {
+        const data = event.data || {};
+        if (data.type === "NEW_VERSION_AVAILABLE" && data.serverBuildId && data.serverBuildId !== currentBuildId) {
+          const lastReload = safeSessionStorageGet("mb_version_reload_ts");
+          const now = Date.now();
+          if (!lastReload || now - parseInt(lastReload, 10) > 30000) {
+            if (isSafeToAutoReload()) {
+              await applyUpdate();
+            } else {
+              showUpdateBanner(applyUpdate);
+            }
+          }
+        }
+      };
+    }
+
     const checkForUpdates = async () => {
       try {
-        const res = await fetch(`/version.json?_t=${Date.now()}`, {
+        // Prevent excessive network traffic across multiple tabs
+        const lastCheck = safeSessionStorageGet("mb_last_check_ts");
+        const now = Date.now();
+        if (lastCheck && now - parseInt(lastCheck, 10) < 45000) {
+          return;
+        }
+        safeSessionStorageSet("mb_last_check_ts", now.toString());
+
+        const res = await fetch(`/version.json?_t=${now}`, {
           cache: "no-store",
           headers: { "Cache-Control": "no-cache", "Pragma": "no-cache" },
         });
@@ -288,21 +437,26 @@ export default function RootLayout() {
         const info = await res.json();
         const serverBuildId = info?.buildId;
         if (serverBuildId && currentBuildId && serverBuildId !== currentBuildId) {
+          const isReady = await verifyReleaseReady(serverBuildId);
+          if (!isReady) return;
+
           const lastReload = safeSessionStorageGet("mb_version_reload_ts");
-          const now = Date.now();
           if (!lastReload || now - parseInt(lastReload, 10) > 30000) {
-            safeSessionStorageSet("mb_version_reload_ts", now.toString());
-            if ("caches" in window) {
+            if (broadcastChannel) {
               try {
-                const keys = await caches.keys();
-                await Promise.all(keys.map((k) => caches.delete(k)));
+                broadcastChannel.postMessage({ type: "NEW_VERSION_AVAILABLE", serverBuildId });
               } catch {}
             }
-            window.location.reload();
+
+            if (isSafeToAutoReload()) {
+              await applyUpdate();
+            } else {
+              showUpdateBanner(applyUpdate);
+            }
           }
         }
       } catch {
-        // Network unavailable or offline, ignore
+        // Network unavailable or offline, ignore gracefully
       }
     };
 
@@ -324,6 +478,7 @@ export default function RootLayout() {
       clearTimeout(initialTimer);
       window.removeEventListener("focus", checkForUpdates);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
+      if (broadcastChannel) broadcastChannel.close();
     };
   }, []);
 

@@ -5,7 +5,8 @@ services:
     region: singapore
     plan: free
     buildCommand: pip install -r requirements-prod.txt
-    startCommand: gunicorn server:app -w 2 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120 --forwarded-allow-ips='*'
+    # Run single-worker to ensure in-memory WebSocket ConnectionManager broadcast consistency
+    startCommand: gunicorn server:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120 --forwarded-allow-ips='*'
     rootDir: backend
     envVars:
       - key: MONGO_URL

@@ -154,7 +154,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-api_router = APIRouter(prefix="/api")
+api_router = APIRouter()
 security = HTTPBearer(auto_error=False)
 
 from fastapi.exceptions import RequestValidationError
@@ -299,11 +299,17 @@ async def api_health_check():
 
 
 @api_router.get("/version")
+@app.get("/version")
+@app.get("/api/version")
 async def get_version():
     return {
         "service": "meribaari-api",
         "version": BACKEND_VERSION,
         "database": "connected",
+        "api_contract_version": "v1.0",
+        "compatible_frontend_range": ">=1.0.0",
+        "environment": os.environ.get("ENVIRONMENT", "production"),
+        "timestamp": now_iso(),
     }
 
 Role = Literal["patient", "doctor", "receptionist", "owner", "admin"]
@@ -1726,6 +1732,7 @@ async def calculate_appointment_eta(
     doctor: Optional[dict] = None,
     session: Optional[dict] = None,
     schedule_config: Optional[dict] = None,
+    existing_appts: Optional[List[dict]] = None,
 ) -> dict:
     """Calculate live queue metrics and latest estimated turn time for an appointment."""
     doctor_id = appt["doctor_id"]
@@ -1739,52 +1746,56 @@ async def calculate_appointment_eta(
 
     session_id = f"{doctor_id}_{appt_date}"
 
-    # Build independent concurrent read tasks
-    appts_coro = db.appointments.find(
-        appt_q,
-        APPOINTMENT_ETA_PROJECTION,
-    ).sort([("queue_order", 1), ("token_number", 1)]).to_list(500)
-
-    doc_coro = (
-        db.doctors.find_one({"id": doctor_id}, DOCTOR_ETA_PROJECTION)
-        if doctor is None
-        else None
-    )
-
-    sess_coro = (
-        db.doctor_sessions.find_one({"id": session_id}, SESSION_ETA_PROJECTION)
-        if session is None and hasattr(db, "doctor_sessions") and hasattr(db.doctor_sessions, "find_one")
-        else None
-    )
-
-    sched_coro = (
-        db.doctor_schedule_configs.find_one({"id": appt_session_id}, {"_id": 0, "start_time": 1, "date_overrides": 1})
-        if (schedule_config is None and has_custom_schedule and hasattr(db, "doctor_schedule_configs") and hasattr(db.doctor_schedule_configs, "find_one"))
-        else None
-    )
-
     pending_tasks = []
     task_keys = []
 
-    pending_tasks.append(appts_coro)
-    task_keys.append("all_appts")
+    # If existing appointments are already provided in memory, avoid expensive redundant DB queries
+    if existing_appts is None:
+        appts_coro = db.appointments.find(
+            appt_q,
+            APPOINTMENT_ETA_PROJECTION,
+        ).sort([("queue_order", 1), ("token_number", 1)]).to_list(500)
+        pending_tasks.append(appts_coro)
+        task_keys.append("all_appts")
 
-    if doc_coro is not None:
+    if doc_coro := (
+        db.doctors.find_one({"id": doctor_id}, DOCTOR_ETA_PROJECTION)
+        if doctor is None
+        else None
+    ):
         pending_tasks.append(doc_coro)
         task_keys.append("doctor")
 
-    if sess_coro is not None:
+    if sess_coro := (
+        db.doctor_sessions.find_one({"id": session_id}, SESSION_ETA_PROJECTION)
+        if session is None and hasattr(db, "doctor_sessions") and hasattr(db.doctor_sessions, "find_one")
+        else None
+    ):
         pending_tasks.append(sess_coro)
         task_keys.append("session")
 
-    if sched_coro is not None:
+    if sched_coro := (
+        db.doctor_schedule_configs.find_one({"id": appt_session_id}, {"_id": 0, "start_time": 1, "date_overrides": 1})
+        if (schedule_config is None and has_custom_schedule and hasattr(db, "doctor_schedule_configs") and hasattr(db.doctor_schedule_configs, "find_one"))
+        else None
+    ):
         pending_tasks.append(sched_coro)
         task_keys.append("schedule_config")
 
-    gathered_results = await asyncio.gather(*pending_tasks)
-    gathered_map = dict(zip(task_keys, gathered_results))
+    if pending_tasks:
+        gathered_results = await asyncio.gather(*pending_tasks)
+        gathered_map = dict(zip(task_keys, gathered_results))
+    else:
+        gathered_map = {}
 
-    all_appts = gathered_map["all_appts"]
+    if existing_appts is not None:
+        if has_custom_schedule:
+            all_appts = [a for a in existing_appts if a.get("session_id") == appt_session_id and a.get("status") != "cancelled"]
+        else:
+            all_appts = [a for a in existing_appts if a.get("status") != "cancelled"]
+    else:
+        all_appts = gathered_map.get("all_appts", [])
+
     if doctor is None:
         doctor = gathered_map.get("doctor")
     if session is None:
@@ -2925,7 +2936,6 @@ async def me(user: dict = Depends(get_current_user)):
 
 
 @api_router.post("/hospital/validate-id")
-@api_router.post("/api/hospital/validate-id")
 @app.post("/api/hospital/validate-id")
 @app.post("/hospital/validate-id")
 async def validate_hospital_id(body: ValidateHospitalIdBody):
@@ -2971,7 +2981,6 @@ async def validate_hospital_id(body: ValidateHospitalIdBody):
 
 
 @api_router.post("/hospital/login")
-@api_router.post("/api/hospital/login")
 @app.post("/api/hospital/login")
 @app.post("/hospital/login")
 async def hospital_login(body: HospitalLoginBody):
@@ -3014,7 +3023,6 @@ async def hospital_login(body: HospitalLoginBody):
 
 
 @api_router.get("/hospital/details")
-@api_router.get("/api/hospital/details")
 @app.get("/api/hospital/details")
 @app.get("/hospital/details")
 async def hospital_details(hospital_id: str):
@@ -3879,7 +3887,6 @@ async def cancel_appointment(appt_id: str, user: dict = Depends(get_current_user
 
 
 @api_router.get("/appointments/{appt_id}/patient-details")
-@api_router.get("/api/appointments/{appt_id}/patient-details")
 @app.get("/api/appointments/{appt_id}/patient-details")
 @app.get("/appointments/{appt_id}/patient-details")
 async def get_patient_details(
@@ -3940,8 +3947,6 @@ async def get_patient_details(
 
 @api_router.put("/appointments/{appt_id}/patient-details")
 @api_router.patch("/appointments/{appt_id}/patient-details")
-@api_router.put("/api/appointments/{appt_id}/patient-details")
-@api_router.patch("/api/appointments/{appt_id}/patient-details")
 @app.put("/api/appointments/{appt_id}/patient-details")
 @app.patch("/api/appointments/{appt_id}/patient-details")
 @app.put("/appointments/{appt_id}/patient-details")
@@ -4143,7 +4148,6 @@ async def doctor_profile(user: dict = Depends(require_role("doctor"))):
 
 
 @api_router.get("/doctor/appointments")
-@api_router.get("/api/doctor/appointments")
 @app.get("/api/doctor/appointments")
 @app.get("/doctor/appointments")
 async def doctor_appointments(
@@ -6351,6 +6355,20 @@ async def reception_queue(
         except Exception:
             pass
 
+    # Pre-fetch doctor and session once to eliminate N+1 database queries in queue loop
+    unique_doc_ids = list({a["doctor_id"] for a in appts if a.get("doctor_id")})
+    doctor_cache = {}
+    session_cache = {}
+    if unique_doc_ids:
+        try:
+            doc_records = await db.doctors.find({"id": {"$in": unique_doc_ids}}, DOCTOR_ETA_PROJECTION).to_list(len(unique_doc_ids))
+            doctor_cache = {d["id"]: d for d in doc_records}
+            sess_ids = [f"{did}_{target_date}" for did in unique_doc_ids]
+            sess_records = await db.doctor_sessions.find({"id": {"$in": sess_ids}}, SESSION_ETA_PROJECTION).to_list(len(sess_ids))
+            session_cache = {s["id"]: s for s in sess_records}
+        except Exception:
+            pass
+
     # Enrich appointments with real-time dynamic ETAs and patient details
     for a in appts:
         if not a.get("patient_address") and a.get("patient_id"):
@@ -6378,7 +6396,15 @@ async def reception_queue(
 
         if a.get("status") in ("booked", "arrived", "in_consultation", "skipped"):
             try:
-                eta_data = await calculate_appointment_eta(a)
+                d_id = a.get("doctor_id")
+                d_obj = doctor_cache.get(d_id)
+                s_obj = session_cache.get(f"{d_id}_{target_date}")
+                eta_data = await calculate_appointment_eta(
+                    a,
+                    doctor=d_obj,
+                    session=s_obj,
+                    existing_appts=appts,
+                )
                 a["expected_turn_time"] = eta_data.get("expected_turn_time")
                 a["expected_time"] = eta_data.get("expected_turn_time")
                 a["eta_minutes"] = eta_data.get("eta_minutes", 0)
@@ -6612,9 +6638,7 @@ async def reception_cancel_appointment(body: QueueActionBody, user: dict = Depen
 @app.post("/api/appointments/{appt_id}/correct-status")
 @app.post("/appointments/{appt_id}/correct-status")
 @api_router.post("/reception/correct_status")
-@api_router.post("/api/reception/correct_status")
 @api_router.post("/appointments/{appt_id}/correct-status")
-@api_router.post("/api/appointments/{appt_id}/correct-status")
 async def correct_appointment_status(
     body: CorrectStatusBody,
     appt_id: Optional[str] = None,
@@ -6840,7 +6864,6 @@ async def emergency_insert(body: dict, user: dict = Depends(require_role("recept
 @app.post("/api/reception/add-patient")
 @app.post("/reception/add-patient")
 @api_router.post("/reception/add-patient")
-@api_router.post("/api/reception/add-patient")
 async def reception_add_patient(body: AddPatientBody, user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner"))):
     """Receptionist adds a patient (with all details) and optionally books an appointment.
     Mobile number is optional for receptionist walk-in registrations.
@@ -7062,7 +7085,6 @@ async def reception_add_patient(body: AddPatientBody, user: dict = Depends(requi
 @app.post("/api/reception/appointments/{appt_id}/send-link")
 @app.post("/reception/appointments/{appt_id}/send-link")
 @api_router.post("/reception/appointments/{appt_id}/send-link")
-@api_router.post("/api/reception/appointments/{appt_id}/send-link")
 async def reception_send_appointment_link(
     appt_id: str,
     user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner")),
@@ -7154,7 +7176,6 @@ async def reception_send_appointment_link(
 
 # ============ EXCEL REPORT EXPORT ENDPOINT ============
 @api_router.get("/reception/export-excel")
-@api_router.get("/api/reception/export-excel")
 async def reception_export_excel(
     doctor_id: Optional[str] = None,
     date: Optional[str] = None,
@@ -7405,7 +7426,6 @@ async def dev_test_sms(
 @app.websocket("/api/ws/queue/doctor/{doctor_id}")
 @app.websocket("/ws/queue/doctor/{doctor_id}")
 @api_router.websocket("/ws/queue/doctor/{doctor_id}")
-@api_router.websocket("/api/ws/queue/doctor/{doctor_id}")
 async def ws_doctor_queue(ws: WebSocket, doctor_id: str):
     channel = f"doctor:{doctor_id}"
     await manager.connect(channel, ws)
@@ -7435,7 +7455,6 @@ async def ws_doctor_queue(ws: WebSocket, doctor_id: str):
 @app.get("/api/ws/queue/doctor/{doctor_id}")
 @app.get("/ws/queue/doctor/{doctor_id}")
 @api_router.get("/ws/queue/doctor/{doctor_id}")
-@api_router.get("/api/ws/queue/doctor/{doctor_id}")
 async def ws_doctor_queue_http_fallback(doctor_id: str):
     """Informative response when a client connects via HTTP instead of WebSocket protocol (RFC 6455)."""
     return JSONResponse(
@@ -7448,7 +7467,6 @@ async def ws_doctor_queue_http_fallback(doctor_id: str):
 @app.websocket("/api/ws/queue/appt/{appointment_id}")
 @app.websocket("/ws/queue/appt/{appointment_id}")
 @api_router.websocket("/ws/queue/appt/{appointment_id}")
-@api_router.websocket("/api/ws/queue/appt/{appointment_id}")
 async def ws_appt_queue(ws: WebSocket, appointment_id: str):
     channel = f"appt:{appointment_id}"
     await manager.connect(channel, ws)
@@ -7478,7 +7496,6 @@ async def ws_appt_queue(ws: WebSocket, appointment_id: str):
 @app.get("/api/ws/queue/appt/{appointment_id}")
 @app.get("/ws/queue/appt/{appointment_id}")
 @api_router.get("/ws/queue/appt/{appointment_id}")
-@api_router.get("/api/ws/queue/appt/{appointment_id}")
 async def ws_appt_queue_http_fallback(appointment_id: str):
     """Informative response when a client connects via HTTP instead of WebSocket protocol (RFC 6455)."""
     return JSONResponse(
@@ -7491,7 +7508,6 @@ async def ws_appt_queue_http_fallback(appointment_id: str):
 # ============ DOCTOR SELF-UPDATE ============
 @api_router.post("/doctor/update_profile")
 @api_router.put("/doctor/profile")
-@api_router.put("/api/doctor/profile")
 @app.put("/api/doctor/profile")
 async def doctor_update_profile(body: DoctorSelfUpdateBody, user: dict = Depends(require_role("doctor"))):
     doc = await db.doctors.find_one({"user_id": user["id"]})
@@ -7778,7 +7794,6 @@ async def owner_update_doctor(doctor_id: str, body: OwnerUpdateDoctorBody, user:
 
 
 @api_router.delete("/owner/doctors/{doctor_id}")
-@api_router.delete("/api/owner/doctors/{doctor_id}")
 async def owner_delete_doctor(doctor_id: str, user: dict = Depends(require_role("owner", "admin"))):
     doc_id = doctor_id.strip()
     d = await db.doctors.find_one({"$or": [{"id": doc_id}, {"user_id": doc_id}, {"email": doc_id.lower()}]})
@@ -7872,7 +7887,6 @@ async def update_hospital(hospital_id: str, body: dict, user: dict = Depends(req
 
 
 @api_router.delete("/owner/hospitals/{hospital_id}")
-@api_router.delete("/api/owner/hospitals/{hospital_id}")
 async def delete_hospital(hospital_id: str, user: dict = Depends(require_role("owner", "admin"))):
     hid = hospital_id.strip().upper()
     await db.hospitals.delete_many({"$or": [{"hospital_id": hid}, {"id": hospital_id}]})
@@ -7884,7 +7898,6 @@ async def delete_hospital(hospital_id: str, user: dict = Depends(require_role("o
 
 
 @api_router.get("/hospitals")
-@api_router.get("/api/hospitals")
 async def public_list_hospitals():
     return await db.hospitals.find({"status": {"$ne": "inactive"}}, {"_id": 0}).to_list(100)
 
@@ -7940,7 +7953,6 @@ async def owner_list_receptionists(user: dict = Depends(require_role("owner", "a
 
 
 @api_router.put("/owner/receptionists/{receptionist_id}")
-@api_router.put("/api/owner/receptionists/{receptionist_id}")
 async def owner_update_receptionist(receptionist_id: str, body: OwnerUpdateReceptionistBody, user: dict = Depends(require_role("owner", "admin"))):
     rec_id = receptionist_id.strip()
     r = await db.users.find_one({"$or": [{"id": rec_id}, {"email": rec_id.lower()}], "role": "receptionist"})
@@ -7981,7 +7993,6 @@ async def owner_update_receptionist(receptionist_id: str, body: OwnerUpdateRecep
 
 
 @api_router.delete("/owner/receptionists/{receptionist_id}")
-@api_router.delete("/api/owner/receptionists/{receptionist_id}")
 async def owner_delete_receptionist(receptionist_id: str, user: dict = Depends(require_role("owner", "admin"))):
     rec_id = receptionist_id.strip()
     r = await db.users.find_one({"$or": [{"id": rec_id}, {"email": rec_id.lower()}], "role": "receptionist"})
@@ -8004,7 +8015,6 @@ async def get_doctor_hospital_id(user: dict) -> str:
 
 
 @api_router.get("/doctor/receptionists")
-@api_router.get("/api/doctor/receptionists")
 async def doctor_list_receptionists(user: dict = Depends(require_role("doctor"))):
     hid = await get_doctor_hospital_id(user)
     recs = await db.users.find(
@@ -8020,7 +8030,6 @@ async def doctor_list_receptionists(user: dict = Depends(require_role("doctor"))
 
 
 @api_router.post("/doctor/add-receptionist")
-@api_router.post("/api/doctor/add-receptionist")
 async def doctor_add_receptionist(body: DoctorAddReceptionistBody, user: dict = Depends(require_role("doctor"))):
     existing = await db.users.find_one({"email": body.email.lower()})
     if existing:
@@ -8054,7 +8063,6 @@ async def doctor_add_receptionist(body: DoctorAddReceptionistBody, user: dict = 
 
 
 @api_router.get("/doctor/receptionists/{receptionist_id}")
-@api_router.get("/api/doctor/receptionists/{receptionist_id}")
 async def doctor_get_receptionist(receptionist_id: str, user: dict = Depends(require_role("doctor"))):
     hid = await get_doctor_hospital_id(user)
     rec_id = receptionist_id.strip()
@@ -8071,9 +8079,7 @@ async def doctor_get_receptionist(receptionist_id: str, user: dict = Depends(req
 
 
 @api_router.put("/doctor/receptionists/{receptionist_id}")
-@api_router.put("/api/doctor/receptionists/{receptionist_id}")
 @api_router.patch("/doctor/receptionists/{receptionist_id}")
-@api_router.patch("/api/doctor/receptionists/{receptionist_id}")
 async def doctor_update_receptionist(
     receptionist_id: str,
     body: DoctorUpdateReceptionistBody,
@@ -8145,7 +8151,6 @@ async def doctor_update_receptionist(
 
 
 @api_router.delete("/doctor/receptionists/{receptionist_id}")
-@api_router.delete("/api/doctor/receptionists/{receptionist_id}")
 async def doctor_delete_receptionist(receptionist_id: str, user: dict = Depends(require_role("doctor"))):
     hid = await get_doctor_hospital_id(user)
     rec_id = receptionist_id.strip()
@@ -8213,6 +8218,7 @@ async def seed_data():
     logger.info("Admin user verified and specialties terminology migrated.")
 
 
+app.include_router(api_router, prefix="/api")
 app.include_router(api_router)
 
 app.add_middleware(
