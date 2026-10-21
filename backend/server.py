@@ -67,10 +67,18 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+_MOTOR_CLIENT_KWARGS = {
+    "serverSelectionTimeoutMS": 10000,
+    "connectTimeoutMS": 10000,
+    "socketTimeoutMS": 15000,
+    "maxPoolSize": 50,
+    "minPoolSize": 5,
+    "retryWrites": True,
+}
+
 client = AsyncIOMotorClient(
     mongo_url,
-    serverSelectionTimeoutMS=2000,
-    connectTimeoutMS=2000,
+    **_MOTOR_CLIENT_KWARGS,
 )
 
 def get_database():
@@ -85,14 +93,12 @@ def get_database():
         if motor_loop.is_closed() or (current_loop and motor_loop != current_loop):
             client = AsyncIOMotorClient(
                 mongo_url,
-                serverSelectionTimeoutMS=2000,
-                connectTimeoutMS=2000,
+                **_MOTOR_CLIENT_KWARGS,
             )
     except Exception:
         client = AsyncIOMotorClient(
             mongo_url,
-            serverSelectionTimeoutMS=2000,
-            connectTimeoutMS=2000,
+            **_MOTOR_CLIENT_KWARGS,
         )
     return client[os.environ["DB_NAME"]]
 
