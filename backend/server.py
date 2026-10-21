@@ -18,6 +18,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Literal, Dict, Any, Tuple
 import uuid
+import time
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
@@ -1658,46 +1659,18 @@ SESSION_ETA_PROJECTION = {
 }
 
 
-async def get_or_create_doctor_session(
+def build_default_session_object(
     doctor_id: str,
     date: str,
     doctor: Optional[dict] = None,
     existing_appts: Optional[list] = None,
 ) -> dict:
-    """Fetch existing doctor session for given date or create and persist default session."""
+    """Construct an in-memory default doctor session object with zero database writes."""
     session_id = f"{doctor_id}_{date}"
-    if not hasattr(db, "doctor_sessions") or not hasattr(db.doctor_sessions, "find_one"):
-        return {
-            "id": session_id,
-            "doctor_id": doctor_id,
-            "date": date,
-            "original_start_time": "10:00 AM",
-            "expected_start_time": "10:00 AM",
-            "status": "not_started",
-            "version": 1,
-        }
-    session = await db.doctor_sessions.find_one({"id": session_id}, {"_id": 0})
-    if session:
-        return session
-
-    # Fetch doctor profile to seed original start time and hospital_id if not already supplied
-    if not doctor or not doctor.get("timings"):
-        doctor = await db.doctors.find_one(
-            {"id": doctor_id},
-            {"_id": 0, "timings": 1, "hospital_id": 1, "full_name": 1, "clinic_name": 1, "status": 1}
-        )
     timings = (doctor or {}).get("timings", "10:00 AM - 6:00 PM")
     orig_start = extract_session_start_time(timings)
     hospital_id = (doctor or {}).get("hospital_id")
-
-    # Check appointments for today if not already supplied
-    if existing_appts is None:
-        all_appts = await db.appointments.find(
-            {"doctor_id": doctor_id, "date": date, "status": {"$ne": "cancelled"}},
-            {"_id": 0, "status": 1}
-        ).to_list(500)
-    else:
-        all_appts = existing_appts
+    all_appts = existing_appts or []
 
     has_in_consult = any(a.get("status") == "in_consultation" for a in all_appts)
     has_completed = any(a.get("status") == "completed" for a in all_appts)
@@ -1711,7 +1684,7 @@ async def get_or_create_doctor_session(
     elif (doctor or {}).get("status") == "paused":
         init_status = "paused"
 
-    session = {
+    return {
         "id": session_id,
         "doctor_id": doctor_id,
         "hospital_id": hospital_id,
@@ -1732,6 +1705,40 @@ async def get_or_create_doctor_session(
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
+
+
+async def get_or_create_doctor_session(
+    doctor_id: str,
+    date: str,
+    doctor: Optional[dict] = None,
+    existing_appts: Optional[list] = None,
+) -> dict:
+    """Fetch existing doctor session for given date or create and persist default session."""
+    session_id = f"{doctor_id}_{date}"
+    if not hasattr(db, "doctor_sessions") or not hasattr(db.doctor_sessions, "find_one"):
+        return build_default_session_object(doctor_id, date, doctor=doctor, existing_appts=existing_appts)
+
+    session = await db.doctor_sessions.find_one({"id": session_id}, {"_id": 0})
+    if session:
+        return session
+
+    # Fetch doctor profile to seed original start time and hospital_id if not already supplied
+    if not doctor or not doctor.get("timings"):
+        doctor = await db.doctors.find_one(
+            {"id": doctor_id},
+            {"_id": 0, "timings": 1, "hospital_id": 1, "full_name": 1, "clinic_name": 1, "status": 1}
+        )
+
+    # Check appointments for today if not already supplied
+    if existing_appts is None:
+        all_appts = await db.appointments.find(
+            {"doctor_id": doctor_id, "date": date, "status": {"$ne": "cancelled"}},
+            {"_id": 0, "status": 1}
+        ).to_list(500)
+    else:
+        all_appts = existing_appts
+
+    session = build_default_session_object(doctor_id, date, doctor=doctor, existing_appts=all_appts)
     try:
         res = await db.doctor_sessions.update_one({"id": session_id}, {"$setOnInsert": session}, upsert=True)
         if getattr(res, "upserted_id", None) is not None:
@@ -1819,9 +1826,9 @@ async def calculate_appointment_eta(
     if schedule_config is None and has_custom_schedule:
         schedule_config = gathered_map.get("schedule_config")
 
-    # If doctor session document does not exist yet in database, create or initialize it
+    # If doctor session document does not exist yet in database, build in-memory session object with zero writes
     if not session:
-        session = await get_or_create_doctor_session(
+        session = build_default_session_object(
             doctor_id,
             appt_date,
             doctor=doctor,
@@ -6305,6 +6312,16 @@ async def auto_refer_queue(body: AutoReferBody, user: dict = Depends(require_rol
 
 _last_unserved_rollover_ts: float = 0.0
 
+async def _run_unserved_rollover(today: str):
+    """Background asynchronous task for day-end unserved appointment rollover without blocking reads."""
+    try:
+        await db.appointments.update_many(
+            {"date": {"$lt": today}, "status": {"$in": ["booked", "arrived"]}},
+            {"$set": {"status": "unserved", "unserved_at": now_iso()}}
+        )
+    except Exception as e:
+        logger.warning(f"[_run_unserved_rollover] error: {e}")
+
 # ============ RECEPTIONIST endpoints ============
 @api_router.get("/reception/queue")
 async def reception_queue(
@@ -6320,16 +6337,10 @@ async def reception_queue(
     # Rollover check for day-end: mark any past date unfinished appointments as 'unserved'
     # Requirement: "At day-end, move the previous day’s queue out of today’s active view while preserving history.
     # Unfinished appointments must remain identifiable as unserved or unfinished; never automatically mark them completed."
-    # Throttled to at most once every 10 minutes to avoid continuous full-collection write scans on every GET request
+    # Run asynchronously in background task to avoid blocking the HTTP read request path
     if target_date_clean == today and (time.time() - _last_unserved_rollover_ts > 600):
         _last_unserved_rollover_ts = time.time()
-        try:
-            await db.appointments.update_many(
-                {"date": {"$lt": today}, "status": {"$in": ["booked", "arrived"]}},
-                {"$set": {"status": "unserved", "unserved_at": now_iso()}}
-            )
-        except Exception:
-            pass
+        asyncio.create_task(_run_unserved_rollover(today))
 
     date_values = list(dict.fromkeys([target_date, target_date_clean, f"{target_date_clean}T00:00:00"]))
     q: dict = {"date": {"$in": date_values} if len(date_values) > 1 else target_date_clean}
@@ -6440,18 +6451,16 @@ async def reception_queue(
             sess_ids = [f"{did}_{target_date_clean}" for did in unique_doc_ids]
             sess_records = await db.doctor_sessions.find({"id": {"$in": sess_ids}}, SESSION_ETA_PROJECTION).to_list(len(sess_ids))
             session_cache = {s["id"]: s for s in sess_records}
-            # Pre-initialize missing sessions once so calculate_appointment_eta does not trigger sequential queries
+            # Pre-initialize missing sessions in-memory with zero database writes on read path
             for did in unique_doc_ids:
                 s_key = f"{did}_{target_date_clean}"
                 if s_key not in session_cache:
-                    s_created = await get_or_create_doctor_session(
+                    session_cache[s_key] = build_default_session_object(
                         did,
                         target_date_clean,
                         doctor=doctor_cache.get(did),
                         existing_appts=appts,
                     )
-                    if s_created:
-                        session_cache[s_key] = s_created
         except Exception:
             pass
 

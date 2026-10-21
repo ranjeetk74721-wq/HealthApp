@@ -80,6 +80,8 @@ export default function ReceptionistDashboard() {
 
   // Queue and Calendar state
   const [queue, setQueue] = useState<any[]>([]);
+  const queueRef = useRef<any[]>([]);
+  useEffect(() => { queueRef.current = queue; }, [queue]);
   const [queueError, setQueueError] = useState<string | null>(null);
   const [summaryData, setSummaryData] = useState<any[]>([]);
   const [selectedDate, setSelectedDate] = useState<string>(
@@ -371,8 +373,11 @@ export default function ReceptionistDashboard() {
 
       // 1. Queue handling
       if (qRes.status === "fulfilled") {
-        setQueue(qRes.value || []);
+        const fetchedQueue = qRes.value || [];
+        queueRef.current = fetchedQueue;
+        setQueue(fetchedQueue);
         setQueueError(null);
+        setIsStale(false);
       } else {
         const qErr = qRes.reason;
         if (qErr?.name === "AbortError") {
@@ -383,7 +388,7 @@ export default function ReceptionistDashboard() {
           return;
         }
         // Preserve previously loaded queue data during temporary refresh failure
-        if (queue.length > 0) {
+        if (queueRef.current.length > 0) {
           setIsStale(true);
         } else {
           setQueueError(
@@ -472,7 +477,7 @@ export default function ReceptionistDashboard() {
         }
       }
     }
-  }, [queue, docSession, handleAuthExpired]);
+  }, [docSession, handleAuthExpired]);
   useEffect(() => { refreshDoctorDataRef.current = refreshDoctorData; }, [refreshDoctorData]);
 
   // Dedicated Retry for session alone without reloading entire dashboard

@@ -521,3 +521,98 @@ async def test_reception_add_patient_success_and_duplicate(mock_db, monkeypatch)
     assert exc.value.status_code == 409
     assert "already has an active appointment" in exc.value.detail
 
+
+@pytest.mark.asyncio
+async def test_reception_queue_zero_writes_before_session_start(mock_db, monkeypatch):
+    """Verify that reception_queue performs ZERO database writes when session has not started,
+    and returns patient queue with valid ETAs and correct ordering."""
+    from server import reception_queue
+
+    # Doctor exists
+    mock_db.doctors.find_one = AsyncMock(return_value={
+        "id": "doc-1",
+        "hospital_id": "H1",
+        "full_name": "Dr. Mariya",
+        "status": "active",
+        "timings": "10:00 AM - 2:00 PM",
+    })
+    mock_db.doctors.find = MagicMock(return_value=MockCursor([{
+        "id": "doc-1",
+        "hospital_id": "H1",
+        "full_name": "Dr. Mariya",
+        "status": "active",
+        "timings": "10:00 AM - 2:00 PM",
+    }]))
+
+    # Appointments in queue for today
+    appts = [
+        {"id": "a-1", "doctor_id": "doc-1", "date": TEST_DATE, "token_number": 1, "queue_order": 1, "status": "booked", "patient_name": "Amit"},
+        {"id": "a-2", "doctor_id": "doc-1", "date": TEST_DATE, "token_number": 2, "queue_order": 2, "status": "booked", "patient_name": "Priya"},
+    ]
+    mock_db.appointments.find = MagicMock(return_value=MockCursor(appts))
+    mock_db.appointments.update_many = AsyncMock()
+
+    # Session is ABSENT from DB before session start
+    mock_db.doctor_sessions.find = MagicMock(return_value=MockCursor([]))
+    mock_db.doctor_sessions.find_one = AsyncMock(return_value=None)
+    mock_db.doctor_sessions.update_one = AsyncMock()
+
+    user = {"id": "rec-1", "role": "receptionist", "hospital_id": "H1"}
+    res = await reception_queue(doctor_id="doc-1", date=TEST_DATE, user=user)
+
+    # 1. Patients are returned in correct order
+    assert len(res) == 2
+    assert res[0]["token_number"] == 1
+    assert res[1]["token_number"] == 2
+
+    # 2. ZERO database writes on doctor_sessions during reception_queue read!
+    assert not mock_db.doctor_sessions.update_one.called
+
+    # 3. ETAs are calculated even without persisted session document
+    assert "expected_turn_time" in res[0]
+    assert "expected_turn_time" in res[1]
+
+
+@pytest.mark.asyncio
+async def test_reception_queue_after_session_start(mock_db, monkeypatch):
+    """Verify that reception_queue correctly handles queue after doctor starts session."""
+    from server import reception_queue
+
+    mock_db.doctors.find_one = AsyncMock(return_value={
+        "id": "doc-1",
+        "hospital_id": "H1",
+        "full_name": "Dr. Mariya",
+        "status": "active",
+        "timings": "10:00 AM - 2:00 PM",
+    })
+    mock_db.doctors.find = MagicMock(return_value=MockCursor([{
+        "id": "doc-1",
+        "hospital_id": "H1",
+        "full_name": "Dr. Mariya",
+        "status": "active",
+        "timings": "10:00 AM - 2:00 PM",
+    }]))
+
+    # Session is ACTIVE after start
+    mock_db.doctor_sessions.find = MagicMock(return_value=MockCursor([{
+        "id": f"doc-1_{TEST_DATE}",
+        "doctor_id": "doc-1",
+        "status": "in_consultation",
+        "actual_start_time": "10:15 AM",
+        "doctor_in_cabin": True,
+    }]))
+
+    appts = [
+        {"id": "a-1", "doctor_id": "doc-1", "date": TEST_DATE, "token_number": 1, "queue_order": 1, "status": "in_consultation", "patient_name": "Amit"},
+        {"id": "a-2", "doctor_id": "doc-1", "date": TEST_DATE, "token_number": 2, "queue_order": 2, "status": "arrived", "patient_name": "Priya"},
+    ]
+    mock_db.appointments.find = MagicMock(return_value=MockCursor(appts))
+
+    user = {"id": "rec-1", "role": "receptionist", "hospital_id": "H1"}
+    res = await reception_queue(doctor_id="doc-1", date=TEST_DATE, user=user)
+
+    assert len(res) == 2
+    assert res[0]["status"] == "in_consultation"
+    assert res[1]["status"] == "arrived"
+
+
