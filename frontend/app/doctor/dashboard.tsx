@@ -1014,10 +1014,36 @@ export default function DoctorDashboard() {
         </View>
 
         {/* ── Schedule list ── */}
-        {filteredAppts.length === 0 ? (
+        {profileError ? (
+          <View style={[styles.empty, { borderColor: "#FCA5A5", backgroundColor: "#FEF2F2", padding: 20 }]}>
+            <Ionicons name="alert-circle-outline" size={40} color="#DC2626" />
+            <Text style={[styles.emptyText, { color: "#991B1B", fontWeight: "700", marginTop: 8 }]}>Failed to Load Appointments</Text>
+            <Text style={{ fontSize: 13, color: "#7F1D1D", textAlign: "center", marginTop: 4, marginBottom: 12 }}>{profileError}</Text>
+            <Pressable
+              onPress={() => load(false, true)}
+              style={{ backgroundColor: "#DC2626", paddingHorizontal: 16, paddingVertical: 8, borderRadius: 8, flexDirection: "row", alignItems: "center", gap: 6 }}
+            >
+              <Ionicons name="refresh" size={16} color="#fff" />
+              <Text style={{ color: "#fff", fontWeight: "700", fontSize: 13 }}>Retry</Text>
+            </Pressable>
+          </View>
+        ) : filteredAppts.length === 0 ? (
           <View style={styles.empty}>
             <Ionicons name="people-outline" size={40} color={colors.muted} />
-            <Text style={styles.emptyText}>No patients match the selected filter for {selectedDate}</Text>
+            {appts.length > 0 && filterStatus !== "all" ? (
+              <>
+                <Text style={[styles.emptyText, { fontWeight: "600" }]}>No {filterStatus} patients for {selectedDate}</Text>
+                <Text style={[styles.emptyText, { fontSize: 12, marginTop: 4 }]}>There are {appts.length} total patient(s) in other statuses.</Text>
+                <Pressable
+                  onPress={() => setFilterStatus("all")}
+                  style={{ marginTop: 10, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: colors.brandPrimary, borderRadius: 6 }}
+                >
+                  <Text style={{ color: "#fff", fontWeight: "600", fontSize: 13 }}>View All Patients ({appts.length})</Text>
+                </Pressable>
+              </>
+            ) : (
+              <Text style={styles.emptyText}>No patients match the selected filter for {selectedDate}</Text>
+            )}
           </View>
         ) : (
           filteredAppts.map((a) => {

@@ -235,7 +235,8 @@ class TestReceptionAddPatientEndpoint:
             "token_sequences": mock_tokens,
         })
 
-        with patch("server.get_database", return_value=mock_db), \
+        with patch("server.db", mock_db), \
+             patch("server.get_database", return_value=mock_db), \
              patch("server.broadcast_doctor_update", new_callable=AsyncMock), \
              patch("server.notify_queue_movement", new_callable=AsyncMock):
             
@@ -297,7 +298,8 @@ class TestReceptionAddPatientEndpoint:
             "token_sequences": mock_tokens,
         })
 
-        with patch("server.get_database", return_value=mock_db), \
+        with patch("server.db", mock_db), \
+             patch("server.get_database", return_value=mock_db), \
              patch("server.broadcast_doctor_update", new_callable=AsyncMock), \
              patch("server.notify_queue_movement", new_callable=AsyncMock):
 

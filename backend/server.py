@@ -4051,16 +4051,38 @@ async def calendar_summary(
     user: dict = Depends(get_current_user)
 ):
     query: dict = {"status": {"$ne": "cancelled"}}
-    if doctor_id:
-        query["doctor_id"] = doctor_id
+    clean_doc_id = doctor_id.strip() if doctor_id and doctor_id.strip() not in ("undefined", "null") else None
+    if clean_doc_id:
+        doc = await db.doctors.find_one({"$or": [{"id": clean_doc_id}, {"user_id": clean_doc_id}]})
+        doc_ids = list(filter(None, [clean_doc_id, doc.get("id") if doc else None, doc.get("user_id") if doc else None]))
+        query["doctor_id"] = {"$in": doc_ids} if len(doc_ids) > 1 else clean_doc_id
     elif user.get("role") == "doctor":
-        doc = await db.doctors.find_one({"user_id": user["id"]})
+        doc = await db.doctors.find_one({"$or": [{"user_id": user["id"]}, {"id": user.get("doctor_id", user["id"])}, {"id": user["id"]}]})
         if doc:
-            query["doctor_id"] = doc["id"]
-    elif user.get("hospital_id"):
-        docs = await db.doctors.find({"hospital_id": user["hospital_id"]}, {"id": 1}).to_list(None)
-        valid_doc_ids = [d["id"] for d in docs]
-        query["doctor_id"] = {"$in": valid_doc_ids}
+            doc_ids = list(filter(None, [doc.get("id"), doc.get("user_id"), user["id"]]))
+            query["doctor_id"] = {"$in": doc_ids}
+        else:
+            query["doctor_id"] = user["id"]
+    elif user.get("hospital_id") or user.get("hospital_code"):
+        hid = (user.get("hospital_id") or user.get("hospital_code") or "").strip()
+        docs = await db.doctors.find({
+            "$or": [
+                {"hospital_id": hid},
+                {"hospital_id": hid.upper()},
+                {"hospital_id": hid.lower()},
+                {"hospital_id": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}},
+                {"hospital_code": hid},
+                {"hospital_code": hid.upper()},
+                {"hospital_code": hid.lower()},
+                {"hospital_code": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}},
+            ]
+        }, {"id": 1, "user_id": 1}).to_list(None)
+        valid_doc_ids = []
+        for d in docs:
+            if d.get("id"): valid_doc_ids.append(d["id"])
+            if d.get("user_id"): valid_doc_ids.append(d["user_id"])
+        if valid_doc_ids:
+            query["doctor_id"] = {"$in": valid_doc_ids}
 
     appts = await db.appointments.find(query, {"_id": 0, "date": 1, "token_number": 1, "status": 1}).to_list(2000)
 
@@ -4069,11 +4091,14 @@ async def calendar_summary(
         dt = a.get("date")
         if not dt or a.get("status") == "cancelled":
             continue
-        if dt not in summary_map:
-            summary_map[dt] = {"date": dt, "patient_count": 0, "tokens": []}
-        summary_map[dt]["patient_count"] += 1
+        dt_clean = str(dt).split("T")[0].strip()
+        if not dt_clean:
+            continue
+        if dt_clean not in summary_map:
+            summary_map[dt_clean] = {"date": dt_clean, "patient_count": 0, "tokens": []}
+        summary_map[dt_clean]["patient_count"] += 1
         if a.get("token_number") is not None:
-            summary_map[dt]["tokens"].append(a["token_number"])
+            summary_map[dt_clean]["tokens"].append(a["token_number"])
 
     res = [item for item in summary_map.values() if item["patient_count"] > 0]
     res.sort(key=lambda x: x["date"])
@@ -4156,16 +4181,24 @@ async def doctor_appointments(
     user: dict = Depends(require_role("doctor", "admin", "owner", "developer"))
 ):
     doc_id = doctor_id
-    if not doc_id:
+    doc_ids = []
+    d = None
+    if doc_id:
+        d = await db.doctors.find_one({"$or": [{"id": doc_id}, {"user_id": doc_id}]})
+        doc_ids = list(filter(None, [doc_id, d.get("id") if d else None, d.get("user_id") if d else None]))
+    else:
         d = await db.doctors.find_one({"$or": [{"user_id": user["id"]}, {"id": user.get("doctor_id", user["id"])}, {"id": user["id"]}]})
         if d:
-            doc_id = d["id"]
-    if not doc_id:
+            doc_ids = list(filter(None, [d.get("id"), d.get("user_id"), user["id"]]))
+    if not doc_ids:
         return []
     today = get_ist_now().strftime("%Y-%m-%d")
     target_date = date or today
+    target_date_clean = str(target_date).split("T")[0].strip()
+    date_values = list(dict.fromkeys([target_date, target_date_clean, f"{target_date_clean}T00:00:00"]))
+    date_q = {"$in": date_values} if len(date_values) > 1 else target_date_clean
     appts = await db.appointments.find(
-        {"doctor_id": doc_id, "date": target_date, "status": {"$ne": "cancelled"}},
+        {"doctor_id": {"$in": doc_ids}, "date": date_q, "status": {"$ne": "cancelled"}},
         {"_id": 0},
     ).sort("token_number", 1).to_list(500)
     # Batch-fetch missing patient addresses to eliminate N+1 queries
@@ -4189,7 +4222,7 @@ async def doctor_appointments(
                         a["patient_address"] = u["address"]
                 except Exception:
                     pass
-        if a.get("payment_amount") is None and d.get("fees") is not None:
+        if a.get("payment_amount") is None and d and d.get("fees") is not None:
             a["payment_amount"] = d["fees"]
         if not a.get("payment_status"):
             a["payment_status"] = "pending"
@@ -4205,7 +4238,11 @@ async def doctor_dashboard(
     if not d:
         raise HTTPException(status_code=404, detail="Doctor profile not found")
     target_date = date or get_ist_now().strftime("%Y-%m-%d")
-    all_today = await db.appointments.find({"doctor_id": d["id"], "date": target_date, "status": {"$ne": "cancelled"}}, {"_id": 0}).to_list(500)
+    target_date_clean = str(target_date).split("T")[0].strip()
+    doc_ids = list(filter(None, [d.get("id"), d.get("user_id"), user["id"]]))
+    date_values = list(dict.fromkeys([target_date, target_date_clean, f"{target_date_clean}T00:00:00"]))
+    date_q = {"$in": date_values} if len(date_values) > 1 else target_date_clean
+    all_today = await db.appointments.find({"doctor_id": {"$in": doc_ids}, "date": date_q, "status": {"$ne": "cancelled"}}, {"_id": 0}).to_list(500)
     completed = [a for a in all_today if a["status"] == "completed"]
     pending = [a for a in all_today if a["status"] in ("booked", "arrived", "in_consultation")]
     earnings = sum((d.get("fees") or 0) for a in completed)
@@ -6255,15 +6292,16 @@ async def auto_refer_queue(body: AutoReferBody, user: dict = Depends(require_rol
 async def reception_queue(
     doctor_id: Optional[str] = None,
     date: Optional[str] = None,
-    user: dict = Depends(require_role("receptionist", "doctor"))
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer"))
 ):
     today = get_ist_now().strftime("%Y-%m-%d")
     target_date = date or today
+    target_date_clean = str(target_date).split("T")[0].strip()
 
     # Rollover check for day-end: mark any past date unfinished appointments as 'unserved'
     # Requirement: "At day-end, move the previous day’s queue out of today’s active view while preserving history.
     # Unfinished appointments must remain identifiable as unserved or unfinished; never automatically mark them completed."
-    if target_date == today:
+    if target_date_clean == today:
         try:
             await db.appointments.update_many(
                 {"date": {"$lt": today}, "status": {"$in": ["booked", "arrived"]}},
@@ -6272,19 +6310,25 @@ async def reception_queue(
         except Exception:
             pass
 
-    q: dict = {"date": target_date}
+    date_values = list(dict.fromkeys([target_date, target_date_clean, f"{target_date_clean}T00:00:00"]))
+    q: dict = {"date": {"$in": date_values} if len(date_values) > 1 else target_date_clean}
     doc_query_conditions = []
-    hid = (user.get("hospital_id") or "").strip()
+    hid = (user.get("hospital_id") or user.get("hospital_code") or "").strip()
     if hid:
         doc_query_conditions.extend([
             {"hospital_id": hid},
             {"hospital_id": hid.upper()},
             {"hospital_id": hid.lower()},
-            {"hospital_id": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}}
+            {"hospital_id": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}},
+            {"hospital_code": hid},
+            {"hospital_code": hid.upper()},
+            {"hospital_code": hid.lower()},
+            {"hospital_code": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}},
         ])
     rec_doc_id = user.get("doctor_id") or user.get("assigned_doctor_id")
     if rec_doc_id:
         doc_query_conditions.append({"id": rec_doc_id})
+        doc_query_conditions.append({"user_id": rec_doc_id})
     user_id = user.get("id")
     if user_id:
         doc_query_conditions.append({"receptionist_id": user_id})
@@ -6292,42 +6336,38 @@ async def reception_queue(
         doc_query_conditions.append({"user_id": user_id})
         doc_query_conditions.append({"id": user_id})
 
+    valid_doc_ids = []
     if doc_query_conditions:
-        docs = await db.doctors.find({"$or": doc_query_conditions}, {"id": 1, "hospital_id": 1, "receptionist_id": 1, "receptionist_ids": 1, "user_id": 1}).to_list(500)
-        valid_doc_ids = [d["id"] for d in docs]
-        if doctor_id:
-            if valid_doc_ids and doctor_id not in valid_doc_ids:
-                # Direct check on doctor document for security
-                doc_obj = await db.doctors.find_one({"id": doctor_id})
-                doc_hosp = ((doc_obj or {}).get("hospital_id") or "").strip().upper()
-                is_authorized = bool(doc_obj and (
-                    (hid and doc_hosp == hid.upper()) or
-                    (rec_doc_id and rec_doc_id == doctor_id) or
-                    (user_id and (doc_obj.get("receptionist_id") == user_id or user_id in (doc_obj.get("receptionist_ids") or []) or doc_obj.get("user_id") == user_id or doc_obj.get("id") == user_id))
-                ))
-                if not is_authorized:
-                    return []
-            elif not valid_doc_ids:
-                doc_obj = await db.doctors.find_one({"id": doctor_id})
-                doc_hosp = ((doc_obj or {}).get("hospital_id") or "").strip().upper()
-                is_authorized = bool(doc_obj and (
-                    (not hid) or (doc_hosp == hid.upper()) or
-                    (rec_doc_id and rec_doc_id == doctor_id) or
-                    (user_id and (doc_obj.get("receptionist_id") == user_id or user_id in (doc_obj.get("receptionist_ids") or []) or doc_obj.get("user_id") == user_id or doc_obj.get("id") == user_id))
-                ))
-                if not is_authorized:
-                    return []
-            q["doctor_id"] = doctor_id
-        else:
-            q["doctor_id"] = {"$in": valid_doc_ids}
-    elif doctor_id:
-        q["doctor_id"] = doctor_id
+        docs = await db.doctors.find(
+            {"$or": doc_query_conditions},
+            {"id": 1, "hospital_id": 1, "hospital_code": 1, "receptionist_id": 1, "receptionist_ids": 1, "user_id": 1}
+        ).to_list(500)
+        for d in docs:
+            if d.get("id"): valid_doc_ids.append(d["id"])
+            if d.get("user_id"): valid_doc_ids.append(d["user_id"])
+
+    clean_doc_id = doctor_id.strip() if doctor_id and doctor_id.strip() not in ("undefined", "null") else None
+    if clean_doc_id:
+        doc_obj = await db.doctors.find_one({"$or": [{"id": clean_doc_id}, {"user_id": clean_doc_id}]})
+        doc_ids = list(filter(None, [clean_doc_id, doc_obj.get("id") if doc_obj else None, doc_obj.get("user_id") if doc_obj else None]))
+        doc_hosp = (((doc_obj or {}).get("hospital_id") or (doc_obj or {}).get("hospital_code")) or "").strip().upper()
+        is_authorized = bool(doc_obj and (
+            (hid and hid.upper() == doc_hosp) or
+            (rec_doc_id and rec_doc_id in doc_ids) or
+            (user_id and (doc_obj.get("receptionist_id") == user_id or user_id in (doc_obj.get("receptionist_ids") or []) or doc_obj.get("user_id") == user_id or doc_obj.get("id") == user_id)) or
+            user.get("role") in ["admin", "owner", "developer"]
+        ))
+        if not is_authorized:
+            return []
+        q["doctor_id"] = {"$in": doc_ids} if len(doc_ids) > 1 else clean_doc_id
+    elif valid_doc_ids:
+        q["doctor_id"] = {"$in": valid_doc_ids}
 
     appts = await db.appointments.find(q, {"_id": 0}).sort([("queue_order", 1), ("token_number", 1)]).to_list(500)
 
     # Midnight crossover requirement:
     # "Keep any consultation crossing midnight accessible until the receptionist completes it."
-    if target_date == today:
+    if target_date_clean == today:
         crossover_q = {"status": "in_consultation", "date": {"$lt": today}}
         if q.get("doctor_id"):
             crossover_q["doctor_id"] = q["doctor_id"]
@@ -6350,8 +6390,11 @@ async def reception_queue(
     doc_fee_map = {}
     if doc_ids_needed:
         try:
-            docs = await db.doctors.find({"id": {"$in": doc_ids_needed}}, {"_id": 0, "id": 1, "fees": 1}).to_list(len(doc_ids_needed))
-            doc_fee_map = {d["id"]: d["fees"] for d in docs if d.get("fees") is not None}
+            docs = await db.doctors.find({"$or": [{"id": {"$in": doc_ids_needed}}, {"user_id": {"$in": doc_ids_needed}}]}, {"_id": 0, "id": 1, "user_id": 1, "fees": 1}).to_list(len(doc_ids_needed))
+            for d in docs:
+                if d.get("fees") is not None:
+                    if d.get("id"): doc_fee_map[d["id"]] = d["fees"]
+                    if d.get("user_id"): doc_fee_map[d["user_id"]] = d["fees"]
         except Exception:
             pass
 
@@ -6361,9 +6404,11 @@ async def reception_queue(
     session_cache = {}
     if unique_doc_ids:
         try:
-            doc_records = await db.doctors.find({"id": {"$in": unique_doc_ids}}, DOCTOR_ETA_PROJECTION).to_list(len(unique_doc_ids))
-            doctor_cache = {d["id"]: d for d in doc_records}
-            sess_ids = [f"{did}_{target_date}" for did in unique_doc_ids]
+            doc_records = await db.doctors.find({"$or": [{"id": {"$in": unique_doc_ids}}, {"user_id": {"$in": unique_doc_ids}}]}, DOCTOR_ETA_PROJECTION).to_list(len(unique_doc_ids))
+            for d in doc_records:
+                if d.get("id"): doctor_cache[d["id"]] = d
+                if d.get("user_id"): doctor_cache[d["user_id"]] = d
+            sess_ids = [f"{did}_{target_date_clean}" for did in unique_doc_ids]
             sess_records = await db.doctor_sessions.find({"id": {"$in": sess_ids}}, SESSION_ETA_PROJECTION).to_list(len(sess_ids))
             session_cache = {s["id"]: s for s in sess_records}
         except Exception:
@@ -6386,7 +6431,7 @@ async def reception_queue(
                 a["payment_amount"] = doc_fee_map[a["doctor_id"]]
             else:
                 try:
-                    doc_fee = await db.doctors.find_one({"id": a["doctor_id"]}, {"_id": 0, "fees": 1})
+                    doc_fee = await db.doctors.find_one({"$or": [{"id": a["doctor_id"]}, {"user_id": a["doctor_id"]}]}, {"_id": 0, "fees": 1})
                     if doc_fee and doc_fee.get("fees") is not None:
                         a["payment_amount"] = doc_fee["fees"]
                 except Exception:
@@ -6398,7 +6443,7 @@ async def reception_queue(
             try:
                 d_id = a.get("doctor_id")
                 d_obj = doctor_cache.get(d_id)
-                s_obj = session_cache.get(f"{d_id}_{target_date}")
+                s_obj = session_cache.get(f"{d_id}_{target_date_clean}")
                 eta_data = await calculate_appointment_eta(
                     a,
                     doctor=d_obj,
@@ -6418,23 +6463,30 @@ async def reception_queue(
 
 
 @api_router.get("/reception/doctors")
-async def reception_doctors(user: dict = Depends(require_role("receptionist", "doctor"))):
+async def reception_doctors(user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner", "developer"))):
     or_conditions = []
-    hid = (user.get("hospital_id") or "").strip()
+    hid = (user.get("hospital_id") or user.get("hospital_code") or "").strip()
     if hid:
         or_conditions.extend([
             {"hospital_id": hid},
             {"hospital_id": hid.upper()},
             {"hospital_id": hid.lower()},
-            {"hospital_id": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}}
+            {"hospital_id": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}},
+            {"hospital_code": hid},
+            {"hospital_code": hid.upper()},
+            {"hospital_code": hid.lower()},
+            {"hospital_code": {"$regex": f"^{re.escape(hid)}$", "$options": "i"}},
         ])
     rec_doc_id = user.get("doctor_id") or user.get("assigned_doctor_id")
     if rec_doc_id:
         or_conditions.append({"id": rec_doc_id})
+        or_conditions.append({"user_id": rec_doc_id})
     user_id = user.get("id")
     if user_id:
         or_conditions.append({"receptionist_id": user_id})
         or_conditions.append({"receptionist_ids": user_id})
+        or_conditions.append({"user_id": user_id})
+        or_conditions.append({"id": user_id})
 
     q = {"$or": or_conditions} if or_conditions else {}
     docs = await db.doctors.find(q, {"_id": 0}).to_list(200)

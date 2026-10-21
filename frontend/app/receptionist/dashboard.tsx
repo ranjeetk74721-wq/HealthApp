@@ -339,12 +339,14 @@ export default function ReceptionistDashboard() {
       // 1. Queue handling
       if (qRes.status === "fulfilled") {
         setQueue(qRes.value || []);
+        setQueueError(null);
       } else {
         const qErr = qRes.reason;
         if (qErr?.status === 401 || (qErr?.message && (qErr.message.includes("401") || qErr.message.includes("expired")))) {
           await handleAuthExpired();
           return;
         }
+        setQueueError(qErr?.message || "Failed to load patient queue");
       }
 
       // 2. Session handling: isolate 403, error, empty, and success
@@ -516,6 +518,8 @@ export default function ReceptionistDashboard() {
               refreshDoctorDataRef.current?.(currentDoc, currentDate, true);
             }
           }, 300);
+        } else {
+          hasPendingUpdateRef.current = true;
         }
       };
       ws.onerror = () => {
@@ -1404,10 +1408,63 @@ export default function ReceptionistDashboard() {
               </Pressable>
             </View>
 
-            {displayedQueue.length === 0 ? (
+            {queueError ? (
+              <View style={[styles.empty, { borderColor: "#FCA5A5", backgroundColor: "#FEF2F2", padding: 20 }]} testID="queue-error-banner">
+                <Ionicons name="alert-circle-outline" size={44} color="#DC2626" />
+                <Text style={[styles.emptyText, { color: "#991B1B", fontWeight: "700", marginTop: 8 }]}>
+                  Failed to Load Patient Queue
+                </Text>
+                <Text style={{ fontSize: 13, color: "#7F1D1D", textAlign: "center", marginTop: 4, marginBottom: 14 }}>
+                  {queueError}
+                </Text>
+                <Pressable
+                  testID="retry-queue-btn"
+                  onPress={() => {
+                    if (selectedDocRef.current) {
+                      refreshDoctorData(selectedDocRef.current, selectedDateRef.current, false);
+                    }
+                  }}
+                  style={{
+                    backgroundColor: "#DC2626",
+                    paddingHorizontal: 16,
+                    paddingVertical: 10,
+                    borderRadius: 8,
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 6,
+                  }}
+                >
+                  <Ionicons name="refresh" size={16} color="#fff" />
+                  <Text style={{ color: "#fff", fontWeight: "700", fontSize: 13 }}>Retry Loading Queue</Text>
+                </Pressable>
+              </View>
+            ) : displayedQueue.length === 0 ? (
               <View style={styles.empty}>
                 <Ionicons name="people-outline" size={44} color={colors.muted} />
-                <Text style={styles.emptyText}>No patients match the selected filter for {selectedDate}. Tap &quot;+ Add Patient&quot; to register a walk-in.</Text>
+                {queue.length > 0 && queueFilter !== "all" ? (
+                  <>
+                    <Text style={[styles.emptyText, { fontWeight: "600" }]}>
+                      No {queueFilter} patients for {selectedDate}.
+                    </Text>
+                    <Text style={[styles.emptyText, { fontSize: 12, marginTop: 4 }]}>
+                      There are {queue.filter((q) => q.status !== "cancelled").length} total patient(s) in other statuses.
+                    </Text>
+                    <Pressable
+                      onPress={() => setQueueFilter("all")}
+                      style={{
+                        marginTop: 10,
+                        paddingHorizontal: 14,
+                        paddingVertical: 8,
+                        backgroundColor: colors.brandPrimary,
+                        borderRadius: 6,
+                      }}
+                    >
+                      <Text style={{ color: "#fff", fontWeight: "600", fontSize: 13 }}>View All Patients ({queue.filter((q) => q.status !== "cancelled").length})</Text>
+                    </Pressable>
+                  </>
+                ) : (
+                  <Text style={styles.emptyText}>No patients match the selected filter for {selectedDate}. Tap &quot;+ Add Patient&quot; to register a walk-in.</Text>
+                )}
               </View>
             ) : (
               displayedQueue.map((a) => {
