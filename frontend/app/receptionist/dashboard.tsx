@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator,
   RefreshControl, Modal, TextInput, KeyboardAvoidingView, Platform, Alert,
@@ -93,18 +93,63 @@ export default function ReceptionistDashboard() {
   const [refreshing, setRefreshing] = useState(false);
   const [actionLoadingMap, setActionLoadingMap] = useState<Record<string, string>>({});
   const [sessionManagerOpen, setSessionManagerOpen] = useState(false);
+  const [configuredSessions, setConfiguredSessions] = useState<any[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
 
-  // Derived Queue definitions placed safely after queue state
-  const activeQueue = queue.filter(
-    (q) => q.status !== "completed" && q.status !== "cancelled"
-  );
-  const completedQueue = queue.filter((q) => q.status === "completed");
-  const displayedQueue =
-    queueFilter === "completed"
+  // Helper to determine whether an appointment belongs to a given session
+  const isApptInSession = useCallback((appt: any, sessId: string | null) => {
+    if (!sessId) return true;
+    if (sessId === "__unassigned__") {
+      const matchesAny = configuredSessions.some((s) => {
+        if (appt.session_id && appt.session_id === s.id) return true;
+        if ((s.id.endsWith("_default") || configuredSessions.length === 1) && !appt.session_id) return true;
+        return false;
+      });
+      return !matchesAny;
+    }
+    if (appt.session_id && appt.session_id === sessId) return true;
+    const isDefault = sessId.endsWith("_default") || (configuredSessions.length === 1 && configuredSessions[0]?.id === sessId);
+    if (isDefault && (!appt.session_id || appt.session_id === sessId)) return true;
+    return false;
+  }, [configuredSessions]);
+
+  // Check if there are legacy or unassigned appointments not matching any configured session
+  const hasUnassignedAppointments = useMemo(() => {
+    if (configuredSessions.length === 0) return false;
+    return queue.some((appt) => {
+      if (appt.status === "cancelled") return false;
+      const matchesAny = configuredSessions.some((s) => {
+        if (appt.session_id && appt.session_id === s.id) return true;
+        if ((s.id.endsWith("_default") || configuredSessions.length === 1) && !appt.session_id) return true;
+        return false;
+      });
+      return !matchesAny;
+    });
+  }, [queue, configuredSessions]);
+
+  // Session-scoped appointment queues
+  const sessionQueue = useMemo(() => {
+    if (!activeSessionId) return queue;
+    return queue.filter((a) => isApptInSession(a, activeSessionId));
+  }, [queue, activeSessionId, isApptInSession]);
+
+  const activeQueue = useMemo(() => {
+    return sessionQueue.filter(
+      (q) => q.status !== "completed" && q.status !== "cancelled"
+    );
+  }, [sessionQueue]);
+
+  const completedQueue = useMemo(() => {
+    return sessionQueue.filter((q) => q.status === "completed");
+  }, [sessionQueue]);
+
+  const displayedQueue = useMemo(() => {
+    return queueFilter === "completed"
       ? completedQueue
       : queueFilter === "all"
-      ? queue.filter((q) => q.status !== "cancelled")
+      ? sessionQueue.filter((q) => q.status !== "cancelled")
       : activeQueue;
+  }, [queueFilter, sessionQueue, activeQueue, completedQueue]);
 
   // Network and stale tracking
   const [isOnline, setIsOnline] = useState(true);
@@ -135,7 +180,6 @@ export default function ReceptionistDashboard() {
 
   // Add Patient sheet (preserves inputs on error)
   const [addOpen, setAddOpen] = useState(false);
-  const [configuredSessions, setConfiguredSessions] = useState<any[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [selectedWindowId, setSelectedWindowId] = useState<string | null>(null);
   const [consultationMode, setConsultationMode] = useState<"walkin" | "regular" | "no_mobile">("walkin");
@@ -268,6 +312,7 @@ export default function ReceptionistDashboard() {
         setDocSession(null);
         setSummaryData([]);
         setConfiguredSessions([]);
+        setActiveSessionId(null);
         setSessionState({ status: "idle" });
         return;
       }
@@ -287,6 +332,7 @@ export default function ReceptionistDashboard() {
         setDocSession(null);
         setSummaryData([]);
         setConfiguredSessions([]);
+        setActiveSessionId(null);
         setSessionState({ status: "loading" });
         setSelectedDoc(nextDocId);
         selectedDocRef.current = nextDocId;
@@ -445,7 +491,14 @@ export default function ReceptionistDashboard() {
 
       // 4. Configured sessions handling
       if (confSessRes.status === "fulfilled") {
-        setConfiguredSessions(confSessRes.value?.sessions || []);
+        const fetchedSessions = confSessRes.value?.sessions || [];
+        setConfiguredSessions(fetchedSessions);
+        setActiveSessionId((prev) => {
+          if (prev && (prev === "__unassigned__" || fetchedSessions.some((s: any) => s.id === prev))) {
+            return prev;
+          }
+          return fetchedSessions.length > 0 ? fetchedSessions[0].id : null;
+        });
       }
 
       const nowStr = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true });
@@ -955,6 +1008,10 @@ export default function ReceptionistDashboard() {
       );
       return;
     }
+    if (activeSessionId && activeSessionId !== "__unassigned__" && configuredSessions.some((s) => s.id === activeSessionId)) {
+      setSelectedSessionId(activeSessionId);
+      setConsultationMode("regular");
+    }
     setAddOpen(true);
   };
 
@@ -1063,7 +1120,7 @@ export default function ReceptionistDashboard() {
     const docName = curDoc?.full_name || "Doctor";
     const clinicName = curDoc?.hospital_name || curDoc?.clinic_name || (user as any)?.hospital_name || "MeriBaari Clinic";
 
-    let patientsToPrint = queue.filter((q) => q.status !== "cancelled");
+    let patientsToPrint = sessionQueue.filter((q) => q.status !== "cancelled");
     let filterLabel = "All Patients";
     if (queueFilter === "active") {
       patientsToPrint = activeQueue;
@@ -1071,6 +1128,11 @@ export default function ReceptionistDashboard() {
     } else if (queueFilter === "completed") {
       patientsToPrint = completedQueue;
       filterLabel = "Completed Patients";
+    }
+
+    const curSess = configuredSessions.find((s) => s.id === activeSessionId);
+    if (curSess) {
+      filterLabel = `${curSess.session_name} · ${filterLabel}`;
     }
 
     printPatientList({
@@ -1082,13 +1144,14 @@ export default function ReceptionistDashboard() {
     });
   };
 
+  const doctorActiveAppts = queue.filter((q) => q.status !== "completed" && q.status !== "cancelled");
   const stats = {
     total: queue.filter((q) => q.status !== "cancelled").length,
-    active: activeQueue.length,
-    arrived: activeQueue.filter((q) => q.status === "arrived").length,
-    consulting: activeQueue.filter((q) => q.status === "in_consultation").length,
-    completed: completedQueue.length,
-    skipped: activeQueue.filter((q) => q.status === "skipped").length,
+    active: doctorActiveAppts.length,
+    arrived: doctorActiveAppts.filter((q) => q.status === "arrived").length,
+    consulting: doctorActiveAppts.filter((q) => q.status === "in_consultation").length,
+    completed: queue.filter((q) => q.status === "completed").length,
+    skipped: doctorActiveAppts.filter((q) => q.status === "skipped").length,
   };
 
   if (loading && doctorListStatus === "loading") {
@@ -1214,6 +1277,8 @@ export default function ReceptionistDashboard() {
                       isFetchingRef.current = false;
                       setQueue([]);
                       setDocSession(null);
+                      setConfiguredSessions([]);
+                      setActiveSessionId(null);
                       setSessionState({ status: "idle" });
                       setSelectedDoc(d.id);
                       selectedDocRef.current = d.id;
@@ -1433,6 +1498,137 @@ export default function ReceptionistDashboard() {
               </View>
             </View>
 
+            {/* ── Visible Session Selection Tabs (Segmented Buttons) ── */}
+            {configuredSessions.length > 0 ? (
+              <View style={styles.sessionNavContainer} testID="queue-session-selector">
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  contentContainerStyle={styles.sessionNavScroll}
+                >
+                  {configuredSessions.map((sess) => {
+                    const isSelected = activeSessionId === sess.id;
+                    const sessAppts = queue.filter(
+                      (a) => isApptInSession(a, sess.id) && a.status !== "cancelled"
+                    );
+                    const sessActive = sessAppts.filter((a) => a.status !== "completed").length;
+                    const sessTotal = sessAppts.length;
+                    const timeRange = sess.start_time && sess.end_time ? `${sess.start_time} - ${sess.end_time}` : "";
+
+                    return (
+                      <Pressable
+                        key={sess.id}
+                        testID={`session-tab-${sess.id}`}
+                        accessibilityRole="tab"
+                        accessibilityState={{ selected: isSelected }}
+                        accessibilityLabel={`${sess.session_name || "Session"}, ${timeRange}, ${sessTotal} patients`}
+                        onPress={() => setActiveSessionId(sess.id)}
+                        style={[
+                          styles.sessionNavCard,
+                          isSelected && styles.sessionNavCardActive,
+                        ]}
+                      >
+                        <View style={styles.sessionNavCardTop}>
+                          <Text
+                            style={[
+                              styles.sessionNavName,
+                              isSelected && styles.sessionNavNameActive,
+                            ]}
+                            numberOfLines={1}
+                          >
+                            {sess.session_name || "Consultation Session"}
+                          </Text>
+                          {isSelected && (
+                            <Ionicons name="checkmark-circle" size={14} color={colors.brandPrimary} />
+                          )}
+                        </View>
+
+                        <View style={styles.sessionNavCardBottom}>
+                          {Boolean(timeRange) && (
+                            <Text
+                              style={[
+                                styles.sessionNavTime,
+                                isSelected && styles.sessionNavTimeActive,
+                              ]}
+                            >
+                              🕒 {timeRange}
+                            </Text>
+                          )}
+                          <View
+                            style={[
+                              styles.sessionCountBadge,
+                              isSelected && styles.sessionCountBadgeActive,
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                styles.sessionCountText,
+                                isSelected && styles.sessionCountTextActive,
+                              ]}
+                            >
+                              {sessTotal} {sessTotal === 1 ? "patient" : "patients"} ({sessActive} active)
+                            </Text>
+                          </View>
+                        </View>
+                      </Pressable>
+                    );
+                  })}
+
+                  {hasUnassignedAppointments && (
+                    <Pressable
+                      testID="session-tab-unassigned"
+                      accessibilityRole="tab"
+                      accessibilityState={{ selected: activeSessionId === "__unassigned__" }}
+                      onPress={() => setActiveSessionId("__unassigned__")}
+                      style={[
+                        styles.sessionNavCard,
+                        activeSessionId === "__unassigned__" && styles.sessionNavCardActive,
+                      ]}
+                    >
+                      <View style={styles.sessionNavCardTop}>
+                        <Text
+                          style={[
+                            styles.sessionNavName,
+                            activeSessionId === "__unassigned__" && styles.sessionNavNameActive,
+                          ]}
+                          numberOfLines={1}
+                        >
+                          Unassigned / Other
+                        </Text>
+                        {activeSessionId === "__unassigned__" && (
+                          <Ionicons name="checkmark-circle" size={14} color={colors.brandPrimary} />
+                        )}
+                      </View>
+                      <View style={styles.sessionNavCardBottom}>
+                        <View
+                          style={[
+                            styles.sessionCountBadge,
+                            activeSessionId === "__unassigned__" && styles.sessionCountBadgeActive,
+                          ]}
+                        >
+                          <Text
+                            style={[
+                              styles.sessionCountText,
+                              activeSessionId === "__unassigned__" && styles.sessionCountTextActive,
+                            ]}
+                          >
+                            {queue.filter((a) => isApptInSession(a, "__unassigned__") && a.status !== "cancelled").length} patients
+                          </Text>
+                        </View>
+                      </View>
+                    </Pressable>
+                  )}
+                </ScrollView>
+              </View>
+            ) : (
+              <View style={styles.noSessionsScheduledBanner} testID="no-sessions-scheduled-banner">
+                <Ionicons name="calendar-outline" size={18} color={colors.muted} />
+                <Text style={styles.noSessionsScheduledText}>
+                  No doctor sessions scheduled for {selectedDate}. Tap &quot;Manage Doctor Shifts&quot; above to configure shifts.
+                </Text>
+              </View>
+            )}
+
             {/* ── Queue Filter Tabs ── */}
             <View style={styles.filterChipsRow}>
               <Pressable
@@ -1441,7 +1637,7 @@ export default function ReceptionistDashboard() {
                 style={[styles.filterChip, queueFilter === "all" && styles.filterChipActive]}
               >
                 <Text style={[styles.filterChipText, queueFilter === "all" && styles.filterChipTextActive]}>
-                  All ({queue.filter((q) => q.status !== "cancelled").length})
+                  All ({sessionQueue.filter((q) => q.status !== "cancelled").length})
                 </Text>
               </Pressable>
               <Pressable
@@ -1501,13 +1697,34 @@ export default function ReceptionistDashboard() {
             ) : displayedQueue.length === 0 ? (
               <View style={styles.empty}>
                 <Ionicons name="people-outline" size={44} color={colors.muted} />
-                {queue.length > 0 && queueFilter !== "all" ? (
+                {configuredSessions.length === 0 ? (
                   <>
-                    <Text style={[styles.emptyText, { fontWeight: "600" }]}>
-                      No {queueFilter} patients for {selectedDate}.
+                    <Text style={[styles.emptyText, { fontWeight: "700", color: colors.onSurface }]}>
+                      No Sessions Scheduled for {selectedDate}
                     </Text>
                     <Text style={[styles.emptyText, { fontSize: 12, marginTop: 4 }]}>
-                      There are {queue.filter((q) => q.status !== "cancelled").length} total patient(s) in other statuses.
+                      There are no active shifts configured for this doctor on this day.
+                    </Text>
+                    <Pressable
+                      onPress={() => setSessionManagerOpen(true)}
+                      style={{
+                        marginTop: 12,
+                        paddingHorizontal: 16,
+                        paddingVertical: 10,
+                        backgroundColor: colors.brandPrimary,
+                        borderRadius: radius.md,
+                      }}
+                    >
+                      <Text style={{ color: "#fff", fontWeight: "600", fontSize: 13 }}>Configure Doctor Shifts</Text>
+                    </Pressable>
+                  </>
+                ) : sessionQueue.length > 0 && queueFilter !== "all" ? (
+                  <>
+                    <Text style={[styles.emptyText, { fontWeight: "600" }]}>
+                      No {queueFilter} patients for this session on {selectedDate}.
+                    </Text>
+                    <Text style={[styles.emptyText, { fontSize: 12, marginTop: 4 }]}>
+                      There are {sessionQueue.filter((q) => q.status !== "cancelled").length} total patient(s) in other statuses.
                     </Text>
                     <Pressable
                       onPress={() => setQueueFilter("all")}
@@ -1519,11 +1736,29 @@ export default function ReceptionistDashboard() {
                         borderRadius: 6,
                       }}
                     >
-                      <Text style={{ color: "#fff", fontWeight: "600", fontSize: 13 }}>View All Patients ({queue.filter((q) => q.status !== "cancelled").length})</Text>
+                      <Text style={{ color: "#fff", fontWeight: "600", fontSize: 13 }}>
+                        View All Session Patients ({sessionQueue.filter((q) => q.status !== "cancelled").length})
+                      </Text>
                     </Pressable>
                   </>
                 ) : (
-                  <Text style={styles.emptyText}>No patients match the selected filter for {selectedDate}. Tap &quot;+ Add Patient&quot; to register a walk-in.</Text>
+                  <>
+                    <Text style={styles.emptyText}>
+                      No patients booked for this session on {selectedDate}. Tap &quot;+ Add Patient&quot; to register a walk-in.
+                    </Text>
+                    <Pressable
+                      onPress={onOpenAddPatient}
+                      style={{
+                        marginTop: 12,
+                        paddingHorizontal: 16,
+                        paddingVertical: 10,
+                        backgroundColor: colors.brandPrimary,
+                        borderRadius: radius.md,
+                      }}
+                    >
+                      <Text style={{ color: "#fff", fontWeight: "600", fontSize: 13 }}>+ Add Patient</Text>
+                    </Pressable>
+                  </>
                 )}
               </View>
             ) : (
@@ -2451,6 +2686,93 @@ const styles = StyleSheet.create({
     fontSize: font.sm,
     fontWeight: "600",
     color: colors.brandPrimary,
+  },
+  sessionNavContainer: {
+    marginVertical: spacing.xs,
+  },
+  sessionNavScroll: {
+    flexDirection: "row",
+    gap: 8,
+    paddingVertical: 2,
+  },
+  sessionNavCard: {
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    minHeight: 52,
+    justifyContent: "center",
+    gap: 3,
+  },
+  sessionNavCardActive: {
+    backgroundColor: colors.brandSecondary,
+    borderColor: colors.brandPrimary,
+    borderWidth: 1.5,
+  },
+  sessionNavCardTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  sessionNavName: {
+    fontSize: font.sm,
+    fontWeight: "600",
+    color: colors.onSurface,
+  },
+  sessionNavNameActive: {
+    color: colors.brandPrimary,
+    fontWeight: "700",
+  },
+  sessionNavCardBottom: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  sessionNavTime: {
+    fontSize: 11,
+    color: colors.muted,
+  },
+  sessionNavTimeActive: {
+    color: colors.brandPrimary,
+    fontWeight: "500",
+  },
+  sessionCountBadge: {
+    backgroundColor: colors.surfaceSecondary,
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  sessionCountBadgeActive: {
+    backgroundColor: colors.brandPrimary,
+    borderColor: colors.brandPrimary,
+  },
+  sessionCountText: {
+    fontSize: 10,
+    fontWeight: "600",
+    color: colors.onSurfaceSecondary,
+  },
+  sessionCountTextActive: {
+    color: "#fff",
+  },
+  noSessionsScheduledBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.md,
+    padding: spacing.md,
+    marginVertical: spacing.xs,
+  },
+  noSessionsScheduledText: {
+    fontSize: font.xs,
+    color: colors.muted,
+    flex: 1,
   },
   filterChipsRow: {
     flexDirection: "row",

@@ -26,14 +26,6 @@ interface DoctorSessionManagerModalProps {
 
 const WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 
-interface BookingWindowItem {
-  id: string;
-  start_time: string;
-  end_time: string;
-  category: "local" | "distant" | "all";
-  max_bookings?: number | null;
-  description?: string;
-}
 
 export default function DoctorSessionManagerModal({
   visible,
@@ -58,9 +50,7 @@ export default function DoctorSessionManagerModal({
   const [clinicAddress, setClinicAddress] = useState("");
   const [dateType, setDateType] = useState<"recurring" | "date">("recurring");
   const [specificDate, setSpecificDate] = useState(selectedDate);
-  const [selectedDays, setSelectedDays] = useState<string[]>([
-    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
-  ]);
+  const [selectedDays, setSelectedDays] = useState<string[]>(WEEKDAYS);
   const [startTime, setStartTime] = useState("10:00 AM");
   const [endTime, setEndTime] = useState("02:00 PM");
   const [bookingOpenTime, setBookingOpenTime] = useState("");
@@ -75,13 +65,6 @@ export default function DoctorSessionManagerModal({
   const [radiusKm, setRadiusKm] = useState("15");
   const [localAreasInput, setLocalAreasInput] = useState("");
   const [localAreas, setLocalAreas] = useState<string[]>([]);
-
-  // Booking Windows
-  const [bookingWindows, setBookingWindows] = useState<BookingWindowItem[]>([
-    { id: "w1", start_time: "10:00 AM", end_time: "11:00 AM", category: "local", description: "Local patients only" },
-    { id: "w2", start_time: "11:00 AM", end_time: "01:00 PM", category: "distant", description: "Distant patients only" },
-    { id: "w3", start_time: "01:00 PM", end_time: "02:00 PM", category: "all", description: "All patients" },
-  ]);
 
   // Date Override Modal state
   const [overrideSession, setOverrideSession] = useState<any | null>(null);
@@ -147,30 +130,12 @@ export default function DoctorSessionManagerModal({
     setLocalAreas(localAreas.filter((t) => t !== tag));
   };
 
-  const addWindow = () => {
-    const newId = `w_${Date.now()}`;
-    setBookingWindows([
-      ...bookingWindows,
-      { id: newId, start_time: startTime, end_time: endTime, category: "all", description: "Open to all patients" }
-    ]);
-  };
-
-  const updateWindow = (idx: number, patch: Partial<BookingWindowItem>) => {
-    const next = [...bookingWindows];
-    next[idx] = { ...next[idx], ...patch };
-    setBookingWindows(next);
-  };
-
-  const removeWindow = (idx: number) => {
-    setBookingWindows(bookingWindows.filter((_, i) => i !== idx));
-  };
-
   const resetForm = () => {
     setEditingSessionId(null);
     setSessionName("Morning OPD");
     setDateType("recurring");
     setSpecificDate(selectedDate);
-    setSelectedDays(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]);
+    setSelectedDays(WEEKDAYS);
     setStartTime("10:00 AM");
     setEndTime("02:00 PM");
     setBookingOpenTime("");
@@ -182,11 +147,6 @@ export default function DoctorSessionManagerModal({
     setRuleType("both");
     setRadiusKm("15");
     setLocalAreas(["Jaipur", "Malviya Nagar", "Mansarovar"]);
-    setBookingWindows([
-      { id: "w1", start_time: "10:00 AM", end_time: "11:00 AM", category: "local", description: "Local patients" },
-      { id: "w2", start_time: "11:00 AM", end_time: "01:00 PM", category: "distant", description: "Distant patients" },
-      { id: "w3", start_time: "01:00 PM", end_time: "02:00 PM", category: "all", description: "All patients" },
-    ]);
     setErrorMsg(null);
   };
 
@@ -203,7 +163,7 @@ export default function DoctorSessionManagerModal({
     setClinicAddress(sess.clinic_address || "");
     setDateType(sess.date_type || "recurring");
     setSpecificDate(sess.date || selectedDate);
-    setSelectedDays(sess.days_of_week || WEEKDAYS.slice(0, 6));
+    setSelectedDays(sess.days_of_week && sess.days_of_week.length > 0 ? sess.days_of_week : WEEKDAYS);
     setStartTime(sess.start_time || "10:00 AM");
     setEndTime(sess.end_time || "02:00 PM");
     setBookingOpenTime(sess.booking_open_time || "");
@@ -217,23 +177,6 @@ export default function DoctorSessionManagerModal({
     setRuleType(r.rule_type || "both");
     setRadiusKm(r.radius_km ? String(r.radius_km) : "15");
     setLocalAreas(r.local_areas || []);
-
-    if (sess.booking_windows && sess.booking_windows.length > 0) {
-      setBookingWindows(
-        sess.booking_windows.map((w: any) => ({
-          id: w.id || `w_${Math.random()}`,
-          start_time: w.start_time,
-          end_time: w.end_time,
-          category: w.category || "all",
-          max_bookings: w.max_bookings,
-          description: w.description,
-        }))
-      );
-    } else {
-      setBookingWindows([
-        { id: "w1", start_time: sess.start_time || "10:00 AM", end_time: sess.end_time || "02:00 PM", category: "all", description: "All patients" }
-      ]);
-    }
     setErrorMsg(null);
     setViewMode("form");
   };
@@ -280,14 +223,6 @@ export default function DoctorSessionManagerModal({
         local_areas: (ruleType === "areas" || ruleType === "both") ? localAreas : [],
         distant_definition: "outside_local"
       },
-      booking_windows: bookingWindows.map((w) => ({
-        id: w.id,
-        start_time: w.start_time.trim(),
-        end_time: w.end_time.trim(),
-        category: w.category,
-        max_bookings: w.max_bookings ? Number(w.max_bookings) : null,
-        description: w.description || undefined,
-      })),
     };
 
     setSaving(true);
@@ -510,7 +445,7 @@ export default function DoctorSessionManagerModal({
                         <Ionicons name="repeat-outline" size={14} color={colors.onSurfaceSecondary} />
                         <Text style={styles.metaPillText}>
                           {sess.date_type === "recurring"
-                            ? (sess.days_of_week?.map((d: string) => d.slice(0, 3)).join(", ") || "Mon–Sat")
+                            ? (sess.days_of_week?.map((d: string) => d.slice(0, 3)).join(", ") || "All Days")
                             : `Single Date: ${sess.date}`}
                         </Text>
                       </View>
@@ -913,94 +848,6 @@ export default function DoctorSessionManagerModal({
               )}
             </View>
 
-            {/* Booking Windows within Session */}
-            <View style={styles.section}>
-              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-                <Text style={styles.sectionHeader}>6. Booking Windows Allocation</Text>
-                <Pressable onPress={addWindow} style={styles.addSmallBtn}>
-                  <Ionicons name="add" size={16} color={colors.brandPrimary} />
-                  <Text style={styles.addSmallBtnText}>+ Add Window</Text>
-                </Pressable>
-              </View>
-              <Text style={styles.subHint}>
-                Decide which time windows are available to local patients, distant patients, or everyone.
-              </Text>
-
-              {bookingWindows.map((win, idx) => (
-                <View key={win.id || idx} style={styles.windowCard}>
-                  <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-                    <Text style={styles.windowCardTitle}>Window #{idx + 1}</Text>
-                    {bookingWindows.length > 1 && (
-                      <Pressable onPress={() => removeWindow(idx)}>
-                        <Ionicons name="trash-outline" size={16} color={colors.error} />
-                      </Pressable>
-                    )}
-                  </View>
-
-                  <View style={{ flexDirection: "row", gap: spacing.sm, marginTop: spacing.xs }}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.miniLabel}>Start Time</Text>
-                      <TextInput
-                        style={styles.textInputMini}
-                        value={win.start_time}
-                        onChangeText={(val) => updateWindow(idx, { start_time: val })}
-                        placeholder="10:00 AM"
-                      />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.miniLabel}>End Time</Text>
-                      <TextInput
-                        style={styles.textInputMini}
-                        value={win.end_time}
-                        onChangeText={(val) => updateWindow(idx, { end_time: val })}
-                        placeholder="11:00 AM"
-                      />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.miniLabel}>Max Bookings</Text>
-                      <TextInput
-                        style={styles.textInputMini}
-                        value={win.max_bookings ? String(win.max_bookings) : ""}
-                        onChangeText={(val) => updateWindow(idx, { max_bookings: val ? parseInt(val, 10) : null })}
-                        placeholder="All"
-                        keyboardType="numeric"
-                      />
-                    </View>
-                  </View>
-
-                  <View style={{ marginTop: spacing.sm }}>
-                    <Text style={styles.miniLabel}>Patient Eligibility Category:</Text>
-                    <View style={styles.categoryPickerRow}>
-                      <Pressable
-                        onPress={() => updateWindow(idx, { category: "local", description: "Local patients only" })}
-                        style={[styles.catBtn, win.category === "local" && styles.catBtnLocal]}
-                      >
-                        <Text style={[styles.catBtnText, win.category === "local" && styles.catBtnTextActive]}>
-                          Local Patients
-                        </Text>
-                      </Pressable>
-                      <Pressable
-                        onPress={() => updateWindow(idx, { category: "distant", description: "Distant patients only" })}
-                        style={[styles.catBtn, win.category === "distant" && styles.catBtnDistant]}
-                      >
-                        <Text style={[styles.catBtnText, win.category === "distant" && styles.catBtnTextActive]}>
-                          Distant Patients
-                        </Text>
-                      </Pressable>
-                      <Pressable
-                        onPress={() => updateWindow(idx, { category: "all", description: "All patients" })}
-                        style={[styles.catBtn, win.category === "all" && styles.catBtnAll]}
-                      >
-                        <Text style={[styles.catBtnText, win.category === "all" && styles.catBtnTextActive]}>
-                          All Patients
-                        </Text>
-                      </Pressable>
-                    </View>
-                  </View>
-                </View>
-              ))}
-            </View>
-
             {/* Readable Summary Card Before Saving */}
             <View style={styles.summaryCard}>
               <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
@@ -1019,11 +866,6 @@ export default function DoctorSessionManagerModal({
               <Text style={styles.summaryCardText}>
                 • Distant definition: Outside the configured local area/radius.
               </Text>
-              {bookingWindows.map((w, idx) => (
-                <Text key={idx} style={styles.summaryCardText}>
-                  • Window {w.start_time}–{w.end_time}: {w.category === "local" ? "Local patients only" : w.category === "distant" ? "Distant patients only" : "All patients"} ({w.max_bookings ? `max ${w.max_bookings}` : "unlimited"}).
-                </Text>
-              ))}
             </View>
 
             {/* Save Buttons */}
@@ -1037,7 +879,7 @@ export default function DoctorSessionManagerModal({
                 {saving ? (
                   <ActivityIndicator color="#fff" />
                 ) : (
-                  <Text style={styles.saveBtnText}>Save Session & Allocation Rules</Text>
+                  <Text style={styles.saveBtnText}>Save Session Schedule</Text>
                 )}
               </Pressable>
             </View>

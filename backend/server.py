@@ -548,7 +548,7 @@ class DoctorScheduleSessionCreate(BaseModel):
     date_type: str = "recurring"  # "recurring" | "date"
     date: Optional[str] = None    # "YYYY-MM-DD" if date_type == "date"
     days_of_week: List[str] = Field(
-        default_factory=lambda: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        default_factory=lambda: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     )
     
     start_time: str  # "10:00 AM"
@@ -5679,7 +5679,7 @@ async def resolve_doctor_sessions_for_date(
             "clinic_latitude": default_clinic_lat,
             "clinic_longitude": default_clinic_lon,
             "date_type": "recurring",
-            "days_of_week": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+            "days_of_week": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
             "start_time": orig_start,
             "end_time": "06:00 PM",
             "booking_open_time": None,
