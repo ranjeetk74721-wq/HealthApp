@@ -294,6 +294,29 @@ export default function DynamicAppointmentScreen() {
       ? 0
       : null;
 
+  const getEstimatedWaitingText = () => {
+    if (status === "in_consultation") return "Consultation in progress · परामर्श जारी है";
+    if (status === "completed") return "Completed · पूर्ण";
+    if (queueData?.is_delayed_awaited || queueData?.return_time_unconfirmed) {
+      return "Waiting time estimate is currently unavailable · प्रतीक्षा समय का अनुमान अभी उपलब्ध नहीं है";
+    }
+    if (queueData?.eta_minutes != null && queueData.eta_minutes > 0) {
+      return `Approximately ${queueData.eta_minutes} minutes · लगभग ${queueData.eta_minutes} मिनट`;
+    }
+    if (queueData?.doctor_in_cabin && (patientsAhead === 0 || queueData?.eta_minutes === 0)) {
+      return "Next in line (< 5 minutes) · अगला नंबर आपका है (< 5 मिनट)";
+    }
+    if (patientsAhead != null && patientsAhead > 0) {
+      const approxMins = patientsAhead * 5;
+      return `Approximately ${approxMins} minutes · लगभग ${approxMins} मिनट`;
+    }
+    if (queueData?.is_estimate_pending) {
+      return "Waiting time estimate is currently unavailable · प्रतीक्षा समय का अनुमान अभी उपलब्ध नहीं है";
+    }
+    return "Approximately 5–10 minutes · लगभग 5–10 मिनट";
+  };
+  const estimatedWaitingText = getEstimatedWaitingText();
+
   return (
     <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
       <ScrollView
@@ -364,6 +387,35 @@ export default function DynamicAppointmentScreen() {
               </Text>
             </View>
           </View>
+
+          {/* Doctor Presence / Cabin Status */}
+          {status !== "completed" && (
+            <View style={styles.doctorStatusRow}>
+              <View
+                style={[
+                  styles.cabinStatusBadge,
+                  queueData?.doctor_in_cabin ? styles.cabinInBadge : styles.cabinOutBadge,
+                ]}
+                testID="doctor-cabin-status-badge"
+              >
+                <Ionicons
+                  name={queueData?.doctor_in_cabin ? "shield-checkmark" : "time-outline"}
+                  size={14}
+                  color={queueData?.doctor_in_cabin ? "#059669" : "#B45309"}
+                />
+                <Text
+                  style={[
+                    styles.cabinStatusText,
+                    queueData?.doctor_in_cabin ? styles.cabinInText : styles.cabinOutText,
+                  ]}
+                >
+                  {queueData?.doctor_in_cabin
+                    ? "Doctor in Cabin · डॉक्टर केबिन में हैं"
+                    : "Doctor Not Yet in Cabin · डॉक्टर अभी केबिन में नहीं पहुँचे हैं"}
+                </Text>
+              </View>
+            </View>
+          )}
         </View>
 
         {/* Enable Queue Push Notifications Banner */}
@@ -441,6 +493,23 @@ export default function DynamicAppointmentScreen() {
           <Text style={styles.tokenBig}>#{tokenNumber}</Text>
           <Text style={styles.patientName}>Patient: {apptData?.patient_name}</Text>
 
+          {/* Estimated Waiting Time Highlight (Before Consultation Starts) */}
+          {status !== "in_consultation" && status !== "completed" && (
+            <View style={styles.waitingTimeBanner} testID="estimated-waiting-time-box">
+              <View style={styles.waitingTimeIconBox}>
+                <Ionicons name="hourglass-outline" size={18} color={colors.brandPrimary} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.waitingTimeHeader}>
+                  Estimated Waiting Time · अनुमानित प्रतीक्षा समय
+                </Text>
+                <Text style={styles.waitingTimeContent} testID="estimated-waiting-time-text">
+                  {estimatedWaitingText}
+                </Text>
+              </View>
+            </View>
+          )}
+
           {/* Queue Details — 3 columns in 1 horizontal row */}
           <View style={styles.queueDetailsRow}>
             {/* Left Column: Currently Serving */}
@@ -451,9 +520,9 @@ export default function DynamicAppointmentScreen() {
               </Text>
             </View>
 
-            {/* Center Column: Estimated Turn Time */}
+            {/* Center Column: Expected Turn Time */}
             <View style={styles.colCenter}>
-              <Text style={styles.colLabel}>{"आपके नंबर का\nअनुमानित समय"}</Text>
+              <Text style={styles.colLabel}>{"Expected Consultation\nअनुमानित परामर्श समय"}</Text>
               <Text
                 style={[styles.colValue, styles.colValueHighlight]}
                 testID="expected-turn-time"
@@ -606,6 +675,75 @@ const styles = StyleSheet.create({
     fontSize: font.xs,
     fontWeight: "700",
     color: colors.onSurfaceSecondary,
+  },
+  doctorStatusRow: {
+    marginTop: spacing.md,
+    paddingTop: spacing.sm,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  cabinStatusBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 5,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+  },
+  cabinInBadge: {
+    backgroundColor: "#ECFDF5",
+    borderColor: "#A7F3D0",
+  },
+  cabinOutBadge: {
+    backgroundColor: "#FFFBEB",
+    borderColor: "#FDE68A",
+  },
+  cabinStatusText: {
+    fontSize: font.xs,
+    fontWeight: "700",
+  },
+  cabinInText: {
+    color: "#065F46",
+  },
+  cabinOutText: {
+    color: "#92400E",
+  },
+  waitingTimeBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.brandSecondary,
+    borderWidth: 1,
+    borderColor: colors.brandPrimary + "33",
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    marginBottom: spacing.md,
+    width: "100%",
+    gap: spacing.sm,
+  },
+  waitingTimeIconBox: {
+    width: 32,
+    height: 32,
+    borderRadius: radius.pill,
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  waitingTimeHeader: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: colors.brandPrimary,
+    textTransform: "uppercase",
+    letterSpacing: 0.3,
+  },
+  waitingTimeContent: {
+    fontSize: font.sm,
+    fontWeight: "800",
+    color: colors.onSurface,
+    marginTop: 2,
   },
   heroCard: {
     backgroundColor: colors.surface,

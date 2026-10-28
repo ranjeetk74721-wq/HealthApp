@@ -204,6 +204,34 @@ export default function PatientQueue() {
         <Text style={styles.doctorName}>{appt.doctor_name}</Text>
         <Text style={styles.slotText}>Token #{appt.token_number} · {appt.slot}</Text>
 
+        {/* Doctor Cabin Status Indicator */}
+        {!isDone && (
+          <View style={styles.cabinStatusRow} testID="patient-queue-cabin-status">
+            <View
+              style={[
+                styles.cabinStatusBadge,
+                data.doctor_in_cabin ? styles.cabinInBadge : styles.cabinOutBadge,
+              ]}
+            >
+              <Ionicons
+                name={data.doctor_in_cabin ? "shield-checkmark" : "time-outline"}
+                size={14}
+                color={data.doctor_in_cabin ? "#059669" : "#B45309"}
+              />
+              <Text
+                style={[
+                  styles.cabinStatusText,
+                  data.doctor_in_cabin ? styles.cabinInText : styles.cabinOutText,
+                ]}
+              >
+                {data.doctor_in_cabin
+                  ? "Doctor in Cabin · डॉक्टर केबिन में हैं"
+                  : "Doctor Not Yet in Cabin · डॉक्टर अभी केबिन में नहीं पहुँचे हैं"}
+              </Text>
+            </View>
+          </View>
+        )}
+
         {/* Weak Internet: Offline & Stale Indicators (Requirement 6) */}
         {!isOnline ? (
           <View style={[styles.statusBanner, { backgroundColor: "#DC2626", borderColor: "#B91C1C" }]}>
@@ -335,6 +363,15 @@ export default function PatientQueue() {
               : `Estimated: ${formatExpectedTimeRange(data.eta_minutes || "Calculating...")}`}
           </Text>
           {!isServing && !isDone && (
+            <View style={styles.waitingTimeWrap} testID="patient-queue-waiting-time">
+              <Ionicons name="hourglass-outline" size={15} color={colors.onBrandPrimary} />
+              <Text style={styles.waitingTimeText}>
+                Estimated Waiting Time: {data.is_delayed_awaited || data.return_time_unconfirmed ? "Waiting time estimate is currently unavailable" : (data.eta_minutes != null && data.eta_minutes > 0 ? `Approximately ${data.eta_minutes} mins` : (data.doctor_in_cabin ? "< 5 mins" : (data.patients_ahead ? `Approximately ${data.patients_ahead * 5} mins` : "Approximately 5–10 mins")))}
+              </Text>
+            </View>
+          )}
+
+          {!isServing && !isDone && (
             <Text style={styles.heroSub}>
               {data.patients_ahead != null
                 ? `${data.patients_ahead} patient${data.patients_ahead !== 1 ? 's' : ''} ahead of you`
@@ -430,6 +467,53 @@ const styles = StyleSheet.create({
   title: { fontSize: font.base, color: colors.muted, fontWeight: "500", letterSpacing: 1 },
   doctorName: { fontSize: font.xxl, fontWeight: "700", color: colors.onSurface },
   slotText: { fontSize: font.base, color: colors.muted },
+  cabinStatusRow: {
+    marginTop: spacing.xs,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  cabinStatusBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 4,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+  },
+  cabinInBadge: {
+    backgroundColor: "#ECFDF5",
+    borderColor: "#A7F3D0",
+  },
+  cabinOutBadge: {
+    backgroundColor: "#FFFBEB",
+    borderColor: "#FDE68A",
+  },
+  cabinStatusText: {
+    fontSize: font.xs,
+    fontWeight: "700",
+  },
+  cabinInText: {
+    color: "#065F46",
+  },
+  cabinOutText: {
+    color: "#92400E",
+  },
+  waitingTimeWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "rgba(255, 255, 255, 0.18)",
+    paddingHorizontal: spacing.md,
+    paddingVertical: 6,
+    borderRadius: radius.pill,
+    marginVertical: 4,
+  },
+  waitingTimeText: {
+    color: colors.onBrandPrimary,
+    fontSize: font.xs,
+    fontWeight: "700",
+  },
   hero: { backgroundColor: colors.brandPrimary, borderRadius: radius.lg, padding: spacing.xl, alignItems: "center", marginTop: spacing.md, gap: 4 },
   heroLabel: { color: colors.brandTertiary, fontSize: font.sm, fontWeight: "700", letterSpacing: 1 },
   heroNumber: { color: colors.onBrandPrimary, fontSize: 76, fontWeight: "800", lineHeight: 84, marginVertical: spacing.sm, textAlign: "center" },

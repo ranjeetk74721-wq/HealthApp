@@ -1953,39 +1953,51 @@ async def calculate_appointment_eta(
                 is_estimate_pending = True
                 eta_minutes = 0
         elif not has_consultation_occurred:
-            exp_start_str = session.get("expected_start_time") or session.get("original_start_time") or "10:00 AM"
-            if appt_session_id and not appt_session_id.endswith("_default"):
-                custom_sess = schedule_config
-                if custom_sess is None and hasattr(db, "doctor_schedule_configs") and hasattr(db.doctor_schedule_configs, "find_one"):
-                    custom_sess = await db.doctor_schedule_configs.find_one({"id": appt_session_id}, {"_id": 0, "start_time": 1, "date_overrides": 1})
-                if custom_sess:
-                    override_start = (custom_sess.get("date_overrides", {}).get(appt_date) or {}).get("start_time")
-                    exp_start_str = override_start or custom_sess.get("start_time") or exp_start_str
-            start_dt = parse_time_to_ist_dt(appt_date, exp_start_str)
-            if not start_dt:
-                start_dt = ist_now
-            is_today = (appt_date == ist_now.strftime("%Y-%m-%d"))
-
-            if start_time_unconfirmed or not session.get("expected_start_time"):
-                expected_turn_time = "Doctor ke consultation shuru karne ka samay abhi confirm nahi hai."
-                is_delayed_awaited = True
-                is_estimate_pending = True
-                eta_minutes = 0
-            elif is_today and start_dt < ist_now:
-                # Do not display fabricated or expired consultation times
-                expected_turn_time = "Doctor ke consultation shuru karne ka samay abhi confirm nahi hai."
-                is_delayed_awaited = True
-                is_estimate_pending = True
-                eta_minutes = 0
-            else:
-                # Rolling 30-minute window for every waiting token:
-                # estimated start = planned session start + estimated duration of patients ahead
-                # estimated end = estimated start + 30 minutes
+            is_in_cabin = bool(session.get("doctor_in_cabin"))
+            if is_in_cabin:
+                # Doctor is physically in cabin; consultations can start immediately from current time
+                base_dt = ist_now
                 pos = len(active_ahead)
-                patient_start_dt = start_dt + timedelta(minutes=pos * per)
+                patient_start_dt = base_dt + timedelta(minutes=pos * per)
                 patient_end_dt = patient_start_dt + timedelta(minutes=WINDOW_WIDTH_MINUTES)
                 expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
-                eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60)) if is_today else 0
+                eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60))
+                is_delayed_awaited = False
+                is_estimate_pending = False
+            else:
+                exp_start_str = session.get("expected_start_time") or session.get("original_start_time") or "10:00 AM"
+                if appt_session_id and not appt_session_id.endswith("_default"):
+                    custom_sess = schedule_config
+                    if custom_sess is None and hasattr(db, "doctor_schedule_configs") and hasattr(db.doctor_schedule_configs, "find_one"):
+                        custom_sess = await db.doctor_schedule_configs.find_one({"id": appt_session_id}, {"_id": 0, "start_time": 1, "date_overrides": 1})
+                    if custom_sess:
+                        override_start = (custom_sess.get("date_overrides", {}).get(appt_date) or {}).get("start_time")
+                        exp_start_str = override_start or custom_sess.get("start_time") or exp_start_str
+                start_dt = parse_time_to_ist_dt(appt_date, exp_start_str)
+                if not start_dt:
+                    start_dt = ist_now
+                is_today = (appt_date == ist_now.strftime("%Y-%m-%d"))
+
+                if start_time_unconfirmed or not session.get("expected_start_time"):
+                    expected_turn_time = "Doctor ke consultation shuru karne ka samay abhi confirm nahi hai."
+                    is_delayed_awaited = True
+                    is_estimate_pending = True
+                    eta_minutes = 0
+                elif is_today and start_dt < ist_now:
+                    # Do not display fabricated or expired consultation times
+                    expected_turn_time = "Doctor ke consultation shuru karne ka samay abhi confirm nahi hai."
+                    is_delayed_awaited = True
+                    is_estimate_pending = True
+                    eta_minutes = 0
+                else:
+                    # Rolling 30-minute window for every waiting token:
+                    # estimated start = planned session start + estimated duration of patients ahead
+                    # estimated end = estimated start + 30 minutes
+                    pos = len(active_ahead)
+                    patient_start_dt = start_dt + timedelta(minutes=pos * per)
+                    patient_end_dt = patient_start_dt + timedelta(minutes=WINDOW_WIDTH_MINUTES)
+                    expected_turn_time = format_expected_time_range(patient_start_dt, patient_end_dt)
+                    eta_minutes = max(0, int((patient_start_dt - ist_now).total_seconds() / 60)) if is_today else 0
         else:
             # Consultations have begun
             if current:
@@ -3801,6 +3813,9 @@ async def my_appointments(user: dict = Depends(require_role("patient"))):
             a["delay_reason"] = eta.get("delay_reason")
             a["expected_start_time"] = eta.get("expected_start_time")
             a["return_time_unconfirmed"] = eta.get("return_time_unconfirmed", False)
+            a["doctor_in_cabin"] = eta.get("doctor_in_cabin", False)
+            a["cabin_entered_at"] = eta.get("cabin_entered_at")
+            a["patients_ahead"] = eta.get("patients_ahead")
     return appts
 
 
