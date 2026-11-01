@@ -80,6 +80,9 @@ export default function PatientDocumentScannerModal({
   const [docType, setDocType] = useState<string>("Document");
   const [docIdNumber, setDocIdNumber] = useState<string>("");
   const [warnings, setWarnings] = useState<string[]>([]);
+  const [ocrModel, setOcrModel] = useState<string>("groq/qwen3.8-27b");
+  const [extractedFieldsList, setExtractedFieldsList] = useState<string[]>([]);
+  const [missingFieldsList, setMissingFieldsList] = useState<string[]>([]);
 
   // Stop camera tracks helper
   const stopCameraStream = useCallback(() => {
@@ -311,17 +314,26 @@ export default function PatientDocumentScannerModal({
       }
 
       const ext = res.extracted_data || {};
+      const model = res.ocr_model || res.model_used || "groq/qwen3.8-27b";
+      setOcrModel(model);
+      setExtractedFieldsList(res.extracted_fields || []);
+      setMissingFieldsList(res.missing_fields || []);
+
+      const nameVal = res.patient_name || ext.full_name?.value || "";
+      const phoneVal = res.phone_number || ext.mobile_number?.value || "";
+      const ageVal = res.age || (ext.age?.value ? String(ext.age.value) : "");
+      const addrVal = res.address || ext.address?.value || "";
 
       // Populate review form state
       setFullName({
-        value: ext.full_name?.value || "",
-        confidence: ext.full_name?.confidence ?? 0.8,
+        value: nameVal,
+        confidence: res.confidence?.patient_name ?? ext.full_name?.confidence ?? 0.8,
         uncertain: ext.full_name?.uncertain ?? false,
       });
 
       setMobileNumber({
-        value: ext.mobile_number?.value || "",
-        confidence: ext.mobile_number?.confidence ?? 0.8,
+        value: phoneVal,
+        confidence: res.confidence?.phone_number ?? ext.mobile_number?.confidence ?? 0.8,
         uncertain: ext.mobile_number?.uncertain ?? false,
       });
 
@@ -332,16 +344,16 @@ export default function PatientDocumentScannerModal({
       });
 
       setAge({
-        value: ext.age?.value || "",
-        confidence: ext.age?.confidence ?? 0.8,
+        value: ageVal,
+        confidence: res.confidence?.age ?? ext.age?.confidence ?? 0.8,
         uncertain: ext.age?.uncertain ?? false,
       });
 
       setGender(ext.gender?.value || null);
 
       setAddress({
-        value: ext.address?.value || "",
-        confidence: ext.address?.confidence ?? 0.8,
+        value: addrVal,
+        confidence: res.confidence?.address ?? ext.address?.confidence ?? 0.8,
         uncertain: ext.address?.uncertain ?? false,
       });
 
@@ -660,6 +672,37 @@ export default function PatientDocumentScannerModal({
                   ) : null}
                 </View>
               )}
+
+              {/* Multi-Model OCR Engine & Extraction Info Banner */}
+              <View style={styles.modelInfoCard}>
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                    <Ionicons name="hardware-chip-outline" size={16} color={colors.brandPrimary} />
+                    <Text style={styles.modelInfoTitle}>
+                      Engine: <Text style={{ fontWeight: "700" }}>{ocrModel}</Text>
+                    </Text>
+                  </View>
+                  <View style={styles.statusPillActive}>
+                    <Text style={styles.statusPillText}>
+                      {extractedFieldsList.length > 0 ? `${extractedFieldsList.length}/4 Fields Found` : "Multi-Model Active"}
+                    </Text>
+                  </View>
+                </View>
+                {missingFieldsList.length > 0 && (
+                  <View style={styles.missingFieldsRow}>
+                    <Ionicons name="information-circle-outline" size={14} color="#D97706" />
+                    <Text style={styles.missingFieldsText}>
+                      Missing in document: {missingFieldsList.map((f) => f.replace("_", " ")).join(", ")} (can be filled manually or left blank)
+                    </Text>
+                  </View>
+                )}
+                <View style={styles.patientMatchNotice}>
+                  <Ionicons name="person-circle-outline" size={14} color={colors.brandPrimary} />
+                  <Text style={styles.patientMatchNoticeText}>
+                    Existing patient verification: If mobile matches a registered patient, their profile will be linked automatically.
+                  </Text>
+                </View>
+              </View>
 
               {warnings.length > 0 && (
                 <View style={styles.warningsList}>
@@ -1304,6 +1347,55 @@ const styles = StyleSheet.create({
   alertText: {
     color: colors.error,
     fontSize: font.xs,
+    flex: 1,
+  },
+  modelInfoCard: {
+    backgroundColor: "#F0F9FF",
+    borderWidth: 1,
+    borderColor: "#BAE6FD",
+    borderRadius: radius.md,
+    padding: spacing.sm,
+    marginBottom: spacing.sm,
+    gap: 6,
+  },
+  modelInfoTitle: {
+    fontSize: 12,
+    color: "#0369A1",
+  },
+  statusPillActive: {
+    backgroundColor: "#E0F2FE",
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 12,
+  },
+  statusPillText: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: "#0284C7",
+  },
+  missingFieldsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "#FFFBEB",
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  missingFieldsText: {
+    fontSize: 11,
+    color: "#B45309",
+    flex: 1,
+  },
+  patientMatchNotice: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingTop: 2,
+  },
+  patientMatchNoticeText: {
+    fontSize: 10.5,
+    color: colors.muted,
     flex: 1,
   },
 });

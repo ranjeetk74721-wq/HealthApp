@@ -58,20 +58,47 @@ except ImportError:
     )
 
 try:
-    from ocr_schema import OCRExtractRequest, OCRExtractResponse, OCRHealthResponse
-    from ocr_service import process_document_ocr, get_ocr_health, DocumentValidationError, GroqConfigurationError
+    from ocr_schema import (
+        OCRExtractRequest,
+        OCRExtractResponse,
+        OCRConfirmRequest,
+        OCRConfirmResponse,
+        OCRHealthResponse,
+    )
+    from ocr_service import (
+        process_document_ocr,
+        confirm_patient_ocr,
+        get_ocr_health,
+        DocumentValidationError,
+        GroqConfigurationError,
+    )
     OCR_FEATURE_AVAILABLE = True
 except Exception as _ocr_direct_err:
     try:
-        from backend.ocr_schema import OCRExtractRequest, OCRExtractResponse, OCRHealthResponse
-        from backend.ocr_service import process_document_ocr, get_ocr_health, DocumentValidationError, GroqConfigurationError
+        from backend.ocr_schema import (
+            OCRExtractRequest,
+            OCRExtractResponse,
+            OCRConfirmRequest,
+            OCRConfirmResponse,
+            OCRHealthResponse,
+        )
+        from backend.ocr_service import (
+            process_document_ocr,
+            confirm_patient_ocr,
+            get_ocr_health,
+            DocumentValidationError,
+            GroqConfigurationError,
+        )
         OCR_FEATURE_AVAILABLE = True
     except Exception as _ocr_pkg_err:
         OCR_FEATURE_AVAILABLE = False
         OCRExtractRequest = None
         OCRExtractResponse = None
+        OCRConfirmRequest = None
+        OCRConfirmResponse = None
         OCRHealthResponse = None
         process_document_ocr = None
+        confirm_patient_ocr = None
         get_ocr_health = None
         DocumentValidationError = Exception
         GroqConfigurationError = Exception
@@ -136,7 +163,7 @@ JWT_EXP_SECONDS_RECEPTION = 60 * 60 * 24 * 90  # 90 days for receptionist (login
 OTP_EXP_SECONDS = 300  # OTP valid for 5 minutes
 
 # Minimum patient age accepted for self-registration. Below this a guardian is required.
-MIN_PATIENT_AGE = 18
+MIN_PATIENT_AGE = 15
 
 # OTP rate limit: per-mobile requests window
 OTP_RATE_WINDOW_SECONDS = 600  # 10 min
@@ -7309,13 +7336,16 @@ async def reception_send_appointment_link(
 @app.post("/receptionist/ocr/extract")
 @app.post("/api/reception/ocr/extract")
 @app.post("/reception/ocr/extract")
+@app.post("/api/ocr/extract")
+@app.post("/ocr/extract")
 @api_router.post("/receptionist/ocr/extract")
 @api_router.post("/reception/ocr/extract")
+@api_router.post("/ocr/extract")
 async def receptionist_ocr_extract(
     body: dict = Body(...),
     user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner")),
 ):
-    """AI-powered OCR extraction of patient details from uploaded document image or PDF."""
+    """AI-powered multi-model OCR extraction of patient details from uploaded document image or PDF."""
     if not OCR_FEATURE_AVAILABLE or process_document_ocr is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -7333,16 +7363,46 @@ async def receptionist_ocr_extract(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"OCR processing failed: {str(e)}")
 
 
+@app.post("/api/receptionist/ocr/confirm")
+@app.post("/receptionist/ocr/confirm")
+@app.post("/api/reception/ocr/confirm")
+@app.post("/reception/ocr/confirm")
+@app.post("/api/ocr/confirm")
+@app.post("/ocr/confirm")
+@api_router.post("/receptionist/ocr/confirm")
+@api_router.post("/reception/ocr/confirm")
+@api_router.post("/ocr/confirm")
+async def receptionist_ocr_confirm(
+    body: dict = Body(...),
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner")),
+):
+    """Validate confirmed OCR patient details against existing database records to prevent duplicate patients."""
+    if not OCR_FEATURE_AVAILABLE or confirm_patient_ocr is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OCR confirmation service is currently unavailable.",
+        )
+    try:
+        req = OCRConfirmRequest(**body)
+        res = await confirm_patient_ocr(req, db=db)
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"OCR confirmation failed: {str(e)}")
+
+
 @app.get("/api/receptionist/ocr/health")
 @app.get("/receptionist/ocr/health")
 @app.get("/api/reception/ocr/health")
 @app.get("/reception/ocr/health")
+@app.get("/api/ocr/health")
+@app.get("/ocr/health")
 @api_router.get("/receptionist/ocr/health")
 @api_router.get("/reception/ocr/health")
+@api_router.get("/ocr/health")
 async def receptionist_ocr_health(
     user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner")),
 ):
-    """Check health and model capability status of receptionist OCR sub-pipeline."""
+    """Check health and model capability status of multi-model receptionist OCR sub-pipeline."""
     if not OCR_FEATURE_AVAILABLE or get_ocr_health is None:
         return {
             "status": "degraded",

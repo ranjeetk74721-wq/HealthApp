@@ -431,5 +431,109 @@ def test_ocr_extract_endpoint_success_receptionist(monkeypatch):
             assert data["extracted_data"]["gender"]["value"] == "Female"
             assert data["extracted_data"]["mobile_number"]["value"] == "9876543210"
             assert data["requires_review"] is True
+            # Section 4 field guarantees
+            assert data["patient_name"] == "Pooja Roy"
+            assert data["phone_number"] == "9876543210"
+            assert "patient_name" in data["extracted_fields"]
+            assert "phone_number" in data["extracted_fields"]
+            assert "confidence" in data
+            assert data["confidence"]["patient_name"] >= 0.90
         finally:
             app.dependency_overrides.pop(get_current_user, None)
+
+
+@pytest.mark.asyncio
+async def test_section4_partial_extraction_no_rejection(monkeypatch):
+    """Missing fields must not reject the document; system returns available fields and marks missing."""
+    monkeypatch.setenv("GROQ_API_KEY", "mock_key")
+    img_bytes = create_sample_image()
+    req = OCRExtractRequest(
+        file_data=base64.b64encode(img_bytes).decode("utf-8"),
+        mime_type="image/jpeg",
+    )
+
+    # Document contains only Name and Mobile, missing Age and Address
+    mock_resp = {
+        "full_name": {"value": "Rohan Verma", "confidence": 0.95, "uncertain": False},
+        "mobile_number": {"value": "9812345678", "confidence": 0.98, "uncertain": False},
+        "age": {"value": None, "confidence": 0.0, "uncertain": False},
+        "address": {"value": None, "confidence": 0.0, "uncertain": False},
+    }
+
+    with patch.object(ocr_service, "call_groq_vision", new_callable=AsyncMock) as mock_vision:
+        mock_vision.return_value = mock_resp
+        res = await ocr_service.process_document_ocr(req)
+
+        assert res.success is True
+        assert res.patient_name == "Rohan Verma"
+        assert res.phone_number == "9812345678"
+        assert res.age is None
+        assert res.address is None
+        assert "patient_name" in res.extracted_fields
+        assert "phone_number" in res.extracted_fields
+        assert "age" in res.missing_fields
+        assert "address" in res.missing_fields
+        assert res.confidence["patient_name"] == 0.95
+        assert res.confidence["age"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_fallback_offline_extractor_when_groq_fails(monkeypatch):
+    """When primary Groq engine fails and HF is unconfigured, fallback local extractor runs."""
+    monkeypatch.setenv("GROQ_API_KEY", "mock_key")
+    monkeypatch.delenv("HUGGINGFACE_API_KEY", raising=False)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+
+    img_bytes = create_sample_image()
+    req = OCRExtractRequest(
+        file_data=base64.b64encode(img_bytes).decode("utf-8"),
+        mime_type="image/jpeg",
+    )
+
+    with patch.object(ocr_service, "call_groq_vision", side_effect=Exception("Groq API Timeout")):
+        res = await ocr_service.process_document_ocr(req)
+        assert res.success is True
+        assert res.ocr_model == ocr_service.FALLBACK_LOCAL
+        assert any("fallback" in w.lower() for w in res.warnings)
+
+
+def test_disqualified_models_documented_in_health():
+    """Verify disqualified models are recorded with concrete technical reasons."""
+    health = ocr_service.get_ocr_health()
+    disqualified = health.disqualified_models
+    assert "lukaszrzepinski/MikolajRej" in disqualified
+    assert "paragon-AI/blip2-image-to-text" in disqualified
+    assert "muscgab/manga-ocr-base-CPT-flex" in disqualified
+    assert "tiiuae/Falcon-OCR" in disqualified
+    assert len(health.fallback_sequence) >= 3
+
+
+def test_ocr_confirm_endpoint_matched_existing_patient():
+    """Test receptionist confirm endpoint verifies duplicate patient by phone number."""
+    from fastapi.testclient import TestClient
+    from server import app, get_current_user
+    client = TestClient(app, raise_server_exceptions=False)
+
+    app.dependency_overrides[get_current_user] = lambda: {
+        "id": "rec_test_123",
+        "role": "receptionist",
+        "hospital_id": "test_hosp_1",
+    }
+
+    payload = {
+        "patient_name": "Kavita Singh",
+        "phone_number": "9876543210",
+        "age": "29",
+        "address": "Civil Lines, Prayagraj",
+    }
+
+    try:
+        resp = client.post("/api/receptionist/ocr/confirm", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "matched_existing_patient" in data
+        assert data["patient_data"]["patient_name"] == "Kavita Singh"
+        assert data["patient_data"]["phone_number"] == "9876543210"
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
