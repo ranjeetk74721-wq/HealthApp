@@ -41,4 +41,6 @@ services:
         sync: false          # Set in Render dashboard
       - key: GROQ_MODEL
         value: "qwen/qwen3.8-27b"
+      - key: HUGGINGFACE_API_KEY
+        sync: false          # Set in Render dashboard (optional fallback)
     healthCheckPath: /health
