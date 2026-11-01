@@ -60,9 +60,21 @@ except ImportError:
 try:
     from ocr_schema import OCRExtractRequest, OCRExtractResponse, OCRHealthResponse
     from ocr_service import process_document_ocr, get_ocr_health, DocumentValidationError, GroqConfigurationError
-except ImportError:
-    from backend.ocr_schema import OCRExtractRequest, OCRExtractResponse, OCRHealthResponse
-    from backend.ocr_service import process_document_ocr, get_ocr_health, DocumentValidationError, GroqConfigurationError
+    OCR_FEATURE_AVAILABLE = True
+except Exception as _ocr_direct_err:
+    try:
+        from backend.ocr_schema import OCRExtractRequest, OCRExtractResponse, OCRHealthResponse
+        from backend.ocr_service import process_document_ocr, get_ocr_health, DocumentValidationError, GroqConfigurationError
+        OCR_FEATURE_AVAILABLE = True
+    except Exception as _ocr_pkg_err:
+        OCR_FEATURE_AVAILABLE = False
+        OCRExtractRequest = None
+        OCRExtractResponse = None
+        OCRHealthResponse = None
+        process_document_ocr = None
+        get_ocr_health = None
+        DocumentValidationError = Exception
+        GroqConfigurationError = Exception
 
 logging.basicConfig(
     level=logging.INFO,
@@ -7293,19 +7305,25 @@ async def reception_send_appointment_link(
 
 
 # ============ AI-POWERED RECEPTIONIST OCR SUB-PIPELINE ============
-@app.post("/api/receptionist/ocr/extract", response_model=OCRExtractResponse)
-@app.post("/receptionist/ocr/extract", response_model=OCRExtractResponse)
-@app.post("/api/reception/ocr/extract", response_model=OCRExtractResponse)
-@app.post("/reception/ocr/extract", response_model=OCRExtractResponse)
-@api_router.post("/receptionist/ocr/extract", response_model=OCRExtractResponse)
-@api_router.post("/reception/ocr/extract", response_model=OCRExtractResponse)
+@app.post("/api/receptionist/ocr/extract")
+@app.post("/receptionist/ocr/extract")
+@app.post("/api/reception/ocr/extract")
+@app.post("/reception/ocr/extract")
+@api_router.post("/receptionist/ocr/extract")
+@api_router.post("/reception/ocr/extract")
 async def receptionist_ocr_extract(
-    body: OCRExtractRequest,
+    body: dict = Body(...),
     user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner")),
 ):
     """AI-powered OCR extraction of patient details from uploaded document image or PDF."""
+    if not OCR_FEATURE_AVAILABLE or process_document_ocr is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OCR service is currently unavailable on this deployment. Please verify dependencies.",
+        )
     try:
-        res = await process_document_ocr(body)
+        req = OCRExtractRequest(**body)
+        res = await process_document_ocr(req)
         return res
     except DocumentValidationError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -7315,16 +7333,24 @@ async def receptionist_ocr_extract(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"OCR processing failed: {str(e)}")
 
 
-@app.get("/api/receptionist/ocr/health", response_model=OCRHealthResponse)
-@app.get("/receptionist/ocr/health", response_model=OCRHealthResponse)
-@app.get("/api/reception/ocr/health", response_model=OCRHealthResponse)
-@app.get("/reception/ocr/health", response_model=OCRHealthResponse)
-@api_router.get("/receptionist/ocr/health", response_model=OCRHealthResponse)
-@api_router.get("/reception/ocr/health", response_model=OCRHealthResponse)
+@app.get("/api/receptionist/ocr/health")
+@app.get("/receptionist/ocr/health")
+@app.get("/api/reception/ocr/health")
+@app.get("/reception/ocr/health")
+@api_router.get("/receptionist/ocr/health")
+@api_router.get("/reception/ocr/health")
 async def receptionist_ocr_health(
     user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner")),
 ):
     """Check health and model capability status of receptionist OCR sub-pipeline."""
+    if not OCR_FEATURE_AVAILABLE or get_ocr_health is None:
+        return {
+            "status": "degraded",
+            "model": "unavailable",
+            "is_vision_supported": False,
+            "configured": False,
+            "message": "OCR service dependencies not loaded on this server",
+        }
     return get_ocr_health()
 
 

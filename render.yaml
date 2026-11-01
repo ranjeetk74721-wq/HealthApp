@@ -35,4 +35,8 @@ services:
         value: "Meribaari_appointment_api"
       - key: AISENSY_API_KEY
         sync: false
+      - key: GROQ_API_KEY
+        sync: false          # Set in Render dashboard
+      - key: GROQ_MODEL
+        value: "qwen/qwen3.8-27b"
     healthCheckPath: /health

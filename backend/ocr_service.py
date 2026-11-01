@@ -22,14 +22,28 @@ _env_path = Path(__file__).resolve().parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path)
 
-from PIL import Image, ImageOps
-from ocr_schema import (
-    ExtractedField,
-    ExtractedPatientData,
-    OCRExtractRequest,
-    OCRExtractResponse,
-    OCRHealthResponse,
-)
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    Image = None
+    ImageOps = None
+
+try:
+    from ocr_schema import (
+        ExtractedField,
+        ExtractedPatientData,
+        OCRExtractRequest,
+        OCRExtractResponse,
+        OCRHealthResponse,
+    )
+except ImportError:
+    from backend.ocr_schema import (
+        ExtractedField,
+        ExtractedPatientData,
+        OCRExtractRequest,
+        OCRExtractResponse,
+        OCRHealthResponse,
+    )
 
 logger = logging.getLogger("receptionist_ocr")
 
@@ -143,6 +157,9 @@ def preprocess_image(image_bytes: bytes) -> Tuple[bytes, int, int]:
     - Re-encodes as optimized JPEG
     Returns (optimized_jpeg_bytes, width, height).
     """
+    if Image is None or ImageOps is None:
+        raise DocumentValidationError("Pillow (PIL) image processing library is not installed on this server.")
+
     try:
         with Image.open(io.BytesIO(image_bytes)) as img:
             img.verify()
