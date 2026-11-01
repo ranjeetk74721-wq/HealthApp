@@ -508,13 +508,14 @@ def extract_patient_details_offline(text: str) -> Dict[str, Any]:
     if not text:
         return out
 
-    # Phone: 10 digit Indian number
-    phone_m = re.search(r"(?:(?:(?:\+?91)|0)?[ -]?)?([6-9]\d{9})\b", text)
+    # Phone: 10 digit Indian number (handles optional country code and spaces like 91234 56789)
+    phone_m = re.search(r"(?:(?:\+?91|0)[ -]?)?([6-9]\d{4}\s*\d{5}|[6-9]\d{9})\b", text)
     if phone_m:
-        out["mobile_number"] = {"value": phone_m.group(1), "confidence": 0.88, "uncertain": False}
+        raw_phone = re.sub(r"\D", "", phone_m.group(1))
+        out["mobile_number"] = {"value": raw_phone, "confidence": 0.88, "uncertain": False}
 
-    # Age: e.g. Age: 34 or 34 Years or 34 Yrs
-    age_m = re.search(r"\b(?:Age|Age/Sex|Years|Yrs|Yr)[\s:/]*(\d{1,3})\b", text, re.IGNORECASE)
+    # Age: e.g. Age: 34 or 34 Years or Age / Gender: 35 Yrs
+    age_m = re.search(r"\b(?:Age|Age\s*/\s*Gender|Age\s*/\s*Sex|Years|Yrs|Yr)[\s:/]*(\d{1,3})\b", text, re.IGNORECASE)
     if age_m:
         try:
             a = int(age_m.group(1))
@@ -534,22 +535,21 @@ def extract_patient_details_offline(text: str) -> Dict[str, Any]:
                 if derived_age:
                     out["age"] = {"value": derived_age, "confidence": 0.82, "uncertain": False}
 
-    # Name: Name: John Doe or Patient Name: John Doe
-    name_m = re.search(r"\b(?:Patient\s*Name|Name|Mr\.|Mrs\.|Ms\.|Shri|Smt)[\s:/]*([A-Za-z\s]{3,35})(?:\n|,|;|\bAge\b|\bMobile\b)", text, re.IGNORECASE)
+    # Name: Name: John Doe or Patient Name: Anita Sen
+    name_m = re.search(r"\b(?:Patient\s*Name|Name|Mr\.|Mrs\.|Ms\.|Shri|Smt)[\s:/]*([A-Za-z. ]{2,35})(?:[\r\n]|$)", text, re.IGNORECASE)
     if name_m:
         cand = name_m.group(1).strip()
-        # Clean stray labels
         cand = re.sub(r"\b(Patient|Name|Age|Sex|Male|Female|Date)\b", "", cand, flags=re.IGNORECASE).strip()
-        if len(cand) >= 3 and not cand.isdigit():
-            out["full_name"] = {"value": cand.title(), "confidence": 0.80, "uncertain": False}
+        if len(cand) >= 2 and not cand.isdigit():
+            out["full_name"] = {"value": cand.title(), "confidence": 0.82, "uncertain": False}
 
     # Address / City / PIN
     pin_m = re.search(r"\b([1-9][0-9]{5})\b", text)
     pin = pin_m.group(1) if pin_m else None
-    addr_m = re.search(r"\b(?:Address|Add|Res|Vill|Flat|House)[\s:/]*([^\n]{10,80})", text, re.IGNORECASE)
+    addr_m = re.search(r"\b(?:Address|Add|Res|Vill|Flat|House)[\s:/]*([^\r\n]{8,90})", text, re.IGNORECASE)
     if addr_m:
         addr = addr_m.group(1).strip()
-        out["address"] = {"value": addr, "confidence": 0.75, "uncertain": False}
+        out["address"] = {"value": addr, "confidence": 0.78, "uncertain": False}
     elif pin:
         out["address"] = {"value": f"PIN: {pin}", "confidence": 0.65, "uncertain": True}
 
@@ -731,8 +731,8 @@ async def process_document_ocr(
     if raw_result is None:
         logger.info(f"Attempting Fallback 2: Lightweight Local Extractor ({FALLBACK_LOCAL})...")
         text_source = pdf_text or ""
-        if not text_source and not is_pdf:
-            # Check raw string for text tokens
+        if not text_source:
+            # Check raw string for text tokens or embedded streams
             try:
                 text_source = raw_bytes.decode("latin1", errors="ignore")
             except Exception:

@@ -216,6 +216,8 @@ def test_uncertainty_flagging_for_low_confidence():
 @pytest.mark.asyncio
 async def test_process_document_ocr_missing_key_raises(monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_API_KEY", raising=False)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
     img_bytes = create_sample_image()
     req = OCRExtractRequest(
         file_data=base64.b64encode(img_bytes).decode("utf-8"),
@@ -302,6 +304,8 @@ async def test_process_document_ocr_pdf_routing(monkeypatch):
 
 def test_get_ocr_health_unconfigured(monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_API_KEY", raising=False)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
     h = get_ocr_health()
     assert h.status == "unconfigured"
     assert h.groq_api_key_configured is False
