@@ -57,6 +57,13 @@ except ImportError:
         get_client_ip,
     )
 
+try:
+    from ocr_schema import OCRExtractRequest, OCRExtractResponse, OCRHealthResponse
+    from ocr_service import process_document_ocr, get_ocr_health, DocumentValidationError, GroqConfigurationError
+except ImportError:
+    from backend.ocr_schema import OCRExtractRequest, OCRExtractResponse, OCRHealthResponse
+    from backend.ocr_service import process_document_ocr, get_ocr_health, DocumentValidationError, GroqConfigurationError
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -7282,6 +7289,43 @@ async def reception_send_appointment_link(
         "sms_text": sms_res.get("sms_text"),
         "appointment_link": dynamic_link,
     }
+
+
+
+# ============ AI-POWERED RECEPTIONIST OCR SUB-PIPELINE ============
+@app.post("/api/receptionist/ocr/extract", response_model=OCRExtractResponse)
+@app.post("/receptionist/ocr/extract", response_model=OCRExtractResponse)
+@app.post("/api/reception/ocr/extract", response_model=OCRExtractResponse)
+@app.post("/reception/ocr/extract", response_model=OCRExtractResponse)
+@api_router.post("/receptionist/ocr/extract", response_model=OCRExtractResponse)
+@api_router.post("/reception/ocr/extract", response_model=OCRExtractResponse)
+async def receptionist_ocr_extract(
+    body: OCRExtractRequest,
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner")),
+):
+    """AI-powered OCR extraction of patient details from uploaded document image or PDF."""
+    try:
+        res = await process_document_ocr(body)
+        return res
+    except DocumentValidationError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except GroqConfigurationError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"OCR processing failed: {str(e)}")
+
+
+@app.get("/api/receptionist/ocr/health", response_model=OCRHealthResponse)
+@app.get("/receptionist/ocr/health", response_model=OCRHealthResponse)
+@app.get("/api/reception/ocr/health", response_model=OCRHealthResponse)
+@app.get("/reception/ocr/health", response_model=OCRHealthResponse)
+@api_router.get("/receptionist/ocr/health", response_model=OCRHealthResponse)
+@api_router.get("/reception/ocr/health", response_model=OCRHealthResponse)
+async def receptionist_ocr_health(
+    user: dict = Depends(require_role("receptionist", "doctor", "admin", "owner")),
+):
+    """Check health and model capability status of receptionist OCR sub-pipeline."""
+    return get_ocr_health()
 
 
 # ============ EXCEL REPORT EXPORT ENDPOINT ============

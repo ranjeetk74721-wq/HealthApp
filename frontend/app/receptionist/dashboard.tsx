@@ -15,6 +15,7 @@ import CalendarSummary from "@/src/components/CalendarSummary";
 import DoctorSessionBar from "@/src/components/DoctorSessionBar";
 import DoctorSessionManagerModal from "@/src/components/DoctorSessionManagerModal";
 import PatientDetailsModal from "@/src/components/PatientDetailsModal";
+import PatientDocumentScannerModal, { OCRConfirmedPatientData } from "@/src/components/PatientDocumentScannerModal";
 import { printPatientList } from "@/src/utils/printPatientList";
 import { safeLocalStorageGet } from "@/src/utils/safeStorage";
 
@@ -180,6 +181,7 @@ export default function ReceptionistDashboard() {
 
   // Add Patient sheet (preserves inputs on error)
   const [addOpen, setAddOpen] = useState(false);
+  const [ocrModalOpen, setOcrModalOpen] = useState(false);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [selectedWindowId, setSelectedWindowId] = useState<string | null>(null);
   const [consultationMode, setConsultationMode] = useState<"walkin" | "regular" | "no_mobile">("walkin");
@@ -998,6 +1000,19 @@ export default function ReceptionistDashboard() {
     setPSymptoms(""); setPAddress(""); setPSlot(""); setAddError(null);
     setSelectedSessionId(null); setSelectedWindowId(null);
     setConsultationMode("walkin");
+  };
+
+  const handleOCRDataConfirmed = (data: OCRConfirmedPatientData) => {
+    if (data.fullName) setPName(data.fullName);
+    if (data.mobile) setPMobile(data.mobile);
+    if (data.age) setPAge(data.age);
+    if (data.gender) {
+      const matched = GENDERS.find((g) => g.toLowerCase() === data.gender?.toLowerCase());
+      setPGender(matched || data.gender);
+    }
+    if (data.address) setPAddress(data.address);
+    setAddToast("Document details populated into form. Please verify and confirm booking.");
+    setTimeout(() => setAddToast(null), 3500);
   };
 
   const onOpenAddPatient = () => {
@@ -2194,6 +2209,28 @@ export default function ReceptionistDashboard() {
         </Pressable>
 
         <Pressable
+          testID="scan-doc-fab-btn"
+          disabled={addLoading || !selectedDoc}
+          onPress={() => {
+            if (!selectedDoc) {
+              Alert.alert("Doctor Required", "Please select an active doctor before scanning patient documents.");
+              return;
+            }
+            onOpenAddPatient();
+            setOcrModalOpen(true);
+          }}
+          style={[
+            styles.fab,
+            { backgroundColor: "#0284C7" },
+            isExtraSmallScreen && { paddingHorizontal: spacing.sm },
+            (!selectedDoc || addLoading) && { opacity: 0.6 },
+          ]}
+        >
+          <Ionicons name="scan-outline" size={18} color="#fff" />
+          <Text style={[styles.fabText, isExtraSmallScreen && { fontSize: 13 }]}>Scan Doc</Text>
+        </Pressable>
+
+        <Pressable
           testID="emergency-insert-btn"
           disabled={!selectedDoc}
           onPress={() => {
@@ -2256,6 +2293,32 @@ export default function ReceptionistDashboard() {
               </Text>
 
               {/* 1. Doctor Sessions Selection */}
+              {/* AI Patient Document Scanner Action */}
+              <Pressable
+                testID="scan-patient-doc-modal-btn"
+                onPress={() => setOcrModalOpen(true)}
+                style={styles.scanDocModalBtn}
+              >
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 10, flex: 1 }}>
+                  <View style={styles.scanDocIconCircle}>
+                    <Ionicons name="scan" size={20} color="#fff" />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                      <Text style={styles.scanDocBtnTitle}>Scan Patient Document</Text>
+                      <View style={styles.aiBadge}>
+                        <Ionicons name="sparkles" size={10} color="#0369A1" />
+                        <Text style={styles.aiBadgeText}>AI OCR</Text>
+                      </View>
+                    </View>
+                    <Text style={styles.scanDocBtnSub}>
+                      Live camera or upload Aadhaar, PAN, Voter ID, Prescription or Hospital Card
+                    </Text>
+                  </View>
+                </View>
+                <Ionicons name="chevron-forward" size={18} color={colors.brandPrimary} />
+              </Pressable>
+
               <Text style={styles.label}>1. Doctor Session (सत्र चुनें)</Text>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, marginVertical: 4 }}>
                 {/* 1. General Walk-in */}
@@ -2634,6 +2697,12 @@ export default function ReceptionistDashboard() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+
+      <PatientDocumentScannerModal
+        visible={ocrModalOpen}
+        onClose={() => setOcrModalOpen(false)}
+        onConfirmFill={handleOCRDataConfirmed}
+      />
 
       {/* ── Patient Details View / Edit Modal ── */}
       {Boolean(selectedPatientAppt) && (
@@ -3237,6 +3306,50 @@ const styles = StyleSheet.create({
   },
   modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
   sheet: { backgroundColor: colors.surface, padding: spacing.lg, borderTopLeftRadius: 24, borderTopRightRadius: 24, gap: spacing.sm, paddingBottom: spacing.xxl },
+  scanDocModalBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#F0F9FF",
+    borderWidth: 1.5,
+    borderColor: "#BAE6FD",
+    borderRadius: radius.md,
+    padding: spacing.sm + 2,
+    marginTop: spacing.xs,
+    marginBottom: spacing.sm,
+  },
+  scanDocIconCircle: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: colors.brandPrimary,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  scanDocBtnTitle: {
+    fontSize: font.sm,
+    fontWeight: "700",
+    color: colors.brandPrimary,
+  },
+  scanDocBtnSub: {
+    fontSize: 11,
+    color: colors.muted,
+    marginTop: 1,
+  },
+  aiBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+    backgroundColor: "#E0F2FE",
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    borderRadius: 4,
+  },
+  aiBadgeText: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: "#0369A1",
+  },
   sheetHandle: { width: 40, height: 4, backgroundColor: colors.borderStrong, borderRadius: 2, alignSelf: "center", marginBottom: spacing.md },
   sheetTitle: { fontSize: font.xl, fontWeight: "700", color: colors.onSurface },
   sheetSub: { fontSize: font.base, color: colors.muted, marginBottom: spacing.md },
