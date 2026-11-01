@@ -155,10 +155,12 @@ def preprocess_image(image_bytes: bytes) -> Tuple[bytes, int, int]:
     - Converts RGBA/P/CMYK to RGB
     - Downscales if oversized (> 2048px)
     - Re-encodes as optimized JPEG
-    Returns (optimized_jpeg_bytes, width, height).
+    If PIL is not installed, gracefully returns (image_bytes, 0, 0)
+    so Groq Vision can process the raw image directly.
     """
     if Image is None or ImageOps is None:
-        raise DocumentValidationError("Pillow (PIL) image processing library is not installed on this server.")
+        logger.warning("PIL (Pillow) library not available on server; passing raw image directly to Groq Vision.")
+        return image_bytes, 0, 0
 
     try:
         with Image.open(io.BytesIO(image_bytes)) as img:
@@ -198,7 +200,12 @@ def preprocess_image(image_bytes: bytes) -> Tuple[bytes, int, int]:
 
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Extract text content from a PDF document using pypdf."""
+    """
+    Extract text content from a PDF document.
+    Attempts extraction via pypdf first; falls back to pure-Python PDF stream scanning
+    if pypdf is not installed.
+    """
+    # 1. Primary extractor: pypdf
     try:
         import pypdf
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
@@ -208,15 +215,31 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
             if text and text.strip():
                 extracted_pages.append(f"--- Page {idx + 1} ---\n{text.strip()}")
         full_text = "\n\n".join(extracted_pages).strip()
-        if not full_text:
-            raise DocumentValidationError(
-                "PDF contains no extractable text layer. If this is a scanned PDF image, please export/upload as an image."
-            )
-        return full_text
-    except DocumentValidationError:
-        raise
+        if full_text:
+            return full_text
+    except ImportError:
+        logger.warning("pypdf not installed; attempting raw text stream extraction.")
     except Exception as e:
-        raise DocumentValidationError(f"Failed to parse PDF document: {str(e)}")
+        logger.warning(f"pypdf extraction error: {e}")
+
+    # 2. Fallback: Pure-Python PDF text stream scanner
+    try:
+        raw_str = pdf_bytes.decode("latin1", errors="ignore")
+        # Match PDF text operators like (Patient Name) Tj
+        matches = re.findall(r"\(([^)]+)\)\s*(?:Tj|'|\")", raw_str)
+        if matches:
+            cleaned_tokens = [m.strip() for m in matches if len(m.strip()) > 1 and not m.startswith("/")]
+            if len(cleaned_tokens) >= 3:
+                fallback_text = " ".join(cleaned_tokens).strip()
+                if len(fallback_text) > 30:
+                    logger.info("Successfully extracted text using fallback PDF stream parser.")
+                    return fallback_text
+    except Exception as e:
+        logger.warning(f"PDF stream fallback failed: {e}")
+
+    raise DocumentValidationError(
+        "Could not extract text from this PDF document. If this is a scanned/photographed PDF, please upload it as an image (JPG/PNG) or export page 1 as an image."
+    )
 
 
 def normalize_mobile(value: Optional[str]) -> Optional[str]:
